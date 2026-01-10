@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html>
+	<body>
+		<button id="connect">Connect</button>
+		<button id="send">Send Test Byte</button>
+		<pre id="log"></pre>
+
+		<script>
+			let device;
+
+			document.getElementById("connect").onclick = async () => {
+				const devices = await navigator.hid.requestDevice({ filters: [] });
+				device = devices[0];
+				await device.open();
+				log("Connected to device");
+			};
+
+			document.getElementById("send").onclick = async () => {
+				// Send byte value 42
+				await device.sendReport(0x01, new Uint8Array([42]));
+				log("Sent: 42");
+			};
+
+			function log(msg) {
+				document.getElementById("log").textContent += msg + "\n";
+			}
+
+			navigator.hid.addEventListener("inputreport", (e) => {
+				log("Received echo: " + e.data.getUint8(1));
+			});
+		</script>
+	</body>
+</html>
