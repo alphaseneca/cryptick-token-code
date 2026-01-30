@@ -1,3 +1,5 @@
+// Web server implementation is optional; only compile when ENABLE_WEBSERVER is defined
+#ifdef ENABLE_WEBSERVER
 #include "web_server.h"
 #include <ArduinoJson.h>
 #include "storage.h"
@@ -215,3 +217,4 @@ static void handleSetTime()
         g_server->send(400, "text/plain", "Missing timestamp");
     }
 }
+#endif

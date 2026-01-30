@@ -1,8 +1,10 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <Adafruit_SSD1306.h>
+#ifdef ENABLE_WEBSERVER
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
+#endif
 #include <LittleFS.h>
 #include <RTClib.h>
 
@@ -12,11 +14,14 @@
 #include "storage.h"
 #include "navigation.h"
 #include "web_server.h"
+#include "serial_comm.h"
 
 // Hardware objects
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 RTC_DS3231 rtc;
+#ifdef ENABLE_WEBSERVER
 ESP8266WebServer server(80);
+#endif
 
 // Application state
 std::vector<TOTPAccount> accounts;
@@ -95,7 +100,8 @@ void setup()
   // Load configuration
   loadConfiguration(accounts);
 
-  // Setup WiFi AP
+  // Setup WiFi AP (only when webserver enabled)
+#ifdef ENABLE_WEBSERVER
   display.clearDisplay();
   display.setCursor(0, 0);
   display.println("WiFi Setup...");
@@ -114,8 +120,15 @@ void setup()
   display.display();
 
   Serial.printf("AP: %s / %s @ %s\n", AP_SSID, AP_PASSWORD, WiFi.softAPIP().toString().c_str());
-  // Setup web server
+#else
+  Serial.println("WiFi/web server disabled by build configuration");
+#endif
+  // Setup web server (optional at build time)
+#ifdef ENABLE_WEBSERVER
   setupWebServer(server, accounts, rtc);
+#else
+  Serial.println("Web server disabled by build configuration");
+#endif
   // Initialize device status
   deviceStatus.wifiConnected = false;
   deviceStatus.batteryLevel = 85;
@@ -125,10 +138,17 @@ void setup()
 }
 void loop()
 {
+#ifdef ENABLE_WEBSERVER
   server.handleClient();
+#endif
+  processSerialCommands(Serial, rtc, accounts);
   // Update status
   deviceStatus.currentTime = rtc.now();
+#ifdef ENABLE_WEBSERVER
   deviceStatus.wifiConnected = WiFi.softAPgetStationNum() > 0;
+#else
+  deviceStatus.wifiConnected = false;
+#endif
   // Handle navigation
   handleNavigation(currentPage, currentAccountIndex, accounts.size(), BUTTON_PIN);
   // Update display

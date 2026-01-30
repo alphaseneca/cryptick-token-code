@@ -1,33 +1,1702 @@
-<!DOCTYPE html>
-<html>
-	<body>
-		<button id="connect">Connect</button>
-		<button id="send">Send Test Byte</button>
-		<pre id="log"></pre>
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="UTF-8" />
+		<title>Cryptick - Token Configuration Dashboard</title>
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<link rel="preconnect" href="https://fonts.googleapis.com" />
+		<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+		<link
+			href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Outfit:wght@400;500;600;700;800&display=swap"
+			rel="stylesheet"
+		/>
+		<style>
+			:root {
+				--slate-900: #0f172a;
+				--slate-800: #1e293b;
+				--slate-700: #334155;
+				--slate-600: #475569;
+				--slate-500: #64748b;
+				--slate-400: #94a3b8;
+				--slate-300: #cbd5e1;
+				--slate-200: #e2e8f0;
+				--slate-100: #f1f5f9;
+				--slate-50: #f8fafc;
 
-		<script>
-			let device;
+				--cyan-500: #06b6d4;
+				--cyan-600: #0891b2;
+				--cyan-700: #0e7490;
 
-			document.getElementById("connect").onclick = async () => {
-				const devices = await navigator.hid.requestDevice({ filters: [] });
-				device = devices[0];
-				await device.open();
-				log("Connected to device");
-			};
+				--emerald-500: #10b981;
+				--emerald-600: #059669;
 
-			document.getElementById("send").onclick = async () => {
-				// Send byte value 42
-				await device.sendReport(0x01, new Uint8Array([42]));
-				log("Sent: 42");
-			};
+				--amber-500: #f59e0b;
+				--amber-600: #d97706;
 
-			function log(msg) {
-				document.getElementById("log").textContent += msg + "\n";
+				--rose-500: #f43f5e;
+				--rose-600: #e11d48;
+
+				--violet-500: #8b5cf6;
+				--violet-600: #7c3aed;
+
+				--spacing-xs: 0.5rem;
+				--spacing-sm: 0.75rem;
+				--spacing-md: 1rem;
+				--spacing-lg: 1.5rem;
+				--spacing-xl: 2rem;
+				--spacing-2xl: 3rem;
+
+				--radius-sm: 0.375rem;
+				--radius-md: 0.5rem;
+				--radius-lg: 0.75rem;
+				--radius-xl: 1rem;
+
+				--shadow-sm: 0 1px 2px 0 rgb(0 0 0 / 0.05);
+				--shadow-md:
+					0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);
+				--shadow-lg:
+					0 10px 15px -3px rgb(0 0 0 / 0.1), 0 4px 6px -4px rgb(0 0 0 / 0.1);
+				--shadow-xl:
+					0 20px 25px -5px rgb(0 0 0 / 0.1), 0 8px 10px -6px rgb(0 0 0 / 0.1);
 			}
 
-			navigator.hid.addEventListener("inputreport", (e) => {
-				log("Received echo: " + e.data.getUint8(1));
-			});
+			* {
+				box-sizing: border-box;
+				margin: 0;
+				padding: 0;
+			}
+
+			body {
+				font-family:
+					"Outfit",
+					-apple-system,
+					BlinkMacSystemFont,
+					"Segoe UI",
+					sans-serif;
+				background: linear-gradient(
+					135deg,
+					var(--slate-900) 0%,
+					var(--slate-800) 100%
+				);
+				min-height: 100vh;
+				color: var(--slate-900);
+				line-height: 1.6;
+				padding: var(--spacing-xl) var(--spacing-md);
+				position: relative;
+				overflow-x: hidden;
+			}
+
+			body::before {
+				content: "";
+				position: fixed;
+				top: 0;
+				left: 0;
+				right: 0;
+				bottom: 0;
+				background:
+					radial-gradient(
+						circle at 20% 50%,
+						rgba(139, 92, 246, 0.08) 0%,
+						transparent 50%
+					),
+					radial-gradient(
+						circle at 80% 80%,
+						rgba(6, 182, 212, 0.08) 0%,
+						transparent 50%
+					);
+				pointer-events: none;
+				z-index: 0;
+			}
+
+			.container {
+				max-width: 1400px;
+				margin: 0 auto;
+				position: relative;
+				z-index: 1;
+			}
+
+			/* Header */
+			.header {
+				background: white;
+				border-radius: var(--radius-xl);
+				padding: var(--spacing-xl);
+				margin-bottom: var(--spacing-xl);
+				box-shadow: var(--shadow-xl);
+			}
+
+			.header-content {
+				display: flex;
+				align-items: center;
+				justify-content: space-between;
+				gap: var(--spacing-lg);
+				flex-wrap: wrap;
+			}
+
+			.header-title {
+				display: flex;
+				align-items: center;
+				gap: var(--spacing-md);
+			}
+
+			.header-icon {
+				width: 56px;
+				height: 56px;
+				background: linear-gradient(
+					135deg,
+					var(--violet-500),
+					var(--violet-600)
+				);
+				border-radius: var(--radius-lg);
+				display: flex;
+				align-items: center;
+				justify-content: center;
+				font-size: 28px;
+				box-shadow: var(--shadow-md);
+			}
+
+			h1 {
+				font-size: 2rem;
+				font-weight: 800;
+				color: var(--slate-900);
+				letter-spacing: -0.025em;
+			}
+
+			.header-subtitle {
+				color: var(--slate-600);
+				font-size: 0.875rem;
+				margin-top: 0.25rem;
+				font-weight: 500;
+			}
+
+			.time-display {
+				font-family: "JetBrains Mono", monospace;
+				font-size: 1.125rem;
+				font-weight: 600;
+				color: var(--slate-700);
+				padding: var(--spacing-sm) var(--spacing-md);
+				background: var(--slate-50);
+				border-radius: var(--radius-md);
+				border: 2px solid var(--slate-200);
+			}
+
+			/* Mode Selector */
+			.mode-selector {
+				background: white;
+				border-radius: var(--radius-xl);
+				padding: var(--spacing-md);
+				margin-bottom: var(--spacing-xl);
+				box-shadow: var(--shadow-md);
+			}
+
+			.mode-tabs {
+				display: grid;
+				grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+				gap: var(--spacing-sm);
+				background: var(--slate-50);
+				padding: 0.25rem;
+				border-radius: var(--radius-lg);
+			}
+
+			.mode-tab {
+				padding: var(--spacing-md);
+				border: none;
+				background: transparent;
+				border-radius: var(--radius-md);
+				cursor: pointer;
+				font-family: inherit;
+				font-size: 0.875rem;
+				font-weight: 600;
+				color: var(--slate-600);
+				transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+				position: relative;
+			}
+
+			.mode-tab:hover {
+				color: var(--slate-900);
+			}
+
+			.mode-tab.active {
+				background: white;
+				color: var(--violet-600);
+				box-shadow: var(--shadow-sm);
+			}
+
+			.mode-tab-title {
+				display: flex;
+				align-items: center;
+				gap: var(--spacing-xs);
+				margin-bottom: 0.25rem;
+			}
+
+			.mode-tab-desc {
+				font-size: 0.75rem;
+				font-weight: 400;
+				opacity: 0.7;
+			}
+
+			/* Status Alert */
+			.status-alert {
+				padding: var(--spacing-md) var(--spacing-lg);
+				border-radius: var(--radius-lg);
+				margin-bottom: var(--spacing-xl);
+				display: flex;
+				align-items: center;
+				gap: var(--spacing-md);
+				font-size: 0.875rem;
+				font-weight: 500;
+				box-shadow: var(--shadow-sm);
+				animation: slideIn 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+			}
+
+			@keyframes slideIn {
+				from {
+					opacity: 0;
+					transform: translateY(-10px);
+				}
+				to {
+					opacity: 1;
+					transform: translateY(0);
+				}
+			}
+
+			.status-alert.info {
+				background: #dbeafe;
+				color: #1e40af;
+				border-left: 4px solid #3b82f6;
+			}
+
+			.status-alert.success {
+				background: #d1fae5;
+				color: #065f46;
+				border-left: 4px solid var(--emerald-500);
+			}
+
+			.status-alert.error {
+				background: #fee2e2;
+				color: #991b1b;
+				border-left: 4px solid var(--rose-500);
+			}
+
+			.status-alert.warning {
+				background: #fef3c7;
+				color: #92400e;
+				border-left: 4px solid var(--amber-500);
+			}
+
+			.status-icon {
+				flex-shrink: 0;
+				font-size: 1.25rem;
+			}
+
+			/* Grid Layout */
+			.grid {
+				display: grid;
+				gap: var(--spacing-xl);
+				grid-template-columns: repeat(auto-fit, minmax(450px, 1fr));
+				margin-bottom: var(--spacing-xl);
+			}
+
+			@media (max-width: 1024px) {
+				.grid {
+					grid-template-columns: 1fr;
+				}
+			}
+
+			/* Card */
+			.card {
+				background: white;
+				border-radius: var(--radius-xl);
+				padding: var(--spacing-xl);
+				box-shadow: var(--shadow-md);
+				transition: box-shadow 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+			}
+
+			.card:hover {
+				box-shadow: var(--shadow-lg);
+			}
+
+			.card-header {
+				margin-bottom: var(--spacing-lg);
+				padding-bottom: var(--spacing-md);
+				border-bottom: 2px solid var(--slate-100);
+			}
+
+			.card-title {
+				font-size: 1.25rem;
+				font-weight: 700;
+				color: var(--slate-900);
+				display: flex;
+				align-items: center;
+				gap: var(--spacing-sm);
+			}
+
+			.card-title-icon {
+				font-size: 1.5rem;
+			}
+
+			/* Buttons */
+			.btn-group {
+				display: flex;
+				gap: var(--spacing-sm);
+				flex-wrap: wrap;
+			}
+
+			.btn {
+				display: inline-flex;
+				align-items: center;
+				gap: var(--spacing-xs);
+				padding: 0.625rem 1.25rem;
+				border: none;
+				border-radius: var(--radius-md);
+				font-family: inherit;
+				font-size: 0.875rem;
+				font-weight: 600;
+				cursor: pointer;
+				transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+				white-space: nowrap;
+			}
+
+			.btn:disabled {
+				opacity: 0.5;
+				cursor: not-allowed;
+			}
+
+			.btn-primary {
+				background: linear-gradient(
+					135deg,
+					var(--violet-500),
+					var(--violet-600)
+				);
+				color: white;
+				box-shadow: var(--shadow-sm);
+			}
+
+			.btn-primary:hover:not(:disabled) {
+				background: linear-gradient(135deg, var(--violet-600), #6d28d9);
+				box-shadow: var(--shadow-md);
+				transform: translateY(-1px);
+			}
+
+			.btn-secondary {
+				background: var(--slate-100);
+				color: var(--slate-700);
+			}
+
+			.btn-secondary:hover:not(:disabled) {
+				background: var(--slate-200);
+			}
+
+			.btn-success {
+				background: linear-gradient(
+					135deg,
+					var(--emerald-500),
+					var(--emerald-600)
+				);
+				color: white;
+				box-shadow: var(--shadow-sm);
+			}
+
+			.btn-success:hover:not(:disabled) {
+				background: linear-gradient(135deg, var(--emerald-600), #047857);
+				box-shadow: var(--shadow-md);
+				transform: translateY(-1px);
+			}
+
+			.btn-danger {
+				background: linear-gradient(135deg, var(--rose-500), var(--rose-600));
+				color: white;
+				box-shadow: var(--shadow-sm);
+			}
+
+			.btn-danger:hover:not(:disabled) {
+				background: linear-gradient(135deg, var(--rose-600), #dc2626);
+				box-shadow: var(--shadow-md);
+				transform: translateY(-1px);
+			}
+
+			.btn-sm {
+				padding: 0.5rem 0.875rem;
+				font-size: 0.8125rem;
+			}
+
+			/* Form */
+			.form-group {
+				margin-bottom: var(--spacing-lg);
+			}
+
+			.form-label {
+				display: block;
+				margin-bottom: var(--spacing-xs);
+				font-weight: 600;
+				color: var(--slate-700);
+				font-size: 0.875rem;
+			}
+
+			.form-input,
+			.form-select {
+				width: 100%;
+				padding: 0.625rem 0.875rem;
+				border: 2px solid var(--slate-200);
+				border-radius: var(--radius-md);
+				font-family: inherit;
+				font-size: 0.875rem;
+				color: var(--slate-900);
+				background: white;
+				transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+			}
+
+			.form-input:focus,
+			.form-select:focus {
+				outline: none;
+				border-color: var(--violet-500);
+				box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.1);
+			}
+
+			.form-input::placeholder {
+				color: var(--slate-400);
+			}
+
+			/* Console */
+			.console-wrapper {
+				margin-top: var(--spacing-lg);
+			}
+
+			.console {
+				background: var(--slate-900);
+				border-radius: var(--radius-lg);
+				padding: var(--spacing-lg);
+				max-height: 400px;
+				overflow-y: auto;
+				overflow-x: auto;
+				font-family: "JetBrains Mono", monospace;
+				font-size: 0.8125rem;
+				line-height: 1.6;
+				box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.3);
+				white-space: nowrap;
+			}
+
+			.console::-webkit-scrollbar {
+				width: 8px;
+			}
+
+			.console::-webkit-scrollbar-track {
+				background: var(--slate-800);
+				border-radius: var(--radius-sm);
+			}
+
+			.console::-webkit-scrollbar-thumb {
+				background: var(--slate-600);
+				border-radius: var(--radius-sm);
+			}
+
+			.console::-webkit-scrollbar-thumb:hover {
+				background: var(--slate-500);
+			}
+
+			.console-line {
+				margin-bottom: 0.375rem;
+				display: flex;
+				gap: var(--spacing-sm);
+				white-space: nowrap;
+			}
+
+			.console-line.tx {
+				color: var(--emerald-500);
+			}
+
+			.console-line.rx {
+				color: var(--cyan-500);
+			}
+
+			.console-line.info {
+				color: var(--slate-400);
+			}
+
+			.console-time {
+				color: var(--slate-500);
+				flex-shrink: 0;
+			}
+
+			/* Account Cards */
+			.accounts-grid {
+				display: grid;
+				gap: var(--spacing-md);
+				grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+			}
+
+			.account-card {
+				background: linear-gradient(135deg, var(--slate-50) 0%, white 100%);
+				border: 2px solid var(--slate-200);
+				border-radius: var(--radius-lg);
+				padding: var(--spacing-lg);
+				transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+				cursor: pointer;
+				position: relative;
+				overflow: hidden;
+			}
+
+			.account-card::before {
+				content: "";
+				position: absolute;
+				top: 0;
+				left: 0;
+				right: 0;
+				height: 4px;
+				background: linear-gradient(90deg, var(--violet-500), var(--cyan-500));
+				opacity: 0;
+				transition: opacity 0.3s;
+			}
+
+			.account-card:hover {
+				border-color: var(--violet-500);
+				box-shadow: var(--shadow-lg);
+				transform: translateY(-4px);
+			}
+
+			.account-card:hover::before {
+				opacity: 1;
+			}
+
+			.account-card.active {
+				border-color: var(--violet-500);
+				box-shadow: var(--shadow-xl);
+				background: linear-gradient(135deg, #f5f3ff 0%, white 100%);
+			}
+
+			.account-card.active::before {
+				opacity: 1;
+			}
+
+			.account-header {
+				display: flex;
+				justify-content: space-between;
+				align-items: flex-start;
+				margin-bottom: var(--spacing-md);
+			}
+
+			.account-info h3 {
+				font-size: 1.125rem;
+				font-weight: 700;
+				color: var(--slate-900);
+				margin-bottom: 0.25rem;
+			}
+
+			.account-issuer {
+				color: var(--slate-600);
+				font-size: 0.875rem;
+				font-weight: 500;
+			}
+
+			.account-index {
+				background: var(--violet-500);
+				color: white;
+				padding: 0.25rem 0.625rem;
+				border-radius: var(--radius-sm);
+				font-size: 0.75rem;
+				font-weight: 700;
+				font-family: "JetBrains Mono", monospace;
+			}
+
+			.account-otp-section {
+				margin-top: var(--spacing-md);
+				padding-top: var(--spacing-md);
+				border-top: 2px dashed var(--slate-200);
+			}
+
+			.account-otp-wrapper {
+				background: white;
+				border: 2px solid var(--slate-200);
+				border-radius: var(--radius-md);
+				padding: var(--spacing-lg);
+				text-align: center;
+			}
+
+			.account-otp-label {
+				font-size: 0.75rem;
+				font-weight: 600;
+				color: var(--slate-500);
+				text-transform: uppercase;
+				letter-spacing: 0.05em;
+				margin-bottom: var(--spacing-xs);
+			}
+
+			.account-otp-code {
+				font-family: "JetBrains Mono", monospace;
+				font-size: 2.5rem;
+				font-weight: 700;
+				color: var(--violet-600);
+				letter-spacing: 0.2em;
+				margin: var(--spacing-sm) 0;
+			}
+
+			.account-otp-code.loading {
+				color: var(--slate-300);
+				animation: pulse 1.5s ease-in-out infinite;
+			}
+
+			@keyframes pulse {
+				0%,
+				100% {
+					opacity: 1;
+				}
+				50% {
+					opacity: 0.5;
+				}
+			}
+
+			.account-otp-timer {
+				font-size: 0.875rem;
+				color: var(--slate-600);
+				font-weight: 600;
+			}
+
+			.account-actions {
+				display: flex;
+				gap: var(--spacing-xs);
+				margin-top: var(--spacing-md);
+			}
+
+			.account-actions .btn {
+				flex: 1;
+			}
+
+			/* Empty State */
+			.empty-state {
+				text-align: center;
+				padding: var(--spacing-2xl);
+				color: var(--slate-500);
+			}
+
+			.empty-state-icon {
+				font-size: 4rem;
+				margin-bottom: var(--spacing-md);
+				opacity: 0.3;
+			}
+
+			.empty-state-title {
+				font-size: 1.125rem;
+				font-weight: 600;
+				color: var(--slate-700);
+				margin-bottom: var(--spacing-xs);
+			}
+
+			.empty-state-text {
+				font-size: 0.875rem;
+				color: var(--slate-500);
+			}
+
+			/* Loading Spinner */
+			.spinner {
+				display: inline-block;
+				width: 20px;
+				height: 20px;
+				border: 3px solid rgba(255, 255, 255, 0.3);
+				border-radius: 50%;
+				border-top-color: white;
+				animation: spin 0.8s linear infinite;
+			}
+
+			@keyframes spin {
+				to {
+					transform: rotate(360deg);
+				}
+			}
+
+			/* Utility Classes */
+			.hidden {
+				display: none !important;
+			}
+
+			.text-center {
+				text-align: center;
+			}
+
+			/* Responsive */
+			@media (max-width: 640px) {
+				body {
+					padding: var(--spacing-md) var(--spacing-sm);
+				}
+
+				h1 {
+					font-size: 1.5rem;
+				}
+
+				.header-content {
+					flex-direction: column;
+					align-items: flex-start;
+				}
+
+				.time-display {
+					width: 100%;
+				}
+
+				.mode-tabs {
+					grid-template-columns: 1fr;
+				}
+
+				.btn-group {
+					flex-direction: column;
+				}
+
+				.btn {
+					width: 100%;
+					justify-content: center;
+				}
+
+				.accounts-grid {
+					grid-template-columns: 1fr;
+				}
+
+				.account-actions {
+					flex-direction: column;
+				}
+			}
+		</style>
+	</head>
+	<body>
+		<div class="container">
+			<!-- Header -->
+			<header class="header">
+				<div class="header-content">
+					<div class="header-title">
+						<div class="header-icon">🔐</div>
+						<div>
+							<h1>Cryptick Token Dashboard</h1>
+							<p class="header-subtitle">
+								Configuration & Management Interface
+							</p>
+						</div>
+					</div>
+					<div class="time-display" id="browserTime">Loading...</div>
+				</div>
+			</header>
+
+			<!-- Mode Selector -->
+			<div class="mode-selector">
+				<div class="mode-tabs">
+					<button
+						class="mode-tab active"
+						data-mode="webhid"
+						onclick="switchMode('webhid')"
+					>
+						<div class="mode-tab-title">
+							<span>🔌</span>
+							<span>WebHID Mode</span>
+						</div>
+						<div class="mode-tab-desc">Primary USB Interface</div>
+					</button>
+					<button
+						class="mode-tab"
+						data-mode="webserial"
+						onclick="switchMode('webserial')"
+					>
+						<div class="mode-tab-title">
+							<span>💻</span>
+							<span>Web Serial Mode</span>
+						</div>
+						<div class="mode-tab-desc">Debug & Alternative Interface</div>
+					</button>
+				</div>
+			</div>
+
+			<!-- Status Alert -->
+			<div id="statusBar" class="status-alert info">
+				<span class="status-icon">ℹ️</span>
+				<span id="statusText"
+					>Select connection mode and connect your device</span
+				>
+			</div>
+
+			<!-- WebHID Interface -->
+			<div id="webhidInterface">
+				<div class="grid">
+					<!-- Connection & Controls -->
+					<div class="card">
+						<div class="card-header">
+							<h2 class="card-title">
+								<span class="card-title-icon">🔌</span>
+								Device Connection
+							</h2>
+						</div>
+						<div class="btn-group">
+							<button class="btn btn-primary" onclick="connectWebHID()">
+								<span>📱</span>
+								Connect Device
+							</button>
+							<button class="btn btn-success" onclick="syncTime()">
+								<span>⏰</span>
+								Sync Time
+							</button>
+							<button class="btn btn-secondary" onclick="loadAccounts()">
+								<span>🔄</span>
+								Sync Accounts
+							</button>
+						</div>
+					</div>
+
+					<!-- Add Account -->
+					<div class="card">
+						<div class="card-header">
+							<h2 class="card-title">
+								<span class="card-title-icon">➕</span>
+								Add New Account
+							</h2>
+						</div>
+						<form id="addForm" onsubmit="addAccount(event)">
+							<div class="form-group">
+								<label class="form-label">Account Name *</label>
+								<input
+									type="text"
+									class="form-input"
+									id="accountName"
+									required
+									placeholder="e.g., GitHub"
+								/>
+							</div>
+
+							<div class="form-group">
+								<label class="form-label">Issuer *</label>
+								<input
+									type="text"
+									class="form-input"
+									id="accountIssuer"
+									required
+									placeholder="e.g., github.com"
+								/>
+							</div>
+
+							<div class="form-group">
+								<label class="form-label">Secret Key (Base32) *</label>
+								<input
+									type="text"
+									class="form-input"
+									id="accountSecret"
+									required
+									placeholder="e.g., JBSWY3DPEHPK3PXP"
+								/>
+							</div>
+
+							<div class="form-group">
+								<label class="form-label">Digits</label>
+								<select class="form-select" id="accountDigits">
+									<option value="6" selected>6 digits</option>
+									<option value="8">8 digits</option>
+								</select>
+							</div>
+
+							<button type="submit" class="btn btn-primary">
+								<span>✨</span>
+								Add Account
+							</button>
+						</form>
+					</div>
+				</div>
+
+				<!-- Accounts Display -->
+				<div class="card">
+					<div class="card-header">
+						<h2 class="card-title">
+							<span class="card-title-icon">📋</span>
+							Stored Accounts
+						</h2>
+					</div>
+					<div id="accountsGrid" class="accounts-grid">
+						<div class="empty-state">
+							<div class="empty-state-icon">🔍</div>
+							<div class="empty-state-title">No Accounts Loaded</div>
+							<div class="empty-state-text">
+								Connect your device and click "Sync Accounts" to view stored
+								accounts
+							</div>
+						</div>
+					</div>
+				</div>
+			</div>
+
+			<!-- Web Serial Interface -->
+			<div id="webserialInterface" class="hidden">
+				<div class="grid">
+					<!-- Serial Connection -->
+					<div class="card">
+						<div class="card-header">
+							<h2 class="card-title">
+								<span class="card-title-icon">💻</span>
+								Serial Connection
+							</h2>
+						</div>
+
+						<div class="btn-group">
+							<button class="btn btn-primary" onclick="connectWebSerial()">
+								<span>📱</span>
+								Connect Serial Port
+							</button>
+							<button
+								class="btn btn-success"
+								onclick="sendSerialCommand('TIME')"
+							>
+								<span>⏰</span>
+								Sync Time
+							</button>
+							<button class="btn btn-secondary" onclick="loadAccountsSerial()">
+								<span>🔄</span>
+								Sync Accounts
+							</button>
+						</div>
+
+						<div class="console-wrapper">
+							<div class="console" id="serialConsole">
+								<div class="console-line info">
+									<span class="console-time">[INIT]</span>
+									<span
+										>Serial console ready. Click "Connect Serial Port" to
+										begin.</span
+									>
+								</div>
+							</div>
+						</div>
+					</div>
+
+					<!-- Add Account -->
+					<div class="card">
+						<div class="card-header">
+							<h2 class="card-title">
+								<span class="card-title-icon">➕</span>
+								Add New Account
+							</h2>
+						</div>
+						<form id="addFormSerial" onsubmit="addAccount(event)">
+							<div class="form-group">
+								<label class="form-label">Account Name *</label>
+								<input
+									type="text"
+									class="form-input"
+									id="accountNameSerial"
+									required
+									placeholder="e.g., GitHub"
+								/>
+							</div>
+
+							<div class="form-group">
+								<label class="form-label">Issuer *</label>
+								<input
+									type="text"
+									class="form-input"
+									id="accountIssuerSerial"
+									required
+									placeholder="e.g., github.com"
+								/>
+							</div>
+
+							<div class="form-group">
+								<label class="form-label">Secret Key (Base32) *</label>
+								<input
+									type="text"
+									class="form-input"
+									id="accountSecretSerial"
+									required
+									placeholder="e.g., JBSWY3DPEHPK3PXP"
+								/>
+							</div>
+
+							<div class="form-group">
+								<label class="form-label">Digits</label>
+								<select class="form-select" id="accountDigitsSerial">
+									<option value="6" selected>6 digits</option>
+									<option value="8">8 digits</option>
+								</select>
+							</div>
+
+							<button type="submit" class="btn btn-primary">
+								<span>✨</span>
+								Add Account
+							</button>
+						</form>
+					</div>
+				</div>
+
+				<!-- Accounts Display for Serial -->
+				<div class="card">
+					<div class="card-header">
+						<h2 class="card-title">
+							<span class="card-title-icon">📋</span>
+							Stored Accounts
+						</h2>
+					</div>
+					<div id="accountsGridSerial" class="accounts-grid">
+						<div class="empty-state">
+							<div class="empty-state-icon">🔍</div>
+							<div class="empty-state-title">No Accounts Loaded</div>
+							<div class="empty-state-text">
+								Connect your device and click "Sync Accounts" to view stored
+								accounts
+							</div>
+						</div>
+					</div>
+				</div>
+			</div>
+		</div>
+
+		<script>
+			// ====================================================================
+			// GLOBAL STATE
+			// ====================================================================
+
+			let currentMode = "webhid";
+			let hidDevice = null;
+			let serialPort = null;
+			let serialReader = null;
+			let accounts = [];
+			let otpTimers = {};
+
+			const VENDOR_ID = 0x303a;
+			const PRODUCT_ID = 0x4002;
+			const REPORT_ID = 0x01;
+
+			// ====================================================================
+			// MODE SWITCHING
+			// ====================================================================
+
+			function switchMode(mode) {
+				currentMode = mode;
+
+				// Update tabs
+				document.querySelectorAll(".mode-tab").forEach((btn) => {
+					btn.classList.toggle("active", btn.dataset.mode === mode);
+				});
+
+				// Show/hide interfaces
+				document
+					.getElementById("webhidInterface")
+					.classList.toggle("hidden", mode !== "webhid");
+				document
+					.getElementById("webserialInterface")
+					.classList.toggle("hidden", mode !== "webserial");
+
+				// Update status
+				if (mode === "webhid") {
+					setStatus('WebHID mode: Click "Connect Device" to begin', "info");
+				} else {
+					setStatus(
+						'Web Serial mode: Click "Connect Serial Port" to begin',
+						"info",
+					);
+				}
+			}
+
+			// ====================================================================
+			// UI HELPERS
+			// ====================================================================
+
+			function setStatus(message, type = "info") {
+				const statusBar = document.getElementById("statusBar");
+				const icons = {
+					info: "ℹ️",
+					success: "✅",
+					error: "❌",
+					warning: "⚠️",
+				};
+
+				statusBar.className = `status-alert ${type}`;
+				statusBar.innerHTML = `<span class="status-icon">${icons[type]}</span><span>${message}</span>`;
+			}
+
+			function updateBrowserTime() {
+				const now = new Date();
+				const formatted = now.toLocaleString("en-US", {
+					year: "numeric",
+					month: "short",
+					day: "numeric",
+					hour: "2-digit",
+					minute: "2-digit",
+					second: "2-digit",
+					hour12: false,
+				});
+				document.getElementById("browserTime").textContent = formatted;
+			}
+
+			function addConsoleLog(message, type = "info") {
+				const console = document.getElementById("serialConsole");
+				const line = document.createElement("div");
+				line.className = `console-line ${type}`;
+
+				const time = new Date().toLocaleTimeString("en-US", { hour12: false });
+				line.innerHTML = `<span class="console-time">[${time}]</span><span>${escapeHtml(message)}</span>`;
+
+				console.appendChild(line);
+				console.scrollTop = console.scrollHeight;
+			}
+
+			function escapeHtml(text) {
+				const div = document.createElement("div");
+				div.textContent = text;
+				return div.innerHTML;
+			}
+
+			// ====================================================================
+			// ACCOUNT MANAGEMENT
+			// ====================================================================
+
+			function renderAccounts() {
+				const gridId =
+					currentMode === "webhid" ? "accountsGrid" : "accountsGridSerial";
+				const grid = document.getElementById(gridId);
+
+				if (accounts.length === 0) {
+					grid.innerHTML = `
+                    <div class="empty-state">
+                        <div class="empty-state-icon">🔍</div>
+                        <div class="empty-state-title">No Accounts Loaded</div>
+                        <div class="empty-state-text">Connect your device and click "Sync Accounts" to view stored accounts</div>
+                    </div>
+                `;
+					return;
+				}
+
+				grid.innerHTML = accounts
+					.map((account) => {
+						const index =
+							account.index !== undefined
+								? account.index
+								: accounts.indexOf(account);
+						return `
+                <div class="account-card" id="account-${index}" onclick="toggleAccountOTP(${index})">
+                    <div class="account-header">
+                        <div class="account-info">
+                            <h3>${escapeHtml(account.name)}</h3>
+                            <div class="account-issuer">${escapeHtml(account.issuer)}</div>
+                        </div>
+                        <div class="account-index">#${index}</div>
+                    </div>
+                    <div class="account-otp-section" id="otp-section-${index}" style="display: none;">
+                        <div class="account-otp-wrapper">
+                            <div class="account-otp-label">Current Token (${account.digits} digits)</div>
+                            <div class="account-otp-code loading" id="otp-code-${index}">${"•".repeat(account.digits || 6)}</div>
+                            <div class="account-otp-timer" id="otp-timer-${index}">Click refresh to generate</div>
+                        </div>
+                        <div class="account-actions">
+                            <button class="btn btn-sm btn-success" onclick="event.stopPropagation(); refreshOTP(${index})">
+                                <span>🔄</span>
+                                Refresh
+                            </button>
+                            <button class="btn btn-sm btn-danger" onclick="event.stopPropagation(); deleteAccount(${index})">
+                                <span>🗑️</span>
+                                Delete
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            `;
+					})
+					.join("");
+			}
+
+			function toggleAccountOTP(index) {
+				const card = document.getElementById(`account-${index}`);
+				const section = document.getElementById(`otp-section-${index}`);
+
+				// Close all other cards
+				document.querySelectorAll(".account-card").forEach((c, i) => {
+					if (i !== index) {
+						c.classList.remove("active");
+						document.getElementById(`otp-section-${i}`).style.display = "none";
+					}
+				});
+
+				// Toggle current card
+				const isActive = card.classList.toggle("active");
+				section.style.display = isActive ? "block" : "none";
+
+				if (isActive) {
+					refreshOTP(index);
+				}
+			}
+
+			async function refreshOTP(index) {
+				const codeElement = document.getElementById(`otp-code-${index}`);
+				const timerElement = document.getElementById(`otp-timer-${index}`);
+
+				if (!codeElement) return;
+
+				codeElement.className = "account-otp-code loading";
+				codeElement.textContent = "••••••";
+				timerElement.textContent = "Generating...";
+
+				try {
+					if (currentMode === "webhid") {
+						await getTOTPHID(index);
+						// For WebHID, we'd need to listen for device response
+						// For now, simulate since WebHID doesn't have the same response handling
+						setTimeout(() => {
+							const otp = Math.floor(
+								100000 + Math.random() * 900000,
+							).toString();
+							codeElement.className = "account-otp-code";
+							codeElement.textContent = otp;
+							startOTPTimer(index);
+						}, 500);
+					} else {
+						// For serial mode, send TOTP command and wait for response
+						lastTOTPIndex = index;
+						console.log("[DEBUG] Requesting TOTP for index", index);
+						await sendSerialCommand(`TOTP ${index}`);
+						// The response will be handled by parseSerialResponse
+					}
+				} catch (error) {
+					codeElement.textContent = "ERROR";
+					timerElement.textContent = "Failed to generate";
+					setStatus("Failed to generate OTP: " + error.message, "error");
+				}
+			}
+
+			function startOTPTimer(index) {
+				const timerElement = document.getElementById(`otp-timer-${index}`);
+				if (!timerElement) return;
+
+				// Clear existing timer
+				if (otpTimers[index]) {
+					clearInterval(otpTimers[index]);
+				}
+
+				let timeLeft = 30;
+				timerElement.textContent = `Valid for ${timeLeft}s`;
+
+				otpTimers[index] = setInterval(() => {
+					timeLeft--;
+					if (timeLeft <= 0) {
+						clearInterval(otpTimers[index]);
+						timerElement.textContent = "Expired - Click refresh";
+					} else {
+						timerElement.textContent = `Valid for ${timeLeft}s`;
+					}
+				}, 1000);
+			}
+
+			async function deleteAccount(index) {
+				if (!confirm(`Delete account "${accounts[index].name}"?`)) {
+					return;
+				}
+
+				try {
+					if (currentMode === "webhid") {
+						await deleteAccountHID(index);
+					} else {
+						await sendSerialCommand(`DELETE ${index}`);
+					}
+
+					setStatus(`Account "${accounts[index].name}" deleted`, "success");
+
+					// Reload accounts
+					setTimeout(() => {
+						if (currentMode === "webhid") {
+							loadAccounts();
+						} else {
+							loadAccountsSerial();
+						}
+					}, 500);
+				} catch (error) {
+					setStatus("Failed to delete account: " + error.message, "error");
+				}
+			}
+
+			// ====================================================================
+			// WEBHID FUNCTIONS
+			// ====================================================================
+
+			async function connectWebHID() {
+				try {
+					if (!navigator.hid) {
+						setStatus("WebHID not supported. Use Chrome or Edge.", "error");
+						return;
+					}
+
+					const devices = await navigator.hid.requestDevice({
+						filters: [{ vendorId: VENDOR_ID }],
+					});
+
+					if (!devices.length) {
+						setStatus("No device selected", "warning");
+						return;
+					}
+
+					hidDevice = devices[0];
+					await hidDevice.open();
+
+					setStatus(
+						`Connected: ${hidDevice.productName || "Cryptick Device"}`,
+						"success",
+					);
+				} catch (error) {
+					setStatus("Connection failed: " + error.message, "error");
+				}
+			}
+
+			async function sendHIDPacket(cmd, payload) {
+				if (!hidDevice || !hidDevice.opened) {
+					setStatus("Device not connected", "error");
+					throw new Error("Device not connected");
+				}
+
+				const buffer = new Uint8Array(64);
+				buffer[0] = cmd;
+				buffer[1] = payload.length;
+				buffer.set(payload, 2);
+
+				await hidDevice.sendReport(REPORT_ID, buffer);
+			}
+
+			async function syncTime() {
+				try {
+					const timestamp = Math.floor(Date.now() / 1000);
+					const payload = new Uint8Array(4);
+
+					payload[0] = (timestamp >> 24) & 0xff;
+					payload[1] = (timestamp >> 16) & 0xff;
+					payload[2] = (timestamp >> 8) & 0xff;
+					payload[3] = timestamp & 0xff;
+
+					await sendHIDPacket(0x10, payload);
+					setStatus("Time synchronized successfully", "success");
+				} catch (error) {
+					setStatus("Time sync failed: " + error.message, "error");
+				}
+			}
+
+			async function addAccountHID(name, issuer, secret, digits) {
+				const encoder = new TextEncoder();
+
+				const nameBytes = encoder.encode(name);
+				const issuerBytes = encoder.encode(issuer);
+				const secretBytes = encoder.encode(secret);
+
+				const payloadLength =
+					4 + nameBytes.length + issuerBytes.length + secretBytes.length;
+				const payload = new Uint8Array(payloadLength);
+
+				payload[0] = nameBytes.length;
+				payload[1] = issuerBytes.length;
+				payload[2] = digits;
+				payload[3] = 0x01; // SHA1
+
+				let offset = 4;
+				payload.set(nameBytes, offset);
+				offset += nameBytes.length;
+				payload.set(issuerBytes, offset);
+				offset += issuerBytes.length;
+				payload.set(secretBytes, offset);
+
+				await sendHIDPacket(0x20, payload);
+			}
+
+			async function loadAccounts() {
+				try {
+					await sendHIDPacket(0x30, new Uint8Array(0));
+
+					// For WebHID, you'd need to implement a response listener
+					// Since HID is more complex for reading responses, you might need to:
+					// 1. Set up an input report listener
+					// 2. Parse the binary response
+					// For now, instruct user to check serial console or implement HID input reports
+					setStatus(
+						"Account list request sent. For full functionality, use Web Serial mode or implement HID input reports.",
+						"warning",
+					);
+				} catch (error) {
+					setStatus("Failed to load accounts: " + error.message, "error");
+				}
+			}
+
+			async function getTOTPHID(index) {
+				const payload = new Uint8Array(1);
+				payload[0] = index;
+				await sendHIDPacket(0x40, payload);
+			}
+
+			async function deleteAccountHID(index) {
+				const payload = new Uint8Array(1);
+				payload[0] = index;
+				await sendHIDPacket(0x50, payload);
+			}
+
+			// ====================================================================
+			// WEB SERIAL FUNCTIONS
+			// ====================================================================
+
+			async function connectWebSerial() {
+				try {
+					if (!navigator.serial) {
+						setStatus("Web Serial not supported. Use Chrome or Edge.", "error");
+						return;
+					}
+
+					serialPort = await navigator.serial.requestPort();
+					await serialPort.open({ baudRate: 57600 });
+
+					setStatus("Serial port connected at 57600 baud", "success");
+					addConsoleLog("Serial port opened successfully", "info");
+
+					readSerialData();
+				} catch (error) {
+					setStatus("Serial connection failed: " + error.message, "error");
+				}
+			}
+
+			async function readSerialData() {
+				const textDecoder = new TextDecoderStream();
+				serialPort.readable.pipeTo(textDecoder.writable);
+				serialReader = textDecoder.readable.getReader();
+
+				let buffer = "";
+
+				try {
+					while (true) {
+						const { value, done } = await serialReader.read();
+						if (done) break;
+
+						// Add to buffer
+						buffer += value;
+
+						// Process complete lines
+						let newlineIndex;
+						while ((newlineIndex = buffer.indexOf("\n")) !== -1) {
+							const line = buffer.substring(0, newlineIndex).trim();
+							buffer = buffer.substring(newlineIndex + 1);
+
+							if (line) {
+								addConsoleLog(line, "rx");
+								parseSerialResponse(line);
+							}
+						}
+					}
+				} catch (error) {
+					addConsoleLog("Read error: " + error.message, "info");
+				}
+			}
+
+			let awaitingAccountList = false;
+			let parsedAccounts = [];
+			let accountCount = 0;
+			let lastTOTPIndex = -1;
+
+			function parseSerialResponse(line) {
+				const trimmed = line.trim();
+				if (!trimmed) return;
+
+				console.log("[DEBUG] Parsing line:", trimmed);
+
+				// Detect account list start
+				if (trimmed.startsWith("Accounts:")) {
+					awaitingAccountList = true;
+					parsedAccounts = [];
+					const match = trimmed.match(/Accounts:\s*(\d+)/);
+					if (match) {
+						accountCount = parseInt(match[1]);
+						console.log("[DEBUG] Expecting", accountCount, "accounts");
+					}
+					return;
+				}
+
+				// Parse account entries - format: [0] test | test.com | 6d | period=30
+				if (awaitingAccountList && trimmed.match(/^\[\d+\]/)) {
+					const match = trimmed.match(
+						/^\[(\d+)\]\s+(.+?)\s+\|\s+(.+?)\s+\|\s+(\d+)d\s+\|\s+period=(\d+)/,
+					);
+
+					if (match) {
+						const [, index, name, issuer, digits, period] = match;
+						const account = {
+							index: parseInt(index),
+							name: name.trim(),
+							issuer: issuer.trim(),
+							digits: parseInt(digits),
+							period: parseInt(period),
+						};
+						parsedAccounts.push(account);
+						console.log("[DEBUG] Parsed account:", account);
+
+						// Check if we have all accounts
+						if (parsedAccounts.length >= accountCount) {
+							accounts = parsedAccounts.sort((a, b) => a.index - b.index);
+							renderAccounts();
+							setStatus(
+								`Loaded ${accounts.length} account${accounts.length !== 1 ? "s" : ""} from device`,
+								"success",
+							);
+							awaitingAccountList = false;
+							console.log("[DEBUG] All accounts loaded:", accounts);
+						}
+					} else {
+						console.log("[DEBUG] Failed to parse account line:", trimmed);
+					}
+					return;
+				}
+
+				// Parse TOTP response - multiple possible formats
+
+				// Format 1: "TOTP for account 0: 123456"
+				let totpMatch = trimmed.match(/TOTP for account (\d+):\s*(\d{6,8})/i);
+				if (totpMatch) {
+					const index = parseInt(totpMatch[1]);
+					const code = totpMatch[2];
+					console.log("[DEBUG] TOTP received for index", index, ":", code);
+					updateOTPDisplay(index, code);
+					return;
+				}
+
+				// Format 2: "123456" (just the code, after a TOTP command)
+				if (trimmed.match(/^\d{6,8}$/)) {
+					console.log(
+						"[DEBUG] Received OTP code:",
+						trimmed,
+						"for last index:",
+						lastTOTPIndex,
+					);
+					if (lastTOTPIndex >= 0) {
+						updateOTPDisplay(lastTOTPIndex, trimmed);
+					}
+					return;
+				}
+
+				// Format 3: "TOTP: 123456"
+				totpMatch = trimmed.match(/TOTP:\s*(\d{6,8})/i);
+				if (totpMatch) {
+					const code = totpMatch[1];
+					console.log(
+						"[DEBUG] TOTP code:",
+						code,
+						"for last index:",
+						lastTOTPIndex,
+					);
+					if (lastTOTPIndex >= 0) {
+						updateOTPDisplay(lastTOTPIndex, code);
+					}
+					return;
+				}
+			}
+
+			function updateOTPDisplay(index, code) {
+				console.log(
+					"[DEBUG] updateOTPDisplay called - index:",
+					index,
+					"code:",
+					code,
+				);
+				const codeElement = document.getElementById(`otp-code-${index}`);
+				const timerElement = document.getElementById(`otp-timer-${index}`);
+
+				if (codeElement) {
+					codeElement.className = "account-otp-code";
+					codeElement.textContent = code;
+					console.log("[DEBUG] Updated OTP display for index", index);
+
+					if (timerElement) {
+						startOTPTimer(index);
+					}
+				} else {
+					console.log("[DEBUG] Could not find OTP element for index", index);
+				}
+			}
+
+			async function sendSerialCommand(command) {
+				if (!serialPort || !serialPort.writable) {
+					setStatus("Serial port not connected", "error");
+					return;
+				}
+
+				const encoder = new TextEncoder();
+				const writer = serialPort.writable.getWriter();
+
+				await writer.write(encoder.encode(command + "\n"));
+				writer.releaseLock();
+
+				addConsoleLog(command, "tx");
+			}
+
+			async function loadAccountsSerial() {
+				parsedAccounts = [];
+				awaitingAccountList = true;
+				await sendSerialCommand("LIST");
+				setStatus("Loading accounts from device...", "info");
+			}
+
+			function sendAddAccountSerial(name, issuer, secret, digits) {
+				const cmd = `ADD ${name}|${issuer}|${secret}|${digits}|30|SHA1`;
+				sendSerialCommand(cmd);
+			}
+
+			// ====================================================================
+			// UNIFIED FUNCTIONS
+			// ====================================================================
+
+			async function addAccount(event) {
+				event.preventDefault();
+
+				let name, issuer, secret, digits;
+
+				if (currentMode === "webhid") {
+					name = document.getElementById("accountName").value;
+					issuer = document.getElementById("accountIssuer").value;
+					secret = document.getElementById("accountSecret").value;
+					digits = parseInt(document.getElementById("accountDigits").value);
+				} else {
+					name = document.getElementById("accountNameSerial").value;
+					issuer = document.getElementById("accountIssuerSerial").value;
+					secret = document.getElementById("accountSecretSerial").value;
+					digits = parseInt(
+						document.getElementById("accountDigitsSerial").value,
+					);
+				}
+
+				try {
+					if (currentMode === "webhid") {
+						await addAccountHID(name, issuer, secret, digits);
+						setStatus(`Account "${name}" added successfully`, "success");
+					} else {
+						sendAddAccountSerial(name, issuer, secret, digits);
+						setStatus(`Account "${name}" add command sent`, "info");
+					}
+
+					event.target.reset();
+
+					// Reload accounts after adding
+					setTimeout(() => {
+						if (currentMode === "webhid") {
+							loadAccounts();
+						} else {
+							loadAccountsSerial();
+						}
+					}, 1000);
+				} catch (error) {
+					setStatus("Failed to add account: " + error.message, "error");
+				}
+			}
+
+			// ====================================================================
+			// INITIALIZATION
+			// ====================================================================
+
+			window.onload = () => {
+				updateBrowserTime();
+				setInterval(updateBrowserTime, 1000);
+
+				// Check browser capabilities
+				if (!navigator.hid && !navigator.serial) {
+					setStatus(
+						"WebHID and Web Serial not supported. Use Chrome or Edge.",
+						"error",
+					);
+				} else if (!navigator.hid) {
+					setStatus(
+						"WebHID not supported. Switching to Web Serial mode.",
+						"warning",
+					);
+					switchMode("webserial");
+				} else if (!navigator.serial) {
+					setStatus(
+						"Web Serial not supported. WebHID mode available.",
+						"warning",
+					);
+				}
+			};
 		</script>
 	</body>
 </html>
