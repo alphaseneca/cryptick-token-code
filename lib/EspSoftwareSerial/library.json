@@ -1,0 +1,7 @@
+{
+  "name": "EspSoftwareSerial",
+  "version": "5.0.0",
+  "description": "ESP8266-compatible SoftwareSerial (local, no override/constexpr issues)",
+  "frameworks": "arduino",
+  "platforms": "espressif8266"
+}
