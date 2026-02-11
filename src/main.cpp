@@ -1,14 +1,17 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <Adafruit_SSD1306.h>
+#include "config.h"
 #ifdef ENABLE_WEBSERVER
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
 #endif
+#ifdef ENABLE_FINGERPRINT
+#include <SoftwareSerial.h>
+#include "R558SFingerprint.h"
+#endif
 #include <LittleFS.h>
 #include <RTClib.h>
-
-#include "config.h"
 #include "types.h"
 #include "display.h"
 #include "storage.h"
@@ -22,6 +25,11 @@ RTC_DS3231 rtc;
 #ifdef ENABLE_WEBSERVER
 ESP8266WebServer server(80);
 #endif
+#ifdef ENABLE_FINGERPRINT
+SoftwareSerial fingerprintSerial(FINGERPRINT_RX, FINGERPRINT_TX);
+R558SFingerprint finger(fingerprintSerial);
+bool fingerprintReady = false;  // true only when sensor is present and init OK
+#endif
 
 // Application state
 std::vector<TOTPAccount> accounts;
@@ -32,10 +40,15 @@ unsigned long lastDisplayUpdate = 0;
 
 void setup()
 {
+  // Let 3.3V and I/O settle before any peripherals (helps intermittent boot)
+  delay(300);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);  // GPIO0: ensure pull-up before anything else
+  delay(100);
+
   Serial.begin(57600);
   Wire.begin(OLED_SDA, OLED_SCL);
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
-  delay(1000);
+  delay(200);  // I2C bus and peripherals power-up
+  yield();
 
   Serial.println("TOTP Device Starting...");
 
@@ -46,6 +59,7 @@ void setup()
     while (1)
       delay(10);
   }
+  yield();
 
   // Initialize filesystem
   if (!LittleFS.begin())
@@ -58,6 +72,7 @@ void setup()
     while (1)
       delay(10);
   }
+  yield();
 
   // Initialize RTC
   display.clearDisplay();
@@ -84,6 +99,7 @@ void setup()
     Serial.println("RTC lost power, setting compile time");
     rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
   }
+  yield();
 
   DateTime now = rtc.now();
   Serial.printf("RTC: %04d-%02d-%02d %02d:%02d:%02d\n",
@@ -95,10 +111,12 @@ void setup()
   display.println("RTC OK!");
   display.printf("Time: %02d:%02d:%02d", now.hour(), now.minute(), now.second());
   display.display();
-  delay(1000);
+  delay(800);
+  yield();
 
   // Load configuration
   loadConfiguration(accounts);
+  yield();
 
   // Setup WiFi AP (only when webserver enabled)
 #ifdef ENABLE_WEBSERVER
@@ -109,6 +127,7 @@ void setup()
 
   WiFi.mode(WIFI_AP);
   WiFi.softAP(AP_SSID, AP_PASSWORD);
+  yield();  // WiFi causes current spike; let supply settle
 
   display.clearDisplay();
   display.setCursor(0, 0);
@@ -129,38 +148,89 @@ void setup()
 #else
   Serial.println("Web server disabled by build configuration");
 #endif
+  // Initialize fingerprint only when enabled; use it only when device responds
+#ifdef ENABLE_FINGERPRINT
+  fingerprintSerial.begin(FINGERPRINT_BAUD);
+  finger.setDebug(false);  // set true for R558-S packet debug
+  if (finger.begin(FINGERPRINT_BAUD) == FINGERPRINT_OK) {
+    fingerprintReady = true;
+    Serial.println("R558-S fingerprint ready");
+#if FINGERPRINT_LED_READY
+    finger.setLed(FINGERPRINT_LED_READY);  // LED from config (e.g. green = ready)
+#endif
+  } else {
+    fingerprintReady = false;
+    Serial.println("R558-S not found (skip fingerprint)");
+  }
+#endif
+
   // Initialize device status
   deviceStatus.wifiConnected = false;
   deviceStatus.batteryLevel = 85;
   deviceStatus.username = "User";
   deviceStatus.currentTime = rtc.now();
   Serial.println("TOTP Device Ready!");
+
+  // Show home clock immediately (don't leave screen on "RTC OK")
+  display.clearDisplay();
+  renderClockPage(display, deviceStatus);
+  display.display();
+  lastDisplayUpdate = millis();
 }
 void loop()
 {
 #ifdef ENABLE_WEBSERVER
   server.handleClient();
 #endif
-  processSerialCommands(Serial, rtc, accounts);
-  // Update status
+  processSerialCommands(Serial, rtc, accounts
+#ifdef ENABLE_FINGERPRINT
+      , &finger, fingerprintReady
+#endif
+  );
+
   deviceStatus.currentTime = rtc.now();
 #ifdef ENABLE_WEBSERVER
   deviceStatus.wifiConnected = WiFi.softAPgetStationNum() > 0;
 #else
   deviceStatus.wifiConnected = false;
 #endif
-  // Handle navigation
+
+  // Button and display first so UI stays responsive (no long blocking before these)
   handleNavigation(currentPage, currentAccountIndex, accounts.size(), BUTTON_PIN);
-  // Update display
-  if (millis() - lastDisplayUpdate >= DISPLAY_UPDATE_INTERVAL)
+
+  unsigned long now = millis();
+  if (now - lastDisplayUpdate >= DISPLAY_UPDATE_INTERVAL)
   {
     display.clearDisplay();
     if (currentPage == PAGE_CLOCK)
       renderClockPage(display, deviceStatus);
     else
       renderTOTPPage(display, deviceStatus, accounts, currentAccountIndex, rtc);
-
     display.display();
-    lastDisplayUpdate = millis();
+    lastDisplayUpdate = now;
   }
+
+  // Throttle fingerprint: poll only every FINGERPRINT_POLL_INTERVAL_MS so loop stays fast
+#ifdef ENABLE_FINGERPRINT
+  static unsigned long lastFingerPoll = 0;
+  if (fingerprintReady && (now - lastFingerPoll >= FINGERPRINT_POLL_INTERVAL_MS))
+  {
+    lastFingerPoll = now;
+    uint16_t id, score;
+    int r = finger.getFingerprintID(&id, &score);
+    if (r == FINGERPRINT_OK)
+    {
+      Serial.printf("Finger matched ID=%u score=%u\n", (unsigned)id, (unsigned)score);
+      deviceStatus.username = "ID:" + String(id);
+#if FINGERPRINT_LED_MATCH
+      finger.setLed(FINGERPRINT_LED_MATCH);
+#endif
+      delay(800);
+#if FINGERPRINT_LED_READY
+      finger.setLed(FINGERPRINT_LED_READY);
+#endif
+    }
+  }
+#endif
+  yield();  // let ESP8266 run background tasks (WiFi, etc.) for smoother UI
 }

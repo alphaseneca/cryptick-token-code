@@ -6,6 +6,8 @@
 #include <RTClib.h>
 #include "types.h"
 
-void processSerialCommands(Stream &serial, RTC_DS3231 &rtc, std::vector<TOTPAccount> &accounts);
+// Optional: pass finger (void* to R558SFingerprint*) and fingerprintReady for FINGER_* commands
+void processSerialCommands(Stream &serial, RTC_DS3231 &rtc, std::vector<TOTPAccount> &accounts,
+    void* finger = nullptr, bool fingerprintReady = false);
 
 #endif

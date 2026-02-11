@@ -1,7 +1,11 @@
 #include "serial_comm.h"
+#include "config.h"
 #include "totp_core.h"
 #include "storage.h"
 #include <Arduino.h>
+#ifdef ENABLE_FINGERPRINT
+#include "R558SFingerprint.h"
+#endif
 
 static String trimStr(const String &s)
 {
@@ -18,8 +22,12 @@ static void printDateTime(Stream &serial, const DateTime &dt)
     serial.println(buf);
 }
 
-void processSerialCommands(Stream &serial, RTC_DS3231 &rtc, std::vector<TOTPAccount> &accounts)
+void processSerialCommands(Stream &serial, RTC_DS3231 &rtc, std::vector<TOTPAccount> &accounts,
+    void* finger, bool fingerprintReady)
 {
+#ifdef ENABLE_FINGERPRINT
+    R558SFingerprint* fp = (R558SFingerprint*)finger;
+#endif
     static String line = "";
     while (serial.available())
     {
@@ -184,6 +192,60 @@ void processSerialCommands(Stream &serial, RTC_DS3231 &rtc, std::vector<TOTPAcco
                     }
                 }
             }
+#ifdef ENABLE_FINGERPRINT
+            else if (fingerprintReady && fp && (name == "FINGER_ENROLL" || name == "FINGER_ADD"))
+            {
+                uint16_t id = 0xFFFF;
+                args.trim();
+                if (args.length()) id = (uint16_t)args.toInt();
+#if FINGERPRINT_LED_ENROLL
+                fp->setLed(FINGERPRINT_LED_ENROLL);  // e.g. blue during enroll
+#endif
+                serial.println("FINGER_ENROLL: Follow the step-by-step prompts below.");
+                int r = fp->enrollFingerprint(id, &serial);
+                serial.print("Enroll result: ");
+                serial.println(R558SFingerprint::getErrorMessage(r));
+                if (r == 0) {
+                    uint16_t n;
+                    fp->getTemplateCount(&n);
+                    serial.printf("Stored. Total templates: %u\n", (unsigned)n);
+#if FINGERPRINT_LED_READY
+                    fp->setLed(FINGERPRINT_LED_READY);
+#endif
+                } else {
+#if FINGERPRINT_LED_ERROR
+                    fp->setLed(FINGERPRINT_LED_ERROR);
+#endif
+                }
+            }
+            else if (fingerprintReady && fp && (name == "FINGER_DELETE" || name == "FINGER_DEL"))
+            {
+                args.trim();
+                if (args.length() == 0) serial.println("Usage: FINGER_DELETE <id>");
+                else {
+                    uint16_t id = (uint16_t)args.toInt();
+                    int r = fp->deleteModel(id);
+                    serial.print("Delete: ");
+                    serial.println(R558SFingerprint::getErrorMessage(r));
+                }
+            }
+            else if (fingerprintReady && fp && name == "FINGER_COUNT")
+            {
+                uint16_t n;
+                int r = fp->getTemplateCount(&n);
+                if (r == 0) serial.printf("Templates: %u\n", (unsigned)n);
+                else {
+                    serial.printf("Failed to get count (error 0x%02X: %s)\n", r, R558SFingerprint::getErrorMessage(r));
+                    serial.println("(Check wiring/baud; 0x1D response may vary by module.)");
+                }
+            }
+            else if (fingerprintReady && fp && (name == "FINGER_CLEAR" || name == "FINGER_EMPTY"))
+            {
+                int r = fp->emptyDatabase();
+                serial.print("Clear all: ");
+                serial.println(R558SFingerprint::getErrorMessage(r));
+            }
+#endif
             else if (name == "HELP" || name == "?")
             {
                 serial.println("Available commands:");
@@ -193,6 +255,14 @@ void processSerialCommands(Stream &serial, RTC_DS3231 &rtc, std::vector<TOTPAcco
                 serial.println("TOTP <index>        - show generated TOTP for account index");
                 serial.println("ADD Name|Issuer|Secret|digits|period|algorithm - add account");
                 serial.println("DELETE <index>      - delete account and save");
+#ifdef ENABLE_FINGERPRINT
+                if (fingerprintReady) {
+                    serial.println("FINGER_ENROLL [id]  - add fingerprint; 4 placements of same finger (id optional)");
+                    serial.println("FINGER_DELETE <id>  - delete fingerprint by id");
+                    serial.println("FINGER_COUNT        - show number of stored templates");
+                    serial.println("FINGER_CLEAR        - delete all fingerprints");
+                }
+#endif
             }
             else
             {
