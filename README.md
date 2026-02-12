@@ -21,12 +21,12 @@ A hardware TOTP (Time-based One-Time Password) authenticator with optional finge
 
 ### Pinout (config in `src/config.h`)
 
-| Function        | Pin        |
-|----------------|------------|
-| OLED SDA       | GPIO14 (D5)|
-| OLED SCL       | GPIO12 (D6)|
-| RTC            | Same I2C (SDA/SCL) |
-| Button         | GPIO0 (FLASH)     |
+| Function       | Pin                                     |
+| -------------- | --------------------------------------- |
+| OLED SDA       | GPIO14 (D5)                             |
+| OLED SCL       | GPIO12 (D6)                             |
+| RTC            | Same I2C (SDA/SCL)                      |
+| Button         | GPIO0 (FLASH)                           |
 | Fingerprint RX | GPIO13 (D7) — when `ENABLE_FINGERPRINT` |
 | Fingerprint TX | GPIO15 (D8) — when `ENABLE_FINGERPRINT` |
 
@@ -73,20 +73,20 @@ pio device monitor -b 57600
 
 Line-based: one command per line, newline terminator. All time is **Unix/POSIX** (seconds since 1970-01-01 00:00:00 UTC).
 
-| Command | Description |
-|--------|-------------|
-| `DATE` | Show current date/time and Unix timestamp |
-| `DATE <unix_ts>` | Set RTC (alias for SETTIME) |
-| `SETTIME <unix_ts>` | Set RTC from Unix timestamp |
-| `TOTP_ADD <otpauth_uri>` | Add credential. Use `otpauth://totp/...` or `otp://totp/...` |
-| `TOTP_LIST` | List credentials (index, label, issuer, digits, period) |
-| `TOTP <index>` | Generate current TOTP for credential at index |
-| `TOTP_DELETE <index>` | Delete credential at index and save |
-| `HELP` or `?` | Show command list |
-| `FINGER_ENROLL` [id] | Enroll fingerprint (optional id). Only when ENABLE_FINGERPRINT |
-| `FINGER_DELETE <id>` | Delete fingerprint by id |
-| `FINGER_COUNT` | Number of stored fingerprints |
-| `FINGER_CLEAR` | Clear all fingerprints |
+| Command                  | Description                                                    |
+| ------------------------ | -------------------------------------------------------------- |
+| `DATE`                   | Show current date/time and Unix timestamp                      |
+| `DATE <unix_ts>`         | Set RTC (alias for SETTIME)                                    |
+| `SETTIME <unix_ts>`      | Set RTC from Unix timestamp                                    |
+| `TOTP_ADD <otpauth_uri>` | Add credential. Use `otpauth://totp/...` or `otp://totp/...`   |
+| `TOTP_LIST`              | List credentials (index, label, issuer, digits, period)        |
+| `TOTP <index>`           | Generate current TOTP for credential at index                  |
+| `TOTP_DELETE <index>`    | Delete credential at index and save                            |
+| `HELP` or `?`            | Show command list                                              |
+| `FINGER_ENROLL` [id]     | Enroll fingerprint (optional id). Only when ENABLE_FINGERPRINT |
+| `FINGER_DELETE <id>`     | Delete fingerprint by id                                       |
+| `FINGER_COUNT`           | Number of stored fingerprints                                  |
+| `FINGER_CLEAR`           | Clear all fingerprints                                         |
 
 No legacy aliases (TIME, ACCOUNTS, LIST, ADD, DELETE, GET); only the above are accepted. Full reference: `src/serial_comm.h`.
 
@@ -107,7 +107,7 @@ Edit `src/config.h`:
 - **ENABLE_FINGERPRINT** — Define to enable R558-S and fingerprint-gated pages; comment out to disable
 - **INACTIVITY_TIMEOUT_SEC** — Seconds without button press before return to clock and clear auth (e.g. 30)
 - **AUTH_ERROR_DISPLAY_MS** — How long to show “Fingerprint could not be verified” (e.g. 2000)
-- **FINGERPRINT_LED_*** — LED colors (ready, error, match, etc.)
+- **FINGERPRINT*LED*\*** — LED colors (ready, error, match, etc.)
 
 ## Project structure
 
@@ -144,4 +144,4 @@ MIT. See LICENSE file.
 
 ---
 
-**Built for hardware 2FA.** For full implementation details and serial semantics, see `docs/IMPLEMENTATION_PLAN.md` and `src/serial_comm.h`.
+**Built with ❤️ for hardware 2FA enthusiasts**
