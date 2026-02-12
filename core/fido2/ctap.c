@@ -1,0 +1,3 @@
+#include "ctap.h"
+
+/* Stub. */

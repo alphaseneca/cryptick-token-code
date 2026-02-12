@@ -12,11 +12,8 @@
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 
-// WiFi Access Point Configuration
-#define AP_SSID "TOTP-Device"
-#define AP_PASSWORD "12345678"
-
-// R558-S Fingerprint (comment out ENABLE_FINGERPRINT to disable at compile time)
+// R558-S Fingerprint: define ENABLE_FINGERPRINT to enable (only clock does not require fingerprint).
+// Comment out the line below to disable: no fingerprint driver, all pages accessible without verification.
 // Pins D7/D8 (GPIO13/15) - does not use D5/D6 (OLED I2C on HW364A)
 #define ENABLE_FINGERPRINT
 #define FINGERPRINT_RX 13 // GPIO13 (D7) - ESP RX <- sensor TX
@@ -32,8 +29,12 @@
 // Application Configuration
 #define TOTP_PERIOD 30
 #define DISPLAY_UPDATE_INTERVAL 1000
-#define BUTTON_DEBOUNCE_MS 200
+#define BUTTON_DEBOUNCE_MS 60
 #define CONFIG_FILE "/totp_config.json"
+// If no button press for this many seconds when not on clock: go to clock and clear auth
+#define INACTIVITY_TIMEOUT_SEC 30
+// How long to show fingerprint error screen before returning to clock (ms)
+#define AUTH_ERROR_DISPLAY_MS 2000
 // Fingerprint poll interval (ms) - higher = smoother UI/button, slower finger detection
 #define FINGERPRINT_POLL_INTERVAL_MS 280
 

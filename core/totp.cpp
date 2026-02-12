@@ -1,7 +1,7 @@
-#include "totp_core.h"
+#include "totp.h"
 #include <TOTP.h>
 
-int base32_decode(const char *encoded, uint8_t *result, int bufSize)
+int totp_base32_decode(const char *encoded, uint8_t *result, int bufSize)
 {
     const char *base32_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
     int buffer = 0, bitsLeft = 0, count = 0;
@@ -29,18 +29,18 @@ int base32_decode(const char *encoded, uint8_t *result, int bufSize)
     return count;
 }
 
-String generateTOTP(const TOTPAccount &account, time_t timestamp)
+String totp_generate(const TOTPCredential &cred, uint32_t timestamp)
 {
     if (timestamp == 0)
         return "RTC Error";
 
     uint8_t key[32];
-    int keyLen = base32_decode(account.secret.c_str(), key, sizeof(key));
+    int keyLen = totp_base32_decode(cred.secret.c_str(), key, sizeof(key));
 
     if (keyLen == 0)
         return "Invalid Secret";
 
     TOTP totp(key, keyLen);
-    char *code = totp.getCode(timestamp);
+    char *code = totp.getCode((unsigned long)timestamp);
     return String(code);
 }

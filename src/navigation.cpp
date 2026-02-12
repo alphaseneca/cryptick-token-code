@@ -1,44 +1,43 @@
 #include "navigation.h"
-#include "config.h"
+#include "auth_handler.h"
+#include "../core/device.h"
 
-void handleNavigation(PageType &currentPage, int &accountIndex,
-                      int accountCount, int buttonPin)
+void handleNavigation(PageEnum &currentPage, int &accountIndex, int accountCount, unsigned long currentTimeMs)
 {
-    static bool lastState = HIGH;
-    static unsigned long lastPress = 0;
+    if (!device_button_state())
+        return;
 
-    bool currentState = digitalRead(buttonPin);
-
-    if (lastState == HIGH && currentState == LOW)
+    if (currentPage == PAGE_CLOCK)
     {
-        if (millis() - lastPress > BUTTON_DEBOUNCE_MS)
+        currentPage = auth_handler_page_to_show(PAGE_TOTP);
+        accountIndex = 0;
+        auth_handler_record_activity(currentTimeMs);
+    }
+    else if (currentPage == PAGE_AUTH_PROMPT)
+    {
+        currentPage = PAGE_CLOCK;
+    }
+    else if (currentPage == PAGE_TOTP)
+    {
+        auth_handler_record_activity(currentTimeMs);
+        if (accountCount > 1)
         {
-            lastPress = millis();
-
-            if (currentPage == PAGE_CLOCK)
+            accountIndex++;
+            if (accountIndex >= accountCount)
             {
-                currentPage = PAGE_TOTP;
+                currentPage = PAGE_CLOCK;
                 accountIndex = 0;
             }
-            else if (currentPage == PAGE_TOTP)
-            {
-                if (accountCount > 1)
-                {
-                    accountIndex++;
-                    if (accountIndex >= accountCount)
-                    {
-                        currentPage = PAGE_CLOCK;
-                        accountIndex = 0;
-                    }
-                }
-                else
-                {
-                    currentPage = PAGE_CLOCK;
-                    accountIndex = 0;
-                }
-            }
+        }
+        else
+        {
+            currentPage = PAGE_CLOCK;
+            accountIndex = 0;
         }
     }
-
-    lastState = currentState;
+    else if (currentPage == PAGE_SETTINGS)
+    {
+        auth_handler_record_activity(currentTimeMs);
+        currentPage = PAGE_CLOCK;
+    }
 }

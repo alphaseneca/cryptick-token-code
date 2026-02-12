@@ -1,4 +1,4 @@
-#include "R558SFingerprint.h"
+#include "fingerprint_r558s.h"
 
 R558SFingerprint::R558SFingerprint(Stream &ss) : _ss(ss) {}
 
@@ -177,9 +177,26 @@ int R558SFingerprint::parseAck(uint8_t ack) {
 
 // LED cmd 0x3C (mode, startColor, endColor, cycles). Colors: 0x01 blue, 0x02 green, 0x04 red.
 int R558SFingerprint::setLed(uint8_t color) {
+  _ledOffAtMs = 0;
   if (color == 0) return setLedEx(R558_LED_MODE_OFF, 0, 0);
   uint8_t c = (color == 1) ? R558_LED_COLOR_RED : (color == 2) ? R558_LED_COLOR_GREEN : R558_LED_COLOR_BLUE;
   return setLedEx(R558_LED_MODE_ON, c, 0);
+}
+int R558SFingerprint::setLedOnFor(uint8_t color, uint32_t durationMs) {
+  if (color == 0 || durationMs == 0) {
+    _ledOffAtMs = 0;
+    return setLed(0);
+  }
+  int r = setLed(color);
+  if (r == FINGERPRINT_OK)
+    _ledOffAtMs = millis() + durationMs;
+  return r;
+}
+void R558SFingerprint::ledUpdate() {
+  if (_ledOffAtMs != 0 && (uint32_t)millis() >= _ledOffAtMs) {
+    _ledOffAtMs = 0;
+    setLed(0);
+  }
 }
 int R558SFingerprint::setLedEx(uint8_t mode, uint8_t color, uint8_t cycles) {
   uint8_t cmd[] = {0x3C, mode, color, color, cycles};

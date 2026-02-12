@@ -1,10 +1,10 @@
 #include "serial_comm.h"
 #include "config.h"
-#include "totp_core.h"
 #include "storage.h"
-#include <Arduino.h>
+#include "../core/device.h"
+#include <RTClib.h>
 #ifdef ENABLE_FINGERPRINT
-#include "R558SFingerprint.h"
+#include "../drivers/fingerprint_r558s.h"
 #endif
 
 static String trimStr(const String &s)
@@ -14,19 +14,115 @@ static String trimStr(const String &s)
     return t;
 }
 
-static void printDateTime(Stream &serial, const DateTime &dt)
+/** Decode %XX and + in a URI component. */
+static String url_decode(const String &s)
 {
-    char buf[64];
-    snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d (unix: %lu)",
-             dt.year(), dt.month(), dt.day(), dt.hour(), dt.minute(), dt.second(), (unsigned long)dt.unixtime());
-    serial.println(buf);
+    String out;
+    for (int i = 0; i < (int)s.length(); i++)
+    {
+        char c = s[i];
+        if (c == '+')
+            out += ' ';
+        else if (c == '%' && i + 2 < (int)s.length())
+        {
+            int hi = s[i + 1], lo = s[i + 2];
+            hi = (hi >= 'A' && hi <= 'F') ? hi - 'A' + 10 : (hi >= 'a' && hi <= 'f') ? hi - 'a' + 10 : (hi >= '0' && hi <= '9') ? hi - '0' : 0;
+            lo = (lo >= 'A' && lo <= 'F') ? lo - 'A' + 10 : (lo >= 'a' && lo <= 'f') ? lo - 'a' + 10 : (lo >= '0' && lo <= '9') ? lo - '0' : 0;
+            out += (char)((hi << 4) | lo);
+            i += 2;
+        }
+        else
+            out += c;
+    }
+    return out;
 }
 
-void processSerialCommands(Stream &serial, RTC_DS3231 &rtc, std::vector<TOTPAccount> &accounts,
-    void* finger, bool fingerprintReady)
+/** Parse otpauth://totp/LABEL?secret=BASE32&issuer=X&digits=6&period=30 (or otp:// as alias). */
+static bool parse_otpauth_uri(const String &uri, TOTPCredential &out)
+{
+    String u = uri;
+    u.trim();
+    if (u.startsWith("otp://"))
+        u = "otpauth://" + u.substring(6);
+    if (!u.startsWith("otpauth://totp/"))
+        return false;
+    int pathStart = 14; // after "otpauth://totp/"
+    int q = u.indexOf('?');
+    String path = (q >= 0) ? u.substring(pathStart, q) : u.substring(pathStart);
+    String query = (q >= 0) ? u.substring(q + 1) : "";
+    path = url_decode(path);
+    int colon = path.indexOf(':');
+    if (colon >= 0)
+    {
+        out.issuer = path.substring(0, colon);
+        out.label = path.substring(colon + 1);
+    }
+    else
+    {
+        out.issuer = "";
+        out.label = path;
+    }
+    out.secret = "";
+    out.digits = 6;
+    out.period = 30;
+    out.algorithm = "SHA1";
+    for (int i = 0; i < (int)query.length(); )
+    {
+        int amp = query.indexOf('&', i);
+        String pair = (amp >= 0) ? query.substring(i, amp) : query.substring(i);
+        i = (amp >= 0) ? amp + 1 : query.length();
+        int eq = pair.indexOf('=');
+        if (eq < 0)
+            continue;
+        String key = pair.substring(0, eq);
+        String val = url_decode(pair.substring(eq + 1));
+        if (key == "secret")
+            out.secret = val;
+        else if (key == "issuer" && val.length())
+            out.issuer = val;
+        else if (key == "digits")
+            out.digits = val.toInt() ? val.toInt() : 6;
+        else if (key == "period")
+            out.period = val.toInt() ? val.toInt() : 30;
+        else if (key == "algorithm" && val.length())
+            out.algorithm = val;
+    }
+    return (out.secret.length() > 0);
+}
+
+static void print_date_time(Stream &serial)
+{
+    uint32_t t = device_get_time_utc();
+    unsigned long sec = (unsigned long)t;
+    unsigned long min = sec / 60; sec %= 60;
+    unsigned long hour = min / 60; min %= 60;
+    unsigned long days = hour / 24; hour %= 24;
+    int year = 1970;
+    int month_days[] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    while (days >= 365)
+    {
+        int dpy = (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)) ? 366 : 365;
+        if (days < (unsigned long)dpy) break;
+        days -= dpy;
+        year++;
+    }
+    if (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)) month_days[1] = 29;
+    int month = 0;
+    while (month < 12 && days >= (unsigned long)month_days[month]) { days -= month_days[month]; month++; }
+    int day = (int)days + 1;
+    month++;
+    serial.printf("%04d-%02d-%02d %02lu:%02lu:%02lu (unix: %lu)\n",
+        year, month, day, hour, min, sec, (unsigned long)t);
+}
+
+void processSerialCommands(Stream &serial, std::vector<TOTPCredential> &credentials,
+    void *finger, bool fingerprintReady)
 {
 #ifdef ENABLE_FINGERPRINT
-    R558SFingerprint* fp = (R558SFingerprint*)finger;
+    R558SFingerprint *fp = (R558SFingerprint *)finger;
+#else
+    (void)finger;
+    (void)fingerprintReady;
 #endif
     static String line = "";
     while (serial.available())
@@ -39,156 +135,131 @@ void processSerialCommands(Stream &serial, RTC_DS3231 &rtc, std::vector<TOTPAcco
             String cmd = trimStr(line);
             line = "";
             if (cmd.length() == 0)
-                return;
+                continue;
 
-            // Tokenize
             int firstSpace = cmd.indexOf(' ');
             String name = (firstSpace == -1) ? cmd : cmd.substring(0, firstSpace);
             String args = (firstSpace == -1) ? String("") : cmd.substring(firstSpace + 1);
+            args.trim();
             name.toUpperCase();
 
-            if (name == "TIME")
+            if (name == "DATE")
             {
-                DateTime now = rtc.now();
-                serial.print("RTC: ");
-                printDateTime(serial, now);
+                if (args.length() == 0)
+                {
+                    serial.print("DATE ");
+                    print_date_time(serial);
+                }
+                else
+                {
+                    unsigned long ts = (unsigned long)args.toInt();
+                    if (ts == 0)
+                        serial.println("Invalid timestamp");
+                    else
+                    {
+                        DateTime dt((uint32_t)ts);
+                        extern RTC_DS3231 rtc;
+                        rtc.adjust(dt);
+                        serial.print("DATE ");
+                        print_date_time(serial);
+                    }
+                }
             }
             else if (name == "SETTIME")
             {
-                args.trim();
                 if (args.length() == 0)
-                {
                     serial.println("Usage: SETTIME <unix_timestamp>");
-                }
                 else
                 {
-                    unsigned long ts = args.toInt();
+                    unsigned long ts = (unsigned long)args.toInt();
                     if (ts == 0)
-                    {
                         serial.println("Invalid timestamp");
-                    }
                     else
                     {
-                        rtc.adjust(DateTime((uint32_t)ts));
-                        serial.print("RTC updated: ");
-                        printDateTime(serial, rtc.now());
+                        DateTime dt((uint32_t)ts);
+                        extern RTC_DS3231 rtc;
+                        rtc.adjust(dt);
+                        serial.print("DATE ");
+                        print_date_time(serial);
                     }
                 }
             }
-            else if (name == "ACCOUNTS" || name == "LIST")
+            else if (name == "TOTP_LIST")
             {
-                serial.printf("Accounts: %u\n", (unsigned)accounts.size());
-                for (size_t i = 0; i < accounts.size(); ++i)
+                serial.printf("TOTP_LIST %u\n", (unsigned)credentials.size());
+                for (size_t i = 0; i < credentials.size(); ++i)
                 {
-                    const TOTPAccount &a = accounts[i];
-                    serial.printf("[%u] %s | %s | %dd | period=%d\n", (unsigned)i, a.name.c_str(), a.issuer.c_str(), a.digits, a.period);
+                    const TOTPCredential &c = credentials[i];
+                    serial.printf("[%u] %s | %s | %dd | period=%d\n", (unsigned)i, c.label.c_str(), c.issuer.c_str(), c.digits, c.period);
                 }
             }
-            else if (name == "TOTP" || name == "GET")
+            else if (name == "TOTP")
             {
-                args.trim();
                 if (args.length() == 0)
-                {
                     serial.println("Usage: TOTP <index>");
-                }
                 else
                 {
                     int idx = args.toInt();
-                    if (idx < 0 || idx >= (int)accounts.size())
-                    {
-                        serial.println("Invalid account index");
-                    }
+                    if (idx < 0 || (size_t)idx >= credentials.size())
+                        serial.println("Invalid index");
                     else
                     {
-                        time_t ts = rtc.now().unixtime();
-                        String gen = generateTOTP(accounts[idx], ts);
-                        serial.printf("Account [%d] %s -> %s (remaining %ld)\n", idx, accounts[idx].name.c_str(), gen.c_str(), (long)(accounts[idx].period - (ts % accounts[idx].period)));
+                        uint32_t ts = device_get_time_utc();
+                        String gen = totp_generate(credentials[idx], ts);
+                        unsigned long rem = credentials[idx].period - (ts % (unsigned long)credentials[idx].period);
+                        serial.printf("TOTP [%d] %s -> %s (remaining %lu)\n", idx, credentials[idx].label.c_str(), gen.c_str(), rem);
                     }
                 }
             }
-            else if (name == "ADD")
+            else if (name == "TOTP_ADD")
             {
-                // Usage: ADD Name|Issuer|Secret|digits|period|algorithm
-                args.trim();
                 if (args.length() == 0)
                 {
-                    serial.println("Usage: ADD Name|Issuer|Secret|digits|period|algorithm");
+                    serial.println("Usage: TOTP_ADD <otpauth_uri>");
+                    serial.println("Example: TOTP_ADD otpauth://totp/Example:user?secret=JBSWY3DPEHPK3PXP&issuer=Example");
                 }
                 else
                 {
-                    // split by '|'
-                    std::vector<String> parts;
-                    int start = 0;
-                    int len = args.length();
-                    for (int i = 0; i <= len; ++i)
+                    TOTPCredential cred;
+                    if (!parse_otpauth_uri(args, cred))
                     {
-                        if (i == len || args.charAt(i) == '|')
-                        {
-                            parts.push_back(args.substring(start, i));
-                            start = i + 1;
-                        }
+                        serial.println("Invalid otpauth URI (use otpauth://totp/... or otp://totp/...)");
+                        continue;
                     }
-                    for (auto &p : parts)
-                        p.trim();
-                    if (parts.size() < 3)
+                    int maxLen = cred.secret.length() * 5 / 8 + 8;
+                    uint8_t *buf = (uint8_t *)malloc((size_t)maxLen);
+                    if (!buf)
                     {
-                        serial.println("Not enough fields. Need at least Name|Issuer|Secret");
+                        serial.println("Memory error");
+                        continue;
                     }
-                    else
+                    int ret = totp_base32_decode(cred.secret.c_str(), buf, maxLen);
+                    free(buf);
+                    if (ret <= 0)
                     {
-                        TOTPAccount a;
-                        a.name = parts[0];
-                        a.issuer = parts[1];
-                        a.secret = parts[2];
-                        a.digits = (parts.size() > 3 && parts[3].length()) ? parts[3].toInt() : 6;
-                        a.period = (parts.size() > 4 && parts[4].length()) ? parts[4].toInt() : 30;
-                        a.algorithm = (parts.size() > 5 && parts[5].length()) ? parts[5] : String("SHA1");
-
-                        // Validate secret by attempting Base32 decode
-                        int maxLen = a.secret.length() * 5 / 8 + 8;
-                        uint8_t *buf = (uint8_t *)malloc(maxLen);
-                        if (!buf)
-                        {
-                            serial.println("Memory error");
-                        }
-                        else
-                        {
-                            int ret = base32_decode(a.secret.c_str(), buf, maxLen);
-                            free(buf);
-                            if (ret <= 0)
-                            {
-                                serial.println("Invalid Base32 secret");
-                            }
-                            else
-                            {
-                                accounts.push_back(a);
-                                saveConfiguration(accounts);
-                                serial.printf("Added account [%u] %s\n", (unsigned)accounts.size() - 1, a.name.c_str());
-                            }
-                        }
+                        serial.println("Invalid Base32 secret");
+                        continue;
                     }
+                    credentials.push_back(cred);
+                    saveConfiguration(credentials);
+                    serial.printf("TOTP_ADD [%u] %s\n", (unsigned)credentials.size() - 1, cred.label.c_str());
                 }
             }
-            else if (name == "DELETE" || name == "DEL")
+            else if (name == "TOTP_DELETE")
             {
-                args.trim();
                 if (args.length() == 0)
-                {
-                    serial.println("Usage: DELETE <index>");
-                }
+                    serial.println("Usage: TOTP_DELETE <index>");
                 else
                 {
                     int idx = args.toInt();
-                    if (idx < 0 || idx >= (int)accounts.size())
-                    {
-                        serial.println("Invalid account index");
-                    }
+                    if (idx < 0 || (size_t)idx >= credentials.size())
+                        serial.println("Invalid index");
                     else
                     {
-                        serial.printf("Deleting account [%d] %s\n", idx, accounts[idx].name.c_str());
-                        accounts.erase(accounts.begin() + idx);
-                        saveConfiguration(accounts);
-                        serial.println("Deleted and saved configuration");
+                        serial.printf("TOTP_DELETE [%d] %s\n", idx, credentials[idx].label.c_str());
+                        credentials.erase(credentials.begin() + idx);
+                        saveConfiguration(credentials);
+                        serial.println("OK");
                     }
                 }
             }
@@ -196,23 +267,26 @@ void processSerialCommands(Stream &serial, RTC_DS3231 &rtc, std::vector<TOTPAcco
             else if (fingerprintReady && fp && (name == "FINGER_ENROLL" || name == "FINGER_ADD"))
             {
                 uint16_t id = 0xFFFF;
-                args.trim();
-                if (args.length()) id = (uint16_t)args.toInt();
+                if (args.length())
+                    id = (uint16_t)args.toInt();
 #if FINGERPRINT_LED_ENROLL
-                fp->setLed(FINGERPRINT_LED_ENROLL);  // e.g. blue during enroll
+                fp->setLed(FINGERPRINT_LED_ENROLL);
 #endif
                 serial.println("FINGER_ENROLL: Follow the step-by-step prompts below.");
                 int r = fp->enrollFingerprint(id, &serial);
                 serial.print("Enroll result: ");
                 serial.println(R558SFingerprint::getErrorMessage(r));
-                if (r == 0) {
+                if (r == 0)
+                {
                     uint16_t n;
                     fp->getTemplateCount(&n);
                     serial.printf("Stored. Total templates: %u\n", (unsigned)n);
 #if FINGERPRINT_LED_READY
                     fp->setLed(FINGERPRINT_LED_READY);
 #endif
-                } else {
+                }
+                else
+                {
 #if FINGERPRINT_LED_ERROR
                     fp->setLed(FINGERPRINT_LED_ERROR);
 #endif
@@ -220,9 +294,10 @@ void processSerialCommands(Stream &serial, RTC_DS3231 &rtc, std::vector<TOTPAcco
             }
             else if (fingerprintReady && fp && (name == "FINGER_DELETE" || name == "FINGER_DEL"))
             {
-                args.trim();
-                if (args.length() == 0) serial.println("Usage: FINGER_DELETE <id>");
-                else {
+                if (args.length() == 0)
+                    serial.println("Usage: FINGER_DELETE <id>");
+                else
+                {
                     uint16_t id = (uint16_t)args.toInt();
                     int r = fp->deleteModel(id);
                     serial.print("Delete: ");
@@ -233,11 +308,10 @@ void processSerialCommands(Stream &serial, RTC_DS3231 &rtc, std::vector<TOTPAcco
             {
                 uint16_t n;
                 int r = fp->getTemplateCount(&n);
-                if (r == 0) serial.printf("Templates: %u\n", (unsigned)n);
-                else {
-                    serial.printf("Failed to get count (error 0x%02X: %s)\n", r, R558SFingerprint::getErrorMessage(r));
-                    serial.println("(Check wiring/baud; 0x1D response may vary by module.)");
-                }
+                if (r == 0)
+                    serial.printf("Templates: %u\n", (unsigned)n);
+                else
+                    serial.printf("Failed: %s\n", R558SFingerprint::getErrorMessage(r));
             }
             else if (fingerprintReady && fp && (name == "FINGER_CLEAR" || name == "FINGER_EMPTY"))
             {
@@ -248,35 +322,24 @@ void processSerialCommands(Stream &serial, RTC_DS3231 &rtc, std::vector<TOTPAcco
 #endif
             else if (name == "HELP" || name == "?")
             {
-                serial.println("Available commands:");
-                serial.println("TIME                - show RTC time");
-                serial.println("SETTIME <unix>      - set RTC time");
-                serial.println("ACCOUNTS | LIST     - list stored accounts");
-                serial.println("TOTP <index>        - show generated TOTP for account index");
-                serial.println("ADD Name|Issuer|Secret|digits|period|algorithm - add account");
-                serial.println("DELETE <index>      - delete account and save");
+                serial.println("Commands: DATE [unix_ts] | SETTIME <unix> | TOTP_ADD <otpauth_uri> | TOTP_LIST | TOTP <index> | TOTP_DELETE <index>");
 #ifdef ENABLE_FINGERPRINT
-                if (fingerprintReady) {
-                    serial.println("FINGER_ENROLL [id]  - add fingerprint; 4 placements of same finger (id optional)");
-                    serial.println("FINGER_DELETE <id>  - delete fingerprint by id");
-                    serial.println("FINGER_COUNT        - show number of stored templates");
-                    serial.println("FINGER_CLEAR        - delete all fingerprints");
-                }
+                if (fingerprintReady)
+                    serial.println("FINGER_ENROLL [id] | FINGER_DELETE <id> | FINGER_COUNT | FINGER_CLEAR");
 #endif
             }
             else
             {
-                serial.print("Unknown command: ");
+                serial.print("Unknown: ");
                 serial.println(cmd);
-                serial.println("Type HELP for commands");
+                serial.println("HELP for commands");
             }
         }
         else
         {
             line += c;
-            // prevent runaway length
-            if (line.length() > 256)
-                line = line.substring(line.length() - 256);
+            if (line.length() > 512)
+                line = line.substring(line.length() - 512);
         }
     }
 }

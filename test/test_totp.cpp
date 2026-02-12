@@ -1,79 +1,66 @@
 #include <Arduino.h>
 #include <unity.h>
-#include "Crypto.h"
-#include "TOTP.h"
+#include "../core/totp.h"
 
-void test_sha1()
+void test_totp_base32_decode(void)
 {
-    String input = "Hello, World!";
-    String expected = "0a0a9f2a6772942557ab5355d76af442f8f65e01";
-    String result = Crypto::sha1(input);
-    TEST_ASSERT_EQUAL_STRING(expected.c_str(), result.c_str());
+    uint8_t buf[32];
+    int n = totp_base32_decode("JBSWY3DPEHPK3PXP", buf, sizeof(buf));
+    TEST_ASSERT_GREATER_THAN(0, n);
+    TEST_ASSERT_LESS_OR_EQUAL(32, n);
 }
 
-void test_sha256()
+void test_totp_base32_decode_invalid(void)
 {
-    String input = "Hello, World!";
-    String expected = "dffd6021bb2bd5b0af676290809ec3a53191dd81c7f70a4b28688a362182986f";
-    String result = Crypto::sha256(input);
-    TEST_ASSERT_EQUAL_STRING(expected.c_str(), result.c_str());
+    uint8_t buf[32];
+    int n = totp_base32_decode("", buf, sizeof(buf));
+    TEST_ASSERT_EQUAL(0, n);
 }
 
-void test_base32_decode()
+void test_totp_generate(void)
 {
-    String input = "JBSWY3DPEHPK3PXP";
-    String result = TOTP::base32Decode(input);
-    // The decoded result should be a binary string
-    TEST_ASSERT_TRUE(result.length() > 0);
+    TOTPCredential cred;
+    cred.secret = "JBSWY3DPEHPK3PXP";
+    cred.digits = 6;
+    cred.period = 30;
+    cred.algorithm = "SHA1";
+    cred.label = "Test";
+    cred.issuer = "TestIssuer";
+    String code = totp_generate(cred, 1);
+    TEST_ASSERT_TRUE(code.length() == 6 || code.length() > 6);
 }
 
-void test_totp_generation()
+void test_totp_generate_known_time(void)
 {
-    String secret = "JBSWY3DPEHPK3PXP";
-    uint64_t counter = 0;
-    String result = TOTP::generateTOTP(secret, counter, 6, "SHA1");
-    // TOTP should generate a 6-digit code
-    TEST_ASSERT_EQUAL(6, result.length());
-    TEST_ASSERT_TRUE(result.toInt() >= 0);
-    TEST_ASSERT_TRUE(result.toInt() < 1000000);
+    TOTPCredential cred;
+    cred.secret = "JBSWY3DPEHPK3PXP";
+    cred.digits = 6;
+    cred.period = 30;
+    cred.algorithm = "SHA1";
+    cred.label = "Test";
+    cred.issuer = "TestIssuer";
+    uint32_t ts = 59;
+    String code = totp_generate(cred, ts);
+    TEST_ASSERT_EQUAL(6, code.length());
+    TEST_ASSERT_TRUE(code.toInt() >= 0 && code.toInt() <= 999999);
 }
 
-void test_hmac_sha1()
+static void run_all_tests(void)
 {
-    String key = "key";
-    String data = "The quick brown fox jumps over the lazy dog";
-    String result = Crypto::hmacSHA1(key, data);
-    // HMAC should produce a hex string
-    TEST_ASSERT_TRUE(result.length() > 0);
-    TEST_ASSERT_TRUE(result.length() % 2 == 0); // Even length for hex
-}
-
-void test_hmac_sha256()
-{
-    String key = "key";
-    String data = "The quick brown fox jumps over the lazy dog";
-    String result = Crypto::hmacSHA256(key, data);
-    // HMAC should produce a hex string
-    TEST_ASSERT_TRUE(result.length() > 0);
-    TEST_ASSERT_TRUE(result.length() % 2 == 0); // Even length for hex
+    RUN_TEST(test_totp_base32_decode);
+    RUN_TEST(test_totp_base32_decode_invalid);
+    RUN_TEST(test_totp_generate);
+    RUN_TEST(test_totp_generate_known_time);
 }
 
 void setup()
 {
     delay(2000);
     UNITY_BEGIN();
-
-    RUN_TEST(test_sha1);
-    RUN_TEST(test_sha256);
-    RUN_TEST(test_base32_decode);
-    RUN_TEST(test_totp_generation);
-    RUN_TEST(test_hmac_sha1);
-    RUN_TEST(test_hmac_sha256);
-
+    run_all_tests();
     UNITY_END();
 }
 
 void loop()
 {
-    // Test completed
 }

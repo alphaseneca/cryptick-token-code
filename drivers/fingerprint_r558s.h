@@ -73,6 +73,10 @@ public:
   // LED (cmd 0x3C): color 0=off, 1=red(R558_LED_COLOR_RED), 2=green, 3=blue. Uses R558_LED_MODE_ON/OFF.
   int setLed(uint8_t color);
   int setLedOff() { return setLed(0); }
+  /** Turn LED on for durationMs, then off. Call ledUpdate() from loop for auto-off. */
+  int setLedOnFor(uint8_t color, uint32_t durationMs);
+  /** Call from loop; turns LED off when on-time has elapsed. */
+  void ledUpdate();
   // Full control: mode R558_LED_MODE_*, color R558_LED_COLOR_*, cycles (0=continuous for blink/breathe).
   int setLedEx(uint8_t mode, uint8_t color, uint8_t cycles = 0);
 
@@ -86,6 +90,7 @@ private:
   bool _debug = false;
   int _error = FINGERPRINT_OK;
   uint8_t _addr[4] = {0xFF, 0xFF, 0xFF, 0xFF};
+  uint32_t _ledOffAtMs = 0;  // when non-zero, ledUpdate() turns LED off at this time
 
   int sendPacket(uint8_t *data, uint16_t len);
   int getPacket(uint8_t *response, uint16_t maxLen, uint16_t *respLen);
