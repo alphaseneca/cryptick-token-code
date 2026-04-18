@@ -1,23 +1,26 @@
 #ifndef CONFIG_H
 #define CONFIG_H
-
-// Hardware Pin Configuration - HW364A NodeMCU-style with built-in OLED
-#define OLED_SDA 14 // GPIO14 (D5) - built-in OLED SDA
-#define OLED_SCL 12 // GPIO12 (D6) - built-in OLED SCL
+// Hardware Pin Configuration - ESP32-S3
+#define OLED_SDA 8 // ESP32-S3 default I2C SDA (GPIO8)
+#define OLED_SCL 9 // ESP32-S3 default I2C SCL (GPIO9)
 #define OLED_RESET -1
 #define OLED_ADDRESS 0x3C
-#define BUTTON_PIN 0 // GPIO0 (Flash button). If boot is intermittent: try better USB/cable, 100–470µF on 3.3V; don’t hold button at power-on.
+
+#define LEFT_BUTTON_PIN 5  // Optional second button for navigation (e.g. back)
+#define BUTTON_PIN 6       // You may want to change this depending on your board wiring
+#define RIGHT_BUTTON_PIN 7 // Optional third button for navigation (e.g. forward)
+// Fingerprint UART
+#define FINGERPRINT_RX 16
+#define FINGERPRINT_TX 17
 
 // Display Configuration
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 
-// R558-S Fingerprint: define ENABLE_FINGERPRINT to enable (only clock does not require fingerprint).
+// R558-S Fingerprint: define ENABLE_FINGERPRINT to enable. If enabled, fingerprint verification is required to access any page other than the clock, and the fingerprint sensor LED will be used to indicate status (see FINGERPRINT_LED_*). If disabled, no fingerprint driver is included, and all pages are accessible without verification.
 // Comment out the line below to disable: no fingerprint driver, all pages accessible without verification.
 // Pins D7/D8 (GPIO13/15) - does not use D5/D6 (OLED I2C on HW364A)
 #define ENABLE_FINGERPRINT
-#define FINGERPRINT_RX 13 // GPIO13 (D7) - ESP RX <- sensor TX
-#define FINGERPRINT_TX 15 // GPIO15 (D8) - ESP TX -> sensor RX
 #define FINGERPRINT_BAUD 57600
 
 // R558-S LED (cmd 0x3C): 0=off, 1=red(0x04), 2=green(0x02), 3=blue(0x01). 0 = skip.
@@ -38,4 +41,4 @@
 // Fingerprint poll interval (ms) - higher = smoother UI/button, slower finger detection
 #define FINGERPRINT_POLL_INTERVAL_MS 280
 
-#endif
+#endif // CONFIG_H

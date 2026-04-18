@@ -11,15 +11,15 @@
 #include "navigation.h"
 #include "serial_comm.h"
 #include "storage.h"
+
 #ifdef ENABLE_FINGERPRINT
-#include <SoftwareSerial.h>
 #include "../drivers/fingerprint_r558s.h"
 #endif
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 RTC_DS3231 rtc;
 #ifdef ENABLE_FINGERPRINT
-SoftwareSerial fingerprintSerial(FINGERPRINT_RX, FINGERPRINT_TX);
+HardwareSerial fingerprintSerial(1); // Use UART1 for fingerprint sensor
 R558SFingerprint finger(fingerprintSerial);
 bool fingerprintReady = false;
 static void auth_led_success(void) { finger.setLedOnFor(FINGERPRINT_LED_MATCH, 1000); }
@@ -95,7 +95,7 @@ void setup()
     device_hal_init();
     DateTime now = rtc.now();
     Serial.printf("RTC: %04d-%02d-%02d %02d:%02d:%02d\n",
-        now.year(), now.month(), now.day(), now.hour(), now.minute(), now.second());
+                  now.year(), now.month(), now.day(), now.hour(), now.minute(), now.second());
 
     display.clearDisplay();
     display.setCursor(0, 0);
@@ -105,13 +105,13 @@ void setup()
     yield();
 
     loadConfiguration(credentials);
-    yield();  /* Let ESP8266 run background tasks; avoids watchdog reset */
+    yield(); /* Let ESP8266 run background tasks; avoids watchdog reset */
     Serial.println("Config loaded.");
 
 #ifdef ENABLE_FINGERPRINT
     yield();
-    fingerprintSerial.begin(FINGERPRINT_BAUD);
-    delay(100);
+    fingerprintSerial.begin(FINGERPRINT_BAUD, SERIAL_8N1, FINGERPRINT_RX, FINGERPRINT_TX);
+    delay(200);
     yield();
     finger.setDebug(false);
     if (finger.begin(FINGERPRINT_BAUD) == FINGERPRINT_OK)
@@ -119,7 +119,7 @@ void setup()
         fingerprintReady = true;
         Serial.println("R558-S fingerprint ready");
 #if FINGERPRINT_LED_READY
-        finger.setLed(FINGERPRINT_LED_READY);   /* green LED on while device is initializing */
+        finger.setLed(FINGERPRINT_LED_READY); /* green LED on while device is initializing */
         delay(2000);
         finger.setLedOff();
 #endif
@@ -139,7 +139,7 @@ void setup()
 
     display.clearDisplay();
     display_handler_clock(display, (uint32_t)rtc.now().unixtime(),
-        currentUsername.c_str(), batteryLevel, bluetoothConnected);
+                          currentUsername.c_str(), batteryLevel, bluetoothConnected);
     display.display();
     lastDisplayUpdate = millis();
 }
@@ -150,9 +150,9 @@ void loop()
 
     processSerialCommands(Serial, credentials,
 #ifdef ENABLE_FINGERPRINT
-        &finger, fingerprintReady
+                          &finger, fingerprintReady
 #else
-        nullptr, false
+                          nullptr, false
 #endif
     );
 
