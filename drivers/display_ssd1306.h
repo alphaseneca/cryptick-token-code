@@ -10,12 +10,16 @@ bool display_ssd1306_init(Adafruit_SSD1306 &display, uint8_t i2c_addr, int width
 void display_ssd1306_clock(Adafruit_SSD1306 &display, int width, int height,
     const char *date_str, const char *time_str, const char *username, int battery_pct, bool link_connected);
 
-/** Draw TOTP page: account name, time_str, 6-digit code, issuer, countdown_str (e.g. "25s"). */
+/** Draw TOTP page: account header (name + index), time_str, code (6-8 digits), issuer, countdown. */
 void display_ssd1306_totp(Adafruit_SSD1306 &display, int width, int height,
-    const char *account_name, const char *time_str, const char *code_6,
+    const char *account_header, const char *time_str, const char *code,
     const char *issuer, const char *countdown_str);
 
-/** Draw "No accounts" / message. */
+/** Draw page menu with selection indicator. items = array of page names, selectedIndex = highlighted. */
+void display_ssd1306_menu(Adafruit_SSD1306 &display, int width, int height,
+    const char **items, int itemCount, int selectedIndex);
+
+/** Draw generic two-line message. */
 void display_ssd1306_message(Adafruit_SSD1306 &display, int width, int height,
     const char *line1, const char *line2);
 

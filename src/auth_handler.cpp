@@ -1,5 +1,5 @@
 #include "auth_handler.h"
-#include "config.h"
+#include "app_config.h"
 
 static bool _authenticated = false;
 static bool _fingerprint_enabled = false;
@@ -8,13 +8,9 @@ static void (*_led_on_success)(void) = nullptr;
 static void (*_led_on_fail)(void) = nullptr;
 static void (*_led_on_clear)(void) = nullptr;
 
-PageEnum auth_handler_page_to_show(PageEnum requested)
+bool auth_handler_needs_auth(void)
 {
-    if (requested == PAGE_CLOCK)
-        return PAGE_CLOCK;
-    if (!_fingerprint_enabled || _authenticated)
-        return requested;
-    return PAGE_AUTH_PROMPT;
+    return _fingerprint_enabled && !_authenticated;
 }
 
 void auth_handler_clear(void)

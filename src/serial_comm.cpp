@@ -1,11 +1,13 @@
 #include "serial_comm.h"
-#include "config.h"
-#include "storage.h"
-#include "../core/device.h"
+#include "app_config.h"
+#include "totp_storage.h"
+#include "../core/fido2/device.h"
 #include <RTClib.h>
 #ifdef ENABLE_FINGERPRINT
 #include "../drivers/fingerprint_r558s.h"
 #endif
+#include "tusb.h" // Low-level TinyUSB for direct CDC access
+
 
 static String trimStr(const String &s)
 {
@@ -125,19 +127,44 @@ void processSerialCommands(Stream &serial, std::vector<TOTPCredential> &credenti
     (void)fingerprintReady;
 #endif
     static String line = "";
-    while (serial.available())
+    
+    // Use low-level TinyUSB CDC available check
+    while (tud_cdc_available())
     {
-        char c = (char)serial.read();
-        if (c == '\r')
+        char c = (char)tud_cdc_read_char();
+        yield();
+
+
+        
+        // Echo back characters for interactivity (except newline which we handle below)
+        if (c != '\n' && c != '\r' && c >= 32 && c <= 126) {
+            serial.print(c);
+            serial.flush();
+        }
+
+
+        if (c == '\b' || c == 0x7F) // Backspace or DEL
+        {
+            if (line.length() > 0) {
+                line.remove(line.length() - 1);
+                serial.print("\b \b"); // Erasure on terminal
+            }
             continue;
-        if (c == '\n')
+        }
+
+        if (c == '\r' || c == '\n')
         {
             String cmd = trimStr(line);
             line = "";
-            if (cmd.length() == 0)
+            serial.println(); // New line after command entered
+            
+            if (cmd.length() == 0) {
+                serial.print("cryptick> ");
                 continue;
+            }
 
             int firstSpace = cmd.indexOf(' ');
+
             String name = (firstSpace == -1) ? cmd : cmd.substring(0, firstSpace);
             String args = (firstSpace == -1) ? String("") : cmd.substring(firstSpace + 1);
             args.trim();
@@ -334,9 +361,11 @@ void processSerialCommands(Stream &serial, std::vector<TOTPCredential> &credenti
                 serial.println(cmd);
                 serial.println("HELP for commands");
             }
+            serial.print("cryptick> ");
         }
         else
         {
+
             line += c;
             if (line.length() > 512)
                 line = line.substring(line.length() - 512);

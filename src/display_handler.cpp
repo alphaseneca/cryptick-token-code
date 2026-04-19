@@ -1,6 +1,6 @@
 #include "display_handler.h"
-#include "config.h"
-#include "../core/device.h"
+#include "app_config.h"
+#include "../core/fido2/device.h"
 #include "../drivers/display_ssd1306.h"
 
 /** Convert Unix seconds (from RTC) to date/time strings. No C time library. */
@@ -63,14 +63,34 @@ void display_handler_totp(Adafruit_SSD1306 &display,
     const TOTPCredential &cred = credentials[index];
     uint32_t ts = device_get_time_utc();
     String code = totp_generate(cred, ts);
+
+    /* Build account header with index indicator (e.g. "MyApp 2/5") */
+    const char *label = cred.label.length() ? cred.label.c_str() : "(no name)";
+    String header = String(label);
+    if (credentials.size() > 1)
+    {
+        header += " ";
+        header += String((int)index + 1);
+        header += "/";
+        header += String((int)credentials.size());
+    }
+
     char time_str[10], countdown[8];
     format_date_time(ts, nullptr, 0, time_str, sizeof(time_str));
-    unsigned long rem = cred.period - (ts % (unsigned long)cred.period);
+
+    int period = cred.period > 0 ? cred.period : 30;
+    unsigned long rem = period - (ts % (unsigned long)period);
     snprintf(countdown, sizeof(countdown), "%lus", (unsigned long)rem);
-    const char *label = cred.label.length() ? cred.label.c_str() : "(no name)";
+
     const char *issuer = cred.issuer.length() ? cred.issuer.c_str() : "-";
     display_ssd1306_totp(display, SCREEN_WIDTH, SCREEN_HEIGHT,
-        label, time_str, code.c_str(), issuer, countdown);
+        header.c_str(), time_str, code.c_str(), issuer, countdown);
+}
+
+void display_handler_menu(Adafruit_SSD1306 &display,
+    const char **items, int itemCount, int selectedIndex)
+{
+    display_ssd1306_menu(display, SCREEN_WIDTH, SCREEN_HEIGHT, items, itemCount, selectedIndex);
 }
 
 void display_handler_message(Adafruit_SSD1306 &display, const char *line1, const char *line2)
@@ -86,4 +106,19 @@ void display_handler_auth_prompt(Adafruit_SSD1306 &display)
 void display_handler_auth_error(Adafruit_SSD1306 &display)
 {
     display_ssd1306_message(display, SCREEN_WIDTH, SCREEN_HEIGHT, "Fingerprint could", "not be verified");
+}
+
+void display_handler_fido_prompt(Adafruit_SSD1306 &display, const char *site)
+{
+    display_ssd1306_message(display, SCREEN_WIDTH, SCREEN_HEIGHT, site, "Tap to confirm");
+}
+
+void display_handler_fido_processing(Adafruit_SSD1306 &display)
+{
+    display_ssd1306_message(display, SCREEN_WIDTH, SCREEN_HEIGHT, "Performing Setup", "Check your PC...");
+}
+
+void display_handler_fido_success(Adafruit_SSD1306 &display)
+{
+    display_ssd1306_message(display, SCREEN_WIDTH, SCREEN_HEIGHT, "Authenticated", "Successfully");
 }

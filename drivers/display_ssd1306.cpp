@@ -62,22 +62,27 @@ void display_ssd1306_clock(Adafruit_SSD1306 &display, int width, int height,
 }
 
 void display_ssd1306_totp(Adafruit_SSD1306 &display, int width, int height,
-    const char *account_name, const char *time_str, const char *code_6,
+    const char *account_header, const char *time_str, const char *code,
     const char *issuer, const char *countdown_str)
 {
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
     display.setCursor(0, 0);
-    display.print(account_name);
+    display.print(account_header);
     int16_t x1, y1;
     uint16_t w, h;
     display.getTextBounds(time_str, 0, 0, &x1, &y1, &w, &h);
     display.setCursor(width - w, 0);
     display.print(time_str);
-    display.setTextSize(3);
-    display.getTextBounds(code_6, 0, 0, &x1, &y1, &w, &h);
+
+    /* Auto-size code text: size 3 for ≤6 digits, size 2 for 7-8 */
+    int codeLen = strlen(code);
+    int textSize = (codeLen <= 6) ? 3 : 2;
+    display.setTextSize(textSize);
+    display.getTextBounds(code, 0, 0, &x1, &y1, &w, &h);
     display.setCursor((width - w) / 2, (height - h) / 2);
-    display.print(code_6);
+    display.print(code);
+
     display.setTextSize(1);
     display.setCursor(0, height - 8);
     if (issuer)
@@ -90,6 +95,47 @@ void display_ssd1306_totp(Adafruit_SSD1306 &display, int width, int height,
     display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
     display.setCursor(rectX + padding, rectY + padding);
     display.print(countdown_str);
+}
+
+void display_ssd1306_menu(Adafruit_SSD1306 &display, int width, int height,
+    const char **items, int itemCount, int selectedIndex)
+{
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+
+    /* Title bar */
+    display.setCursor(0, 0);
+    display.print("Menu");
+    display.drawLine(0, 10, width - 1, 10, SSD1306_WHITE);
+
+    /* Menu items */
+    int y = 14;
+    int lineHeight = 12;
+    for (int i = 0; i < itemCount && y + lineHeight <= height; i++)
+    {
+        if (i == selectedIndex)
+        {
+            /* Inverted highlight for selected item */
+            display.fillRect(0, y, width, lineHeight, SSD1306_WHITE);
+            display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
+            display.setCursor(6, y + 2);
+            display.print("> ");
+            display.print(items[i]);
+            display.setTextColor(SSD1306_WHITE);
+        }
+        else
+        {
+            display.setCursor(6, y + 2);
+            display.print("  ");
+            display.print(items[i]);
+        }
+        y += lineHeight;
+    }
+
+    /* Navigation hint at bottom */
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, height - 8);
+    display.print("[<]Back [O]Enter [>]Next");
 }
 
 void display_ssd1306_message(Adafruit_SSD1306 &display, int width, int height,

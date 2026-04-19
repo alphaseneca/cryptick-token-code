@@ -88,8 +88,8 @@ int R558SFingerprint::sendPacket(uint8_t *data, uint16_t len) {
   flush();
   _ss.write(packet, pktLen);
   _ss.flush();
-  // Give sensor time to process and start replying (reduces Bad packet / Packet receive error)
-  delay(80);
+  // Reduced delay to allow other tasks (like display refresh) to run
+  delay(5); 
   return FINGERPRINT_OK;
 }
 

@@ -1,7 +1,7 @@
 # Features TODO
 
-- [ ] TOTP (in progress)
-- [ ] FIDO2 / CTAP2 / WebAuthn
+- [x] TOTP
+- [x] FIDO2 / CTAP2 / WebAuthn
 - [ ] U2F / CTAP1
 - [ ] Attestation (key + cert)
 - [ ] PIN / User verification
