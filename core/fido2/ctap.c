@@ -386,10 +386,10 @@ void ctap_flush_state()
 
 static uint32_t auth_data_update_count(CTAP_authDataHeader * authData)
 {
-    uint32_t count = ctap_atomic_count( 0 );
+    uint32_t count = ctap_atomic_count( 1 );
     if (count == 0)     // count 0 will indicate invalid token
     {
-        count = ctap_atomic_count( 0 );
+        count = ctap_atomic_count( 1 );
 
     }
     uint8_t * byte = (uint8_t*) &authData->signCount;

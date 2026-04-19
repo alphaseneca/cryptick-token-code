@@ -1,5 +1,6 @@
 #include "totp.h"
 #include <string.h>
+#include <ctype.h>
 
 /* ════════════════════════════════════════════════════════════════════════
  * Self-contained SHA-1 (FIPS 180-4) + HMAC-SHA1 (RFC 2104)
@@ -146,7 +147,11 @@ int totp_base32_decode(const char *encoded, uint8_t *result, int bufSize)
 
     for (const char *ptr = encoded; *ptr && count < bufSize; ++ptr)
     {
-        char ch = toupper(*ptr);
+        char ch = *ptr;
+        if (isspace(ch) || ch == '-')
+            continue;
+            
+        ch = toupper(ch);
         if (ch == '=')
             break;
 
@@ -160,7 +165,7 @@ int totp_base32_decode(const char *encoded, uint8_t *result, int bufSize)
 
         if (bitsLeft >= 8)
         {
-            result[count++] = (buffer >> (bitsLeft - 8)) & 0xFF;
+            result[count++] = (uint8_t)((buffer >> (bitsLeft - 8)) & 0xFF);
             bitsLeft -= 8;
         }
     }
