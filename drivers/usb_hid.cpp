@@ -1,6 +1,14 @@
 #include "usb_hid.h"
-#include "Adafruit_TinyUSB.h"
 #include <string.h>
+
+#ifdef ESP32
+#include "USB.h"
+// Capture the build flags before they might be redefined by board headers
+static const uint16_t VID_FLAGS = USB_VID;
+static const uint16_t PID_FLAGS = USB_PID;
+#endif
+
+#include "Adafruit_TinyUSB.h"
 
 extern "C" {
     void i2c_lock();
@@ -55,6 +63,16 @@ static void _hid_report_callback(uint8_t report_id, hid_report_type_t report_typ
 }
 
 void usb_hid_init(void) {
+#ifdef ESP32
+    // On ESP32-S3, we need to set these before USB.begin() 
+    // to ensure they are picked up for the HID descriptors.
+    USB.manufacturerName(USB_MANUFACTURER);
+    USB.productName(USB_PRODUCT);
+    USB.VID(VID_FLAGS);
+    USB.PID(PID_FLAGS);
+    USB.begin();
+#endif
+
     _usb_hid.setPollInterval(2);
     _usb_hid.setReportDescriptor(hid_report_descriptor, sizeof(hid_report_descriptor));
     _usb_hid.setReportCallback(NULL, _hid_report_callback);

@@ -138,7 +138,7 @@ uint8_t ctap_get_info(CborEncoder * encoder)
     uint8_t aaguid[16];
     device_read_aaguid(aaguid);
 
-    ret = cbor_encoder_create_map(encoder, &map, 8);
+    ret = cbor_encoder_create_map(encoder, &map, 10);
     check_ret(ret);
     {
 
@@ -273,6 +273,39 @@ uint8_t ctap_get_info(CborEncoder * encoder)
         check_ret(ret);
         {
             ret = cbor_encode_uint(&map, 128);
+            check_ret(ret);
+        }
+
+        ret = cbor_encode_uint(&map, 0x09); // transports
+        check_ret(ret);
+        {
+            ret = cbor_encoder_create_array(&map, &array, 1);
+            check_ret(ret);
+            ret = cbor_encode_text_stringz(&array, "usb");
+            check_ret(ret);
+            ret = cbor_encoder_close_container(&map, &array);
+            check_ret(ret);
+        }
+
+        ret = cbor_encode_uint(&map, 0x0a); // algorithms
+        check_ret(ret);
+        {
+            CborEncoder alg;
+            ret = cbor_encoder_create_array(&map, &array, 1);
+            check_ret(ret);
+            ret = cbor_encoder_create_map(&array, &alg, 2);
+            check_ret(ret);
+            ret = cbor_encode_text_stringz(&alg, "type");
+            check_ret(ret);
+            ret = cbor_encode_text_stringz(&alg, "public-key");
+            check_ret(ret);
+            ret = cbor_encode_text_stringz(&alg, "alg");
+            check_ret(ret);
+            ret = cbor_encode_int(&alg, -7); // ES256
+            check_ret(ret);
+            ret = cbor_encoder_close_container(&array, &alg);
+            check_ret(ret);
+            ret = cbor_encoder_close_container(&map, &array);
             check_ret(ret);
         }
 

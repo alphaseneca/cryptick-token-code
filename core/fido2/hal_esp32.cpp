@@ -10,9 +10,6 @@
 #include <RTClib.h>
 #include "../../drivers/usb_hid.h"
 
-#undef USB_VID
-#undef USB_PID
-
 extern "C" {
 
 #define HID_QUEUE_LEN 16
@@ -334,14 +331,17 @@ void ctap_store_rk(int index, CTAP_residentKey *rk) {
     }
 }
 
-void ctap_load_rk(int index, CTAP_residentKey *rk) {
+void ctap_load_rk(int index, CTAP_residentKey * rk) {
+    memset(rk, 0xff, sizeof(CTAP_residentKey));
     File f = LittleFS.open(RK_FILENAME, "r");
     if (f) {
         f.seek(index * sizeof(CTAP_residentKey));
-        f.read((uint8_t*)rk, sizeof(CTAP_residentKey));
+        size_t read_bytes = f.read((uint8_t*)rk, sizeof(CTAP_residentKey));
+        if (read_bytes < sizeof(CTAP_residentKey)) {
+            // Partial read: likely end of file reached. 
+            // The buffer was already 0xff initialized, so the rest remains 0xff (invalid).
+        }
         f.close();
-    } else {
-        memset(rk, 0xff, sizeof(CTAP_residentKey));
     }
 }
 
@@ -414,7 +414,11 @@ uint8_t *device_get_attestation_key() {
 }
 
 void device_read_aaguid(uint8_t * dst){
-    uint8_t * aaguid = (uint8_t *)"\x00\x76\x63\x1b\xd4\xa0\x42\x7f\x57\x73\x0e\xc7\x1c\x9e\x02\x79";
+    // "UCASELABS" based AAGUID
+    static const uint8_t aaguid[16] = {
+        0x00, 0x55, 0x43, 0x41, 0x53, 0x45, 0x4c, 0x41, 
+        0x42, 0x53, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01
+    };
     memmove(dst, aaguid, 16);
 }
 
