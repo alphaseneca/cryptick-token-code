@@ -347,9 +347,16 @@ void processSerialCommands(Stream &serial, std::vector<TOTPCredential> &credenti
                 serial.println(R558SFingerprint::getErrorMessage(r));
             }
 #endif
+            else if (name == "FIDO_RESET")
+            {
+                serial.println("Resetting FIDO2 state (PIN and all Passkeys)...");
+                extern void ctap_reset();
+                ctap_reset();
+                serial.println("OK. FIDO2 state wiped.");
+            }
             else if (name == "HELP" || name == "?")
             {
-                serial.println("Commands: DATE [unix_ts] | SETTIME <unix> | TOTP_ADD <otpauth_uri> | TOTP_LIST | TOTP <index> | TOTP_DELETE <index>");
+                serial.println("Commands: DATE [unix_ts] | SETTIME <unix> | TOTP_ADD <otpauth_uri> | TOTP_LIST | TOTP <index> | TOTP_DELETE <index> | FIDO_RESET");
 #ifdef ENABLE_FINGERPRINT
                 if (fingerprintReady)
                     serial.println("FINGER_ENROLL [id] | FINGER_DELETE <id> | FINGER_COUNT | FINGER_CLEAR");
