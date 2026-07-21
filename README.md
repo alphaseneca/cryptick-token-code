@@ -107,7 +107,7 @@ Edit `src/config.h`:
 - **ENABLE_FINGERPRINT** — Define to enable R558-S and fingerprint-gated pages; comment out to disable
 - **INACTIVITY_TIMEOUT_SEC** — Seconds without button press before return to clock and clear auth (e.g. 30)
 - **AUTH_ERROR_DISPLAY_MS** — How long to show “Fingerprint could not be verified” (e.g. 2000)
-- **FINGERPRINT*LED*\*** — LED colors (ready, error, match, etc.)
+- **FINGERPRINT*LED*** — LED colors (ready, error, match, etc.)
 
 ## Project structure
 
