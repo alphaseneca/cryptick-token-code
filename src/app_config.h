@@ -1,21 +1,39 @@
 #ifndef APP_CONFIG_H
 #define APP_CONFIG_H
-// Hardware Pin Configuration - ESP32-S3
-#define OLED_SDA 8 // ESP32-S3 default I2C SDA (GPIO8)
-#define OLED_SCL 9 // ESP32-S3 default I2C SCL (GPIO9)
+
 #define OLED_RESET -1
 #define OLED_ADDRESS 0x3C
-
-#define RIGHT_BUTTON_PIN 5 // Optional second button for navigation (e.g. back)
-#define BUTTON_PIN 6       // You may want to change this depending on your board wiring
-#define LEFT_BUTTON_PIN 7  // Optional third button for navigation (e.g. forward)
-// Fingerprint UART
-#define FINGERPRINT_RX 16
-#define FINGERPRINT_TX 17
 
 // Display Configuration
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
+
+// Hardware Pin Configuration
+#if defined(ESP32S3)
+// ESP32-S3 N16R8: fingerprint sensor RX/TX -> GPIO17/GPIO18
+#define OLED_SDA 8 // ESP32-S3 default I2C SDA (GPIO8)
+#define OLED_SCL 9 // ESP32-S3 default I2C SCL (GPIO9)
+#define FINGERPRINT_RX 17
+#define FINGERPRINT_TX 18
+#else
+#define OLED_SDA 8 // ESP32-S3 default I2C SDA (GPIO8)
+#define OLED_SCL 9 // ESP32-S3 default I2C SCL (GPIO9)
+#define FINGERPRINT_RX 16
+#define FINGERPRINT_TX 17
+#endif
+
+// Button GPIO pins - board specific
+#if defined(ESP32S3)
+// ESP32-S3 N16R8 pinout
+#define RIGHT_BUTTON_PIN 4 // Right button
+#define BUTTON_PIN 15      // Center button
+#define LEFT_BUTTON_PIN 7  // Left button
+#else
+// Legacy ESP32 Super Mini defaults
+#define RIGHT_BUTTON_PIN 5 // Right button
+#define BUTTON_PIN 6       // Center button
+#define LEFT_BUTTON_PIN 7  // Left button
+#endif
 
 // R558-S Fingerprint: define ENABLE_FINGERPRINT to enable. If enabled, fingerprint verification is required to access any page other than the clock, and the fingerprint sensor LED will be used to indicate status (see FINGERPRINT_LED_*). If disabled, no fingerprint driver is included, and all pages are accessible without verification.
 // Comment out the line below to disable: no fingerprint driver, all pages accessible without verification.
