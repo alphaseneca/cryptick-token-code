@@ -3,7 +3,7 @@
 
 #include <Arduino.h>
 #include <vector>
-#include "../core/totp.h"
+#include "totp.h"
 
 /**
  * Serial commands (line-based, one command per line). Time = Unix/POSIX seconds (UTC).
@@ -16,6 +16,7 @@
  * TOTP <index>     Generate current TOTP code for credential at index.
  * TOTP_DELETE <index>  Delete credential at index and save.
  * HELP, ?          Show commands.
+ * BOOTLOADER, DFU, DOWNLOAD  Enter ROM USB download (no BOOT button).
  * FINGER_ENROLL [id], FINGER_DELETE <id>, FINGER_COUNT, FINGER_CLEAR  (if ENABLE_FINGERPRINT).
  */
 void processSerialCommands(Stream &serial, std::vector<TOTPCredential> &credentials,

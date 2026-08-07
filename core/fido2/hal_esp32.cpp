@@ -6,9 +6,9 @@
 #include <nvs_flash.h>
 #include "esp_random.h"
 #include "LittleFS.h"
-#include "../../src/app_config.h"
+#include <board_config.h>
 #include <RTClib.h>
-#include "../../drivers/usb_hid.h"
+#include "usb_device.h"
 
 extern "C" {
 
@@ -23,15 +23,12 @@ static TaskHandle_t  _fido_task_handle = NULL;
 SemaphoreHandle_t _i2c_mutex = NULL;
 #define FIDO_STACK_SIZE (32 * 1024)
 
-/* ── Volatile ISR state ── */
+/* ── Volatile ISR state (legacy stubs; InputSystem owns buttons) ── */
 static volatile bool     _btn_fired[BTN_COUNT]  = { false, false, false };
 static volatile uint32_t _btn_time[BTN_COUNT]   = { 0, 0, 0 };
 static uint32_t _btn_last_accepted[BTN_COUNT] = { 0, 0, 0 };
 
-/* ── ISR handlers ── */
-static void IRAM_ATTR _isr_left(void)   { _btn_fired[BTN_LEFT]   = true; _btn_time[BTN_LEFT]   = millis(); }
-static void IRAM_ATTR _isr_center(void) { _btn_fired[BTN_CENTER] = true; _btn_time[BTN_CENTER] = millis(); }
-static void IRAM_ATTR _isr_right(void)  { _btn_fired[BTN_RIGHT]  = true; _btn_time[BTN_RIGHT]  = millis(); }
+/* Button ISRs removed — InputSystem owns all navigation pins. */
 
 void i2c_mutex_init() {
     if (!_i2c_mutex) {
@@ -145,10 +142,6 @@ void device_reboot() {
     ESP.restart();
 }
 
-extern void nav_set_state_fido_prompt();
-extern void nav_set_state_fido_processing();
-extern void nav_set_state_clock();
-
 int ctap_user_presence_test(uint32_t delay_ms) {
     if (_up_disabled) {
         Serial.println("[HAL] UP Warning: UP is disabled, auto-confirming.");
@@ -157,24 +150,22 @@ int ctap_user_presence_test(uint32_t delay_ms) {
 
     uint32_t start = millis();
     uint32_t last_keepalive = 0;
-    _fido_ui_request = 1; // Request Prompt UI
+    _fido_ui_request = 1; // Request Prompt UI → fingerprint match on main core
     _user_confirmed = false;
     _request_cancelled = false;
 
-    // Safety: check pin state for diagnostics
-    Serial.printf("[HAL] UP Wait Start | Pin %d: %s\n", BUTTON_PIN, digitalRead(BUTTON_PIN) == LOW ? "PRESSED" : "IDLE");
+    Serial.println("[HAL] UP Wait: place enrolled finger to confirm");
 
     while (millis() - start < delay_ms) {
         uint32_t now = millis();
 
-        // 1. Check for physical button or UI bridge confirmation
-        if (device_is_button_pressed() || _user_confirmed) {
-            Serial.printf("[HAL] UP Success (%s)\n", _user_confirmed ? "UI Bridge" : "Hardware Button");
+        /* FIDO user presence is fingerprint only (bridge from FpSystem/NavSystem) */
+        if (_user_confirmed) {
+            Serial.println("[HAL] UP Success (fingerprint)");
             _fido_ui_request = 2; // Request Processing UI
             return 1;
         }
 
-        // 2. Periodic KEEPALIVE (Every 100ms) - Required for browser response
         if (now - last_keepalive >= 100) {
             extern void ctaphid_update_status(int8_t status);
             ctaphid_update_status(CTAPHID_STATUS_UPNEEDED);
@@ -183,7 +174,7 @@ int ctap_user_presence_test(uint32_t delay_ms) {
 
         if (_request_cancelled) {
             Serial.println("[HAL] UP Cancelled by User");
-            _fido_ui_request = 0; // Return to clock
+            _fido_ui_request = 0;
             return -1;
         }
 
@@ -192,7 +183,7 @@ int ctap_user_presence_test(uint32_t delay_ms) {
     }
 
     Serial.println("[HAL] UP Timeout");
-    _fido_ui_request = 0; // Timeout, return to clock
+    _fido_ui_request = 0;
     return 0;
 }
 
@@ -228,18 +219,8 @@ void device_init_esp32() {
         err = nvs_flash_init();
     }
     ESP_ERROR_CHECK(err);
- 
-    pinMode(BUTTON_PIN, INPUT_PULLUP);
-    attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), _isr_center, FALLING);
-    
-    #ifdef LEFT_BUTTON_PIN
-    pinMode(LEFT_BUTTON_PIN, INPUT_PULLUP);
-    attachInterrupt(digitalPinToInterrupt(LEFT_BUTTON_PIN), _isr_left, FALLING);
-    #endif
-    #ifdef RIGHT_BUTTON_PIN
-    pinMode(RIGHT_BUTTON_PIN, INPUT_PULLUP);
-    attachInterrupt(digitalPinToInterrupt(RIGHT_BUTTON_PIN), _isr_right, FALLING);
-    #endif
+
+    /* Navigation pins owned by InputSystem — do not attach ISRs here. */
 
     if (_hid_queue == NULL) {
         _hid_queue = xQueueCreate(HID_QUEUE_LEN, 64);

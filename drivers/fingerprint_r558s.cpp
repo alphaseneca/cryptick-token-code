@@ -1,38 +1,50 @@
-#include "fingerprint_r558s.h"
+﻿#include "fingerprint_r558s.h"
+#include <board_config.h>
+
+#ifndef FINGERPRINT_ENROLL_REMOVE_STREAK
+#define FINGERPRINT_ENROLL_REMOVE_STREAK 3
+#endif
+#ifndef FINGERPRINT_ENROLL_GOOD_IMG
+#define FINGERPRINT_ENROLL_GOOD_IMG 2
+#endif
+#ifndef FINGERPRINT_ENROLL_TIMEOUT_MS
+#define FINGERPRINT_ENROLL_TIMEOUT_MS 120000
+#endif
 
 R558SFingerprint::R558SFingerprint(Stream &ss) : _ss(ss) {}
 
 int R558SFingerprint::begin(uint16_t baud) {
+  (void)baud;
   delay(50);
   flush();
   delay(50);
   flush();
 
-  uint8_t defaultPwd[4] = {0xFF, 0xFF, 0xFF, 0xFF};
-  int pwdR = vfyPwd(defaultPwd);
+  /* R557 default password is 0x00000000; many modules use 0xFFFFFFFF */
+  uint8_t pwdZero[4] = {0x00, 0x00, 0x00, 0x00};
+  uint8_t pwdFF[4] = {0xFF, 0xFF, 0xFF, 0xFF};
+  int pwdR = vfyPwd(pwdZero);
   if (pwdR != FINGERPRINT_OK) {
-    if (_debug) Serial.println("Pwd wrong (0x21) - Resetting...");
-    setPwd(defaultPwd);
-    pwdR = vfyPwd(defaultPwd);
+    pwdR = vfyPwd(pwdFF);
   }
-  if (pwdR != FINGERPRINT_OK) return pwdR;
+  if (pwdR != FINGERPRINT_OK) {
+    if (_debug) Serial.println("VfyPwd failed");
+    return pwdR;
+  }
 
-  int hsResult = handshake();
-  if (hsResult != FINGERPRINT_OK) {
-    if (_debug) Serial.println("Handshake FAIL! Check wiring.");
-    return hsResult;
-  }
+  /* Optional wake/link (R558); ignore failure on R557 */
+  handshakeOptional();
+
   uint16_t count;
   if (getTemplateCount(&count) != FINGERPRINT_OK) {
     if (_debug) Serial.println("Get template count failed");
     return FINGERPRINT_PACKETRECIEVEERR;
   }
-  if (_debug) Serial.println("R558-S Ready (baud=" + String(baud) + ", 8N1)");
+  if (_debug) Serial.println("R557 ready, templates=" + String(count));
   return FINGERPRINT_OK;
 }
 
-// Handshake 0x35 - wake/link check
-int R558SFingerprint::handshake() {
+int R558SFingerprint::handshakeOptional() {
   uint8_t cmd[] = {0x35};
   uint8_t resp[32];
   uint16_t len;
@@ -88,8 +100,7 @@ int R558SFingerprint::sendPacket(uint8_t *data, uint16_t len) {
   flush();
   _ss.write(packet, pktLen);
   _ss.flush();
-  // Reduced delay to allow other tasks (like display refresh) to run
-  delay(5); 
+  delay(5);
   return FINGERPRINT_OK;
 }
 
@@ -99,7 +110,6 @@ int R558SFingerprint::getPacket(uint8_t *response, uint16_t maxLen, uint16_t *re
   uint8_t header[9];
   uint8_t idx = 0;
 
-  // Sync to packet start (0xEF 0x01) in case of leftover bytes or noise
   while (idx < 2) {
     while (_ss.available()) {
       uint8_t b = _ss.read();
@@ -110,7 +120,6 @@ int R558SFingerprint::getPacket(uint8_t *response, uint16_t maxLen, uint16_t *re
     if (millis() - start > _timeout) return FINGERPRINT_TIMEOUT;
     if (idx < 2) delay(2);
   }
-  // Read rest of 9-byte header
   while (idx < 9) {
     while (_ss.available() && idx < 9) header[idx++] = _ss.read();
     if (millis() - start > _timeout) return FINGERPRINT_TIMEOUT;
@@ -145,15 +154,6 @@ int R558SFingerprint::getPacket(uint8_t *response, uint16_t maxLen, uint16_t *re
 
   memcpy(response, tail, dataLen);
   *respLen = dataLen;
-  if (_debug) {
-    Serial.print("RX: ");
-    for (uint16_t i = 0; i < dataLen; i++) {
-      if (response[i] < 0x10) Serial.print('0');
-      Serial.print(response[i], HEX);
-      Serial.print(' ');
-    }
-    Serial.println();
-  }
   return FINGERPRINT_OK;
 }
 
@@ -169,13 +169,13 @@ int R558SFingerprint::parseAck(uint8_t ack) {
     case 0x09: return FINGERPRINT_NOTFOUND;
     case 0x0A: return FINGERPRINT_MERGEFAIL;
     case 0x0B: return FINGERPRINT_BADLOCATION;
+    case 0x13: return FINGERPRINT_WRONGPASSWORD;
     case 0x1F: return FINGERPRINT_DBRANGEFAIL;
-    case 0x35: return FINGERPRINT_ILLEGALDATA;  // Illegal Data (e.g. store without 4 enrolls)
+    case 0x35: return FINGERPRINT_ILLEGALDATA;
     default: return FINGERPRINT_PACKETRECIEVEERR;
   }
 }
 
-// LED cmd 0x3C (mode, startColor, endColor, cycles). Colors: 0x01 blue, 0x02 green, 0x04 red.
 int R558SFingerprint::setLed(uint8_t color) {
   _ledOffAtMs = 0;
   if (color == 0) return setLedEx(R558_LED_MODE_OFF, 0, 0);
@@ -199,17 +199,17 @@ void R558SFingerprint::ledUpdate() {
   }
 }
 int R558SFingerprint::setLedEx(uint8_t mode, uint8_t color, uint8_t cycles) {
+  /* Soft-fail: R557 may not support Aura LED cmd */
   uint8_t cmd[] = {0x3C, mode, color, color, cycles};
   uint8_t resp[32];
   uint16_t len;
   int r = sendPacket(cmd, 5);
-  if (r != FINGERPRINT_OK) return r;
+  if (r != FINGERPRINT_OK) return FINGERPRINT_OK;
   r = getPacket(resp, sizeof(resp), &len);
-  if (r != FINGERPRINT_OK) return r;
-  return parseAck(resp[0]);
+  if (r != FINGERPRINT_OK) return FINGERPRINT_OK;
+  return FINGERPRINT_OK;
 }
 
-// GenImg 0x01 - collect finger image into ImageBuffer
 int R558SFingerprint::getImage() {
   uint8_t cmd[] = {0x01};
   uint8_t resp[32];
@@ -221,7 +221,6 @@ int R558SFingerprint::getImage() {
   return parseAck(resp[0]);
 }
 
-// GenChar 0x02 - generate character from ImageBuffer to CharBuffer1/2
 int R558SFingerprint::image2Tz(uint8_t slot) {
   uint8_t cmd[] = {0x02, slot};
   uint8_t resp[32];
@@ -233,7 +232,6 @@ int R558SFingerprint::image2Tz(uint8_t slot) {
   return parseAck(resp[0]);
 }
 
-// RegModel 0x05 - merge CharBuffer1+2 into template
 int R558SFingerprint::createModel() {
   uint8_t cmd[] = {0x05};
   uint8_t resp[32];
@@ -245,7 +243,6 @@ int R558SFingerprint::createModel() {
   return parseAck(resp[0]);
 }
 
-// VfyPwd 0x13 - verify handshake password (default 0xFFFFFFFF or 0x00000000)
 int R558SFingerprint::vfyPwd(const uint8_t pwd[4]) {
   uint8_t cmd[] = {0x13, pwd[0], pwd[1], pwd[2], pwd[3]};
   uint8_t resp[32];
@@ -257,7 +254,6 @@ int R558SFingerprint::vfyPwd(const uint8_t pwd[4]) {
   return parseAck(resp[0]);
 }
 
-// SetPwd 0x12
 int R558SFingerprint::setPwd(const uint8_t pwd[4]) {
   uint8_t cmd[] = {0x12, pwd[0], pwd[1], pwd[2], pwd[3]};
   uint8_t resp[32];
@@ -269,7 +265,6 @@ int R558SFingerprint::setPwd(const uint8_t pwd[4]) {
   return parseAck(resp[0]);
 }
 
-// Store 0x06 - store template from buffer to Flash at PageID
 int R558SFingerprint::storeModel(uint16_t id) {
   uint8_t cmd[] = {0x06, 0x01, (uint8_t)(id >> 8), (uint8_t)(id & 0xFF)};
   uint8_t resp[32];
@@ -281,7 +276,6 @@ int R558SFingerprint::storeModel(uint16_t id) {
   return parseAck(resp[0]);
 }
 
-// LoadChar 0x07 - load template from Flash to buffer
 int R558SFingerprint::loadModel(uint16_t id) {
   uint8_t cmd[] = {0x07, 0x01, (uint8_t)(id >> 8), (uint8_t)(id & 0xFF)};
   uint8_t resp[32];
@@ -293,11 +287,13 @@ int R558SFingerprint::loadModel(uint16_t id) {
   return parseAck(resp[0]);
 }
 
-// Search 0x04 - search library (BufferID, StartPage, PageNum)
 int R558SFingerprint::fingerFastSearch(uint16_t *id, uint16_t *score) {
   *id = 0xFFFF;
   *score = 0xFFFF;
   uint8_t cmd[] = {0x04, 0x01, 0x00, 0x00, 0x00, 0x64};
+  /* PageNum is capacity-limited; use 120 for R557 */
+  cmd[4] = (_capacity >> 8) & 0xFF;
+  cmd[5] = _capacity & 0xFF;
   uint8_t resp[32];
   uint16_t len;
   int r = sendPacket(cmd, 6);
@@ -312,7 +308,6 @@ int R558SFingerprint::fingerFastSearch(uint16_t *id, uint16_t *score) {
   return ack;
 }
 
-// TempleteNum 0x1D - read valid template count. N may be 1 or 2 bytes; try little-endian 2-byte.
 int R558SFingerprint::getTemplateCount(uint16_t *count) {
   *count = 0;
   uint8_t cmd[] = {0x1D};
@@ -325,13 +320,15 @@ int R558SFingerprint::getTemplateCount(uint16_t *count) {
   int ack = parseAck(resp[0]);
   if (ack != FINGERPRINT_OK) return ack;
   if (len >= 3)
-    *count = (uint16_t)resp[1] | ((uint16_t)resp[2] << 8);  // little-endian (common on R558)
+    *count = ((uint16_t)resp[1] << 8) | resp[2]; /* big-endian (manual style) */
   else if (len >= 2)
     *count = resp[1];
+  /* If big-endian yields absurd, try little-endian */
+  if (*count > _capacity && len >= 3)
+    *count = (uint16_t)resp[1] | ((uint16_t)resp[2] << 8);
   return FINGERPRINT_OK;
 }
 
-// DeletChar 0x0C - delete N templates from PageID
 int R558SFingerprint::deleteModel(uint16_t id) {
   uint8_t cmd[] = {0x0C, (uint8_t)(id >> 8), (uint8_t)(id & 0xFF), 0x00, 0x01};
   uint8_t resp[32];
@@ -343,7 +340,6 @@ int R558SFingerprint::deleteModel(uint16_t id) {
   return parseAck(resp[0]);
 }
 
-// Empty 0x0D - clear finger library
 int R558SFingerprint::emptyDatabase() {
   uint8_t cmd[] = {0x0D};
   uint8_t resp[32];
@@ -355,7 +351,6 @@ int R558SFingerprint::emptyDatabase() {
   return parseAck(resp[0]);
 }
 
-// ReadSysPara 0x0F
 int R558SFingerprint::readSysPara() {
   uint8_t cmd[] = {0x0F};
   uint8_t resp[32];
@@ -367,36 +362,211 @@ int R558SFingerprint::readSysPara() {
   return parseAck(resp[0]);
 }
 
+
 int R558SFingerprint::getFreeId(uint16_t &freeId) {
   freeId = 0xFFFF;
-  uint16_t capacity = 100;
-  uint16_t perPage = 256;
-  uint16_t pageCount = (capacity + perPage - 1) / perPage;
+  uint16_t capacity = _capacity ? _capacity : 120;
 
-  for (uint16_t page = 0; page < pageCount; page++) {
-    uint8_t cmd[] = {0x1F, (uint8_t)page};
-    uint8_t resp[64];
-    uint16_t len;
-    int r = sendPacket(cmd, 2);
-    if (r != FINGERPRINT_OK) return r;
+  /* TemplateIndex (0x1F) — short timeout so unsupported modules fail quickly */
+  const uint32_t prev = _timeout;
+  if (_timeout > 400)
+    _timeout = 400;
+
+  uint8_t cmd[] = {0x1F, 0x00};
+  uint8_t resp[64];
+  uint16_t len;
+  int r = sendPacket(cmd, 2);
+  if (r == FINGERPRINT_OK)
     r = getPacket(resp, sizeof(resp), &len);
-    if (r != FINGERPRINT_OK) return r;
-    int ack = parseAck(resp[0]);
-    if (ack != FINGERPRINT_OK) return ack;
+  _timeout = prev;
 
+  if (r == FINGERPRINT_OK && parseAck(resp[0]) == FINGERPRINT_OK) {
     uint8_t *bitmap = resp + 1;
-    for (uint16_t i = 0; i < 256; i++) {
-      uint16_t globalId = page * perPage + i;
-      if (globalId >= capacity) break;
-      uint16_t byteIdx = i / 8;
-      uint8_t bitIdx = i % 8;
-      if ((bitmap[byteIdx] & (1 << bitIdx)) == 0) {
-        freeId = globalId;
+    uint16_t bits = (len > 1) ? (len - 1) * 8 : 0;
+    for (uint16_t i = 0; i < bits && i < capacity; i++) {
+      if ((bitmap[i / 8] & (1 << (i % 8))) == 0) {
+        freeId = i;
         return FINGERPRINT_OK;
       }
     }
+    freeId = 0;
+    return FINGERPRINT_DBRANGEFAIL;
   }
-  return FINGERPRINT_DBRANGEFAIL;
+
+  /*
+   * R557 often has no 0x1F. Do NOT LoadChar-scan (multi-second hangs).
+   * Use template count as next sequential id (common module behaviour).
+   */
+  uint16_t count = 0;
+  if (getTemplateCount(&count) == FINGERPRINT_OK) {
+    freeId = (count < capacity) ? count : 0;
+    return FINGERPRINT_OK;
+  }
+  freeId = 0;
+  return FINGERPRINT_OK;
+}
+
+int R558SFingerprint::enrollStart(uint16_t id) {
+  _enrollId = id;
+  if (_enrollId == 0xFFFF) {
+    if (getFreeId(_enrollId) != FINGERPRINT_OK)
+      _enrollId = 0;
+  }
+  _enrollStep = 1;
+  _enrollState = ENROLL_WAIT_FINGER;
+  _enrollDeadline = millis() + (uint32_t)FINGERPRINT_ENROLL_TIMEOUT_MS;
+  _error = FINGERPRINT_OK;
+  _nofingerStreak = 0;
+  _goodImgStreak = 0;
+  _retryAfterFail = false;
+  flush();
+  return FINGERPRINT_OK;
+}
+
+void R558SFingerprint::enrollAbort() {
+  _enrollState = ENROLL_IDLE;
+  _enrollStep = 0;
+  _nofingerStreak = 0;
+  _goodImgStreak = 0;
+  _retryAfterFail = false;
+}
+
+/*
+ * R557 / AS608-class enrollment (manual):
+ *   GenImg → GenChar(1) → (lift) → GenImg → GenChar(2) → RegModel → StoreChar
+ * Non-blocking: one GenImg/GenChar attempt per poll tick.
+ */
+int R558SFingerprint::enrollPoll(EnrollNbState &state, uint8_t &step) {
+  step = _enrollStep;
+  state = _enrollState;
+  if (_enrollState == ENROLL_IDLE || _enrollState == ENROLL_DONE || _enrollState == ENROLL_FAILED)
+    return (_enrollState == ENROLL_DONE) ? FINGERPRINT_OK : _error;
+
+  if (millis() > _enrollDeadline) {
+    _enrollState = ENROLL_FAILED;
+    _error = FINGERPRINT_TIMEOUT;
+    state = _enrollState;
+    return _error;
+  }
+
+  const uint32_t prevTimeout = _timeout;
+  if (_timeout > 600)
+    _timeout = 600;
+
+  if (_enrollState == ENROLL_WAIT_FINGER) {
+    int r = getImage();
+    if (r == FINGERPRINT_NOFINGER || r == FINGERPRINT_TIMEOUT) {
+      _goodImgStreak = 0;
+      _timeout = prevTimeout;
+      return r;
+    }
+    if (r != FINGERPRINT_OK) {
+      _goodImgStreak = 0;
+      _timeout = prevTimeout;
+      return r;
+    }
+
+    if (++_goodImgStreak < (uint8_t)FINGERPRINT_ENROLL_GOOD_IMG) {
+      _timeout = prevTimeout;
+      return FINGERPRINT_OK;
+    }
+    _goodImgStreak = 0;
+
+    /* BufferID 1 first capture, 2 second — matches GenChar in manual */
+    r = image2Tz(_enrollStep == 1 ? 1 : 2);
+    if (r != FINGERPRINT_OK) {
+      /* Ask to lift and re-place same step (manual retry) */
+      _retryAfterFail = true;
+      _nofingerStreak = 0;
+      _enrollState = ENROLL_WAIT_REMOVE;
+      state = _enrollState;
+      _timeout = prevTimeout;
+      return r;
+    }
+
+    _nofingerStreak = 0;
+    _retryAfterFail = false;
+    _enrollDeadline = millis() + (uint32_t)FINGERPRINT_ENROLL_TIMEOUT_MS;
+
+    if (_enrollStep == 1) {
+      /* Must lift before second GenImg */
+      _enrollState = ENROLL_WAIT_REMOVE;
+    } else {
+      /* After buffer 2, RegModel + Store without requiring lift */
+      _enrollState = ENROLL_MERGE_STORE;
+    }
+    state = _enrollState;
+    _timeout = prevTimeout;
+    return FINGERPRINT_OK;
+  }
+
+  if (_enrollState == ENROLL_WAIT_REMOVE) {
+    int r = getImage();
+    /* Empty plate: NOFINGER; some R557 builds also return timeout when empty */
+    bool empty = (r == FINGERPRINT_NOFINGER || r == FINGERPRINT_TIMEOUT);
+    if (empty) {
+      if (++_nofingerStreak < (uint8_t)FINGERPRINT_ENROLL_REMOVE_STREAK) {
+        _timeout = prevTimeout;
+        return FINGERPRINT_NOFINGER;
+      }
+      _nofingerStreak = 0;
+      _goodImgStreak = 0;
+      if (_retryAfterFail) {
+        _retryAfterFail = false;
+        _enrollState = ENROLL_WAIT_FINGER;
+        _enrollDeadline = millis() + (uint32_t)FINGERPRINT_ENROLL_TIMEOUT_MS;
+        step = _enrollStep;
+        state = _enrollState;
+        _timeout = prevTimeout;
+        return FINGERPRINT_OK;
+      }
+      /* First capture done → go to second placement */
+      _enrollStep = 2;
+      _enrollState = ENROLL_WAIT_FINGER;
+      _enrollDeadline = millis() + (uint32_t)FINGERPRINT_ENROLL_TIMEOUT_MS;
+      step = _enrollStep;
+      state = _enrollState;
+      _timeout = prevTimeout;
+      return FINGERPRINT_OK;
+    }
+    /* Still seeing a finger (or partial image) — keep asking for lift */
+    _nofingerStreak = 0;
+    _timeout = prevTimeout;
+    return FINGERPRINT_OK;
+  }
+
+  if (_enrollState == ENROLL_MERGE_STORE) {
+    int r = createModel(); /* RegModel 0x05 */
+    if (r != FINGERPRINT_OK) {
+      _error = r;
+      _enrollState = ENROLL_FAILED;
+      state = _enrollState;
+      _timeout = prevTimeout;
+      return r;
+    }
+    r = storeModel(_enrollId); /* StoreChar 0x06 */
+    if (r != FINGERPRINT_OK) {
+      uint16_t alt = 0;
+      if (getFreeId(alt) == FINGERPRINT_OK && alt != _enrollId) {
+        _enrollId = alt;
+        r = storeModel(_enrollId);
+      }
+    }
+    if (r != FINGERPRINT_OK) {
+      _error = r;
+      _enrollState = ENROLL_FAILED;
+      state = _enrollState;
+      _timeout = prevTimeout;
+      return r;
+    }
+    _enrollState = ENROLL_DONE;
+    state = _enrollState;
+    _timeout = prevTimeout;
+    return FINGERPRINT_OK;
+  }
+
+  _timeout = prevTimeout;
+  return FINGERPRINT_OK;
 }
 
 int R558SFingerprint::fingerID(uint16_t *id, uint16_t *score) {
@@ -405,79 +575,60 @@ int R558SFingerprint::fingerID(uint16_t *id, uint16_t *score) {
   return fingerFastSearch(id, score);
 }
 
-// Non-blocking: one getImage(); if no finger return immediately; else identify
 int R558SFingerprint::getFingerprintID(uint16_t *id, uint16_t *score) {
   int r = getImage();
-  if (r != FINGERPRINT_OK) return r;  // NOFINGER, IMAGEFAIL, etc.
+  if (r != FINGERPRINT_OK) return r;
   r = image2Tz(1);
   if (r != FINGERPRINT_OK) return r;
   return fingerFastSearch(id, score);
 }
 
-// R558/R557 require 4 enrollments (image2Tz slots 1..4) before createModel/storeModel (fixes 0x35 Illegal Data).
 int R558SFingerprint::enrollFingerprint(uint16_t id, Stream* feedback) {
-  uint16_t storeId = id;
-  if (storeId == 0xFFFF) {
-    if (getFreeId(storeId) != FINGERPRINT_OK) {
-      if (feedback) feedback->println(F("Enroll: No free ID (database full)."));
-      return FINGERPRINT_DBRANGEFAIL;
-    }
-  }
-  if (feedback) {
-    feedback->println(F("--- Enrollment (4 steps) ---"));
-    feedback->printf("  Storing at ID %u. Place same finger 4 times when asked.\n", (unsigned)storeId);
-  }
-  uint32_t savedTimeout = _timeout;
-  _timeout = 12000;
-  int r;
-  for (uint8_t slot = 1; slot <= 4; slot++) {
-    if (feedback) feedback->printf("  [%u/4] Place finger on sensor...\n", (unsigned)slot);
-    unsigned long start = millis();
-    while ((r = getImage()) != FINGERPRINT_OK) {
-      if (r != FINGERPRINT_NOFINGER) {
-        _timeout = savedTimeout;
-        if (feedback) feedback->printf("  Enroll failed: %s\n", getErrorMessage(r));
-        return r;
-      }
-      if (millis() - start > 20000) {
-        _timeout = savedTimeout;
-        if (feedback) feedback->println(F("  Enroll failed: Timeout (place finger within 20s)."));
-        return FINGERPRINT_TIMEOUT;
-      }
-      delay(200);
-    }
-    delay(150);
-    r = image2Tz(slot);
-    if (r != FINGERPRINT_OK) {
-      _timeout = savedTimeout;
-      if (feedback) feedback->printf("  Enroll failed at step %u: %s\n", (unsigned)slot, getErrorMessage(r));
-      return r;
-    }
-    if (feedback) feedback->printf("  [%u/4] OK. Remove finger.\n", (unsigned)slot);
-    delay(150);
-    if (slot < 4) {
-      for (int i = 0; i < 40; i++) {
-        if (getImage() == FINGERPRINT_NOFINGER) break;
-        delay(200);
-      }
-      delay(500);
-    }
-  }
-  if (feedback) feedback->println(F("  Creating template and storing..."));
-  delay(150);
-  if ((r = createModel()) != FINGERPRINT_OK) {
-    _timeout = savedTimeout;
-    if (feedback) feedback->printf("  Enroll failed (merge): %s\n", getErrorMessage(r));
+  int r = enrollStart(id);
+  if (r != FINGERPRINT_OK) {
+    if (feedback) feedback->printf("Enroll start fail: %s\n", getErrorMessage(r));
     return r;
   }
-  delay(150);
-  r = storeModel(storeId);
-  _timeout = savedTimeout;
-  if (r == FINGERPRINT_OK && feedback)
-    feedback->printf("  Enrolled at ID %u.\n", (unsigned)storeId);
-  else if (r != FINGERPRINT_OK && feedback)
-    feedback->printf("  Enroll failed (store): %s\n", getErrorMessage(r));
-  return r;
+  if (feedback) {
+    feedback->println(F("--- Enrollment (2 steps) ---"));
+    feedback->printf("  Storing at ID %u\n", (unsigned)_enrollId);
+    feedback->println(F("  [1/2] Place finger firmly..."));
+  }
+  EnrollNbState st;
+  uint8_t step;
+  uint8_t lastStep = 0;
+  bool askedRemove = false;
+  bool askedPlace = true;
+  while (true) {
+    r = enrollPoll(st, step);
+    if (st == ENROLL_WAIT_FINGER && (step != lastStep || !askedPlace)) {
+      lastStep = step;
+      askedRemove = false;
+      askedPlace = true;
+      if (feedback) feedback->printf("  [%u/2] Place finger firmly...\n", (unsigned)step);
+    }
+    if (st == ENROLL_WAIT_REMOVE && !askedRemove) {
+      askedRemove = true;
+      askedPlace = false;
+      if (feedback) {
+        if (_retryAfterFail)
+          feedback->printf("  [%u/2] Poor capture — lift finger, try again.\n",
+                           (unsigned)step);
+        else
+          feedback->printf("  [%u/2] OK. Lift finger completely.\n", (unsigned)step);
+      }
+    }
+    if (st == ENROLL_DONE) {
+      if (feedback) feedback->printf("  Enrolled at ID %u.\n", (unsigned)_enrollId);
+      return FINGERPRINT_OK;
+    }
+    if (st == ENROLL_FAILED) {
+      if (feedback) feedback->printf("  Enroll failed: %s\n", getErrorMessage(r));
+      return r;
+    }
+    delay(40);
+    yield();
+  }
 }
 
 const char* R558SFingerprint::getErrorMessage(int err) {
@@ -487,13 +638,14 @@ const char* R558SFingerprint::getErrorMessage(int err) {
     case FINGERPRINT_NOFINGER: return "No finger";
     case FINGERPRINT_IMAGEFAIL: return "Image capture failed";
     case FINGERPRINT_IMAGEMESS: return "Image too messy";
-    case FINGERPRINT_FEATUREFAIL: return "Too few features";
-    case FINGERPRINT_NOMATCH: return "No match";
-    case FINGERPRINT_NOTFOUND: return "Not found";
-    case FINGERPRINT_MERGEFAIL: return "Merge failed";
-    case FINGERPRINT_BADLOCATION: return "Bad slot/location";
-    case FINGERPRINT_DBRANGEFAIL: return "Database full";
-    case FINGERPRINT_ILLEGALDATA: return "Illegal data (need 4 enroll steps?)";
+    case FINGERPRINT_FEATUREFAIL: return "Could not find fingerprint features";
+    case FINGERPRINT_NOMATCH: return "Fingerprints do not match";
+    case FINGERPRINT_NOTFOUND: return "Fingerprint not found";
+    case FINGERPRINT_MERGEFAIL: return "Could not merge fingerprints (try again)";
+    case FINGERPRINT_BADLOCATION: return "Invalid template location";
+    case FINGERPRINT_DBRANGEFAIL: return "Database full / range error";
+    case FINGERPRINT_WRONGPASSWORD: return "Wrong password";
+    case FINGERPRINT_ILLEGALDATA: return "Illegal data";
     case FINGERPRINT_TIMEOUT: return "Timeout";
     case FINGERPRINT_BADPACKET: return "Bad packet";
     default: return "Unknown error";

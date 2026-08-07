@@ -1,5 +1,5 @@
 #include "totp_storage.h"
-#include "app_config.h"
+#include <board_config.h>
 #include <LittleFS.h>
 #include <ArduinoJson.h>
 #include <new>

@@ -1,10 +1,12 @@
 #include "serial_comm.h"
-#include "app_config.h"
+#include <board_config.h>
 #include "totp_storage.h"
-#include "../core/fido2/device.h"
+#include "device.h"
+#include "usb_device.h"
+#include "event_bus.h"
 #include <RTClib.h>
 #ifdef ENABLE_FINGERPRINT
-#include "../drivers/fingerprint_r558s.h"
+#include "fingerprint_r558s.h"
 #endif
 #include "tusb.h" // Low-level TinyUSB for direct CDC access
 
@@ -293,31 +295,28 @@ void processSerialCommands(Stream &serial, std::vector<TOTPCredential> &credenti
 #ifdef ENABLE_FINGERPRINT
             else if (fingerprintReady && fp && (name == "FINGER_ENROLL" || name == "FINGER_ADD"))
             {
-                uint16_t id = 0xFFFF;
-                if (args.length())
-                    id = (uint16_t)args.toInt();
-#if FINGERPRINT_LED_ENROLL
-                fp->setLed(FINGERPRINT_LED_ENROLL);
-#endif
-                serial.println("FINGER_ENROLL: Follow the step-by-step prompts below.");
-                int r = fp->enrollFingerprint(id, &serial);
-                serial.print("Enroll result: ");
-                serial.println(R558SFingerprint::getErrorMessage(r));
-                if (r == 0)
-                {
-                    uint16_t n;
-                    fp->getTemplateCount(&n);
-                    serial.printf("Stored. Total templates: %u\n", (unsigned)n);
-#if FINGERPRINT_LED_READY
-                    fp->setLed(FINGERPRINT_LED_READY);
-#endif
+                /* Non-blocking — same path as Settings → Enroll (keeps USB/UI alive) */
+                BusEvent e{};
+                e.type = EVT_CMD;
+                e.kind = CMD_FP_ENROLL_START;
+                e.a = args.length() ? (uint16_t)args.toInt() : 0xFFFF;
+                if (!bus_publish(e))
+                    serial.println("Busy — try again");
+                else {
+                    serial.println("Enroll started (non-blocking).");
+                    serial.println("  1) Place finger firmly");
+                    serial.println("  2) Lift completely when asked");
+                    serial.println("  3) Place same finger again");
+                    serial.println("Watch [FP] lines. Abort: FINGER_ABORT");
                 }
-                else
-                {
-#if FINGERPRINT_LED_ERROR
-                    fp->setLed(FINGERPRINT_LED_ERROR);
-#endif
-                }
+            }
+            else if (fingerprintReady && (name == "FINGER_ABORT" || name == "FINGER_CANCEL"))
+            {
+                BusEvent e{};
+                e.type = EVT_CMD;
+                e.kind = CMD_FP_ENROLL_ABORT;
+                bus_publish(e);
+                serial.println("Enroll abort requested");
             }
             else if (fingerprintReady && fp && (name == "FINGER_DELETE" || name == "FINGER_DEL"))
             {
@@ -354,9 +353,17 @@ void processSerialCommands(Stream &serial, std::vector<TOTPCredential> &credenti
                 ctap_reset();
                 serial.println("OK. FIDO2 state wiped.");
             }
+            else if (name == "BOOTLOADER" || name == "DFU" || name == "DOWNLOAD")
+            {
+                /* PCB has no BOOT/RESET — enter ROM USB download for esptool/pio upload */
+                serial.println("OK. Entering ROM download mode...");
+                serial.flush();
+                delay(50);
+                usb_device_enter_bootloader();
+            }
             else if (name == "HELP" || name == "?")
             {
-                serial.println("Commands: DATE [unix_ts] | SETTIME <unix> | TOTP_ADD <otpauth_uri> | TOTP_LIST | TOTP <index> | TOTP_DELETE <index> | FIDO_RESET");
+                serial.println("Commands: DATE [unix_ts] | SETTIME <unix> | TOTP_ADD <otpauth_uri> | TOTP_LIST | TOTP <index> | TOTP_DELETE <index> | FIDO_RESET | BOOTLOADER");
 #ifdef ENABLE_FINGERPRINT
                 if (fingerprintReady)
                     serial.println("FINGER_ENROLL [id] | FINGER_DELETE <id> | FINGER_COUNT | FINGER_CLEAR");

@@ -174,8 +174,7 @@ int totp_base32_decode(const char *encoded, uint8_t *result, int bufSize)
 
 String totp_generate(const TOTPCredential &cred, uint32_t timestamp)
 {
-    if (timestamp == 0)
-        return "RTC Err";
+    /* timestamp 0 is a valid RFC 6238 counter window (T=0), not an RTC error */
 
     uint8_t key[64];
     int keyLen = totp_base32_decode(cred.secret.c_str(), key, sizeof(key));
