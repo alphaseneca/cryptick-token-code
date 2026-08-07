@@ -6,15 +6,25 @@
 #include "esp32-hal-tinyusb.h"
 #endif
 
-#include "Adafruit_TinyUSB.h"
+/*
+ * Prefer class headers; keep tusb API from ESP32 core stack.
+ * Umbrella Adafruit_TinyUSB.h pulls MSC headers (SdFat dependency) — avoid it.
+ */
+#include "arduino/Adafruit_USBD_CDC.h"
+#include "arduino/hid/Adafruit_USBD_HID.h"
 #include "tusb.h"
 
 /*
- * Single CDC + FIDO HID. Dual CDC (CFG_TUD_CDC=2) often breaks enum on S3
- * endpoint budget — use CDC=1 so Serial always maps to one COM port.
- *
- * TinyUSB_Port_EnterDFU is empty in Adafruit ESP32 port → linker wrap.
+ * Single CDC + FIDO HID. Product registers one CDC interface at runtime.
+ * VID/PID set via USB API (avoid build-flag clash with board pins_arduino).
  */
+
+#ifndef CRYPTICK_USB_VID
+#define CRYPTICK_USB_VID 0x1209
+#endif
+#ifndef CRYPTICK_USB_PID
+#define CRYPTICK_USB_PID 0xBEEE
+#endif
 
 static Adafruit_USBD_HID _usb_hid;
 Stream &USBLog = Serial;
@@ -61,8 +71,8 @@ void usb_device_init(void)
 #ifdef ESP32
     USB.manufacturerName(USB_MANUFACTURER);
     USB.productName(USB_PRODUCT);
-    USB.VID(USB_VID);
-    USB.PID(USB_PID);
+    USB.VID(CRYPTICK_USB_VID);
+    USB.PID(CRYPTICK_USB_PID);
 #endif
 
     _usb_hid.setPollInterval(5);
@@ -77,8 +87,8 @@ void usb_device_init(void)
     Serial.begin(115200);
 
     /* Short wait only — never block boot (OLED / buttons must still work). */
-    uint32_t t0 = millis();
-    while (millis() - t0 < 800) {
+    uint32_t t0 = (uint32_t)millis();
+    while ((uint32_t)millis() - t0 < 800) {
         if (Serial || (tud_inited() && tud_mounted()))
             break;
         delay(10);
@@ -141,8 +151,8 @@ bool usb_hid_send_report(const uint8_t buffer[64])
     if (!_usb_mutex)
         _usb_mutex = xSemaphoreCreateMutex();
 
-    uint32_t timeout = millis() + 50;
-    while (millis() < timeout) {
+    uint32_t timeout = (uint32_t)millis() + 50;
+    while ((uint32_t)millis() < timeout) {
         if (_usb_hid.ready()) {
             if (xSemaphoreTake(_usb_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
                 bool success = _usb_hid.sendReport(0, buffer, 64);

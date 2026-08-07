@@ -79,6 +79,7 @@ const char *nav_system_fido_label(void) { return _fidoLabel; }
 void nav_system_set_fido_ui(int8_t req)
 {
     if (req == _lastFidoReq && req != 0) return;
+    int8_t prev = _lastFidoReq;
     _lastFidoReq = req;
     if (req == 1) {
         set_state(UI_FIDO_PROMPT);
@@ -88,7 +89,10 @@ void nav_system_set_fido_ui(int8_t req)
         set_state(UI_FIDO_PROCESSING);
     } else if (req == 0) {
         cmd_fp(CMD_FP_MATCH_STOP);
-        if (_state == UI_FIDO_PROMPT || _state == UI_FIDO_PROCESSING) {
+        if (_state == UI_FIDO_PROCESSING || prev == 2) {
+            _fidoSuccessStart = millis();
+            set_state(UI_FIDO_SUCCESS);
+        } else if (_state == UI_FIDO_PROMPT) {
             set_state(UI_CLOCK);
         }
     }
@@ -198,16 +202,16 @@ void nav_system_on_event(const BusEvent &e)
     case UI_CLOCK:
         /* Any of the 5 keys opens the menu (enroll is Settings → Enroll) */
         if (key == KEY_CENTER || key == KEY_LEFT || key == KEY_RIGHT ||
-            key == KEY_UP || key == KEY_DOWN || key == KEY_CW || key == KEY_CCW) {
+            key == KEY_UP || key == KEY_DOWN) {
             enter_menu();
         }
         break;
 
     case UI_MENU:
-        if (key == KEY_UP || key == KEY_CW) {
+        if (key == KEY_UP) {
             _menuIdx = (_menuIdx + MENU_COUNT - 1) % MENU_COUNT;
             publish_ui();
-        } else if (key == KEY_DOWN || key == KEY_CCW || key == KEY_RIGHT) {
+        } else if (key == KEY_DOWN || key == KEY_RIGHT) {
             _menuIdx = (_menuIdx + 1) % MENU_COUNT;
             publish_ui();
         } else if (key == KEY_LEFT) {
@@ -220,11 +224,11 @@ void nav_system_on_event(const BusEvent &e)
 
     case UI_TOTP:
         auth_system_record_activity(now);
-        if (key == KEY_UP || key == KEY_CW) {
+        if (key == KEY_UP) {
             if (_accountCount > 0)
                 _accountIdx = (_accountIdx + _accountCount - 1) % _accountCount;
             publish_ui();
-        } else if (key == KEY_DOWN || key == KEY_CCW || key == KEY_RIGHT) {
+        } else if (key == KEY_DOWN || key == KEY_RIGHT) {
             if (_accountCount > 0)
                 _accountIdx = (_accountIdx + 1) % _accountCount;
             publish_ui();
@@ -235,10 +239,10 @@ void nav_system_on_event(const BusEvent &e)
 
     case UI_SETTINGS:
         auth_system_record_activity(now);
-        if (key == KEY_UP || key == KEY_CW) {
+        if (key == KEY_UP) {
             _settingsIdx = (_settingsIdx + SET_ITEM_COUNT - 1) % SET_ITEM_COUNT;
             publish_ui();
-        } else if (key == KEY_DOWN || key == KEY_CCW || key == KEY_RIGHT) {
+        } else if (key == KEY_DOWN || key == KEY_RIGHT) {
             _settingsIdx = (_settingsIdx + 1) % SET_ITEM_COUNT;
             publish_ui();
         } else if (key == KEY_LEFT) {

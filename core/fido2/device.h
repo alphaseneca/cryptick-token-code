@@ -17,9 +17,16 @@ extern "C" {
 #include <stdbool.h>
 #include "storage.h"
 
-/** Return a millisecond timestamp.  Does not need to be synchronized to anything.
- * */
-uint32_t millis();
+/** Millisecond timestamp. Solo C units map millis() → device_millis() under Arduino
+ *  to avoid clashing with Arduino's unsigned long millis() in C++. */
+uint32_t device_millis(void);
+#if defined(ARDUINO)
+#if !defined(__cplusplus)
+#define millis() device_millis()
+#endif
+#else
+uint32_t millis(void);
+#endif
 
 /** Handle one HID packet.
  * */
@@ -27,7 +34,7 @@ void usbhid_send(uint8_t * msg);
 
 /** Reboot the device.
  * */
-void device_reboot();
+void device_reboot(void);
 
 /** Load the shared auth state from non-volatile storage.
  * */
@@ -43,7 +50,7 @@ void device_set_status(uint32_t status);
 
 /** Standard button check.
  * */
-int device_is_button_pressed();
+int device_is_button_pressed(void);
 
 
 /** Standard user presence check.  Should check for button press and return
@@ -66,8 +73,8 @@ uint32_t ctap_atomic_count(uint32_t amount);
 /** Resident Secret (RK) management. 
  *  Stored separately from AuthenticatorState.
  * */
-void ctap_reset_rk();
-uint32_t ctap_rk_size();
+void ctap_reset_rk(void);
+uint32_t ctap_rk_size(void);
 void ctap_store_rk(int index, CTAP_residentKey * rk);
 void ctap_delete_rk(int index);
 void ctap_load_rk(int index, CTAP_residentKey * rk);
@@ -75,7 +82,7 @@ void ctap_overwrite_rk(int index, CTAP_residentKey * rk);
 
 /** Not implemented yet.
  * */
-void device_wink();
+void device_wink(void);
 
 typedef enum {
     DEVICE_CLOCK_SLOW,
@@ -88,11 +95,11 @@ void device_set_clock_rate(DEVICE_CLOCK_RATE param);
 
 /** Return true if NFC is used.
  * */
-int device_is_nfc();
+int device_is_nfc(void);
 
 /** Return the device attestation key.
  * */
-uint8_t * device_get_attestation_key();
+uint8_t * device_get_attestation_key(void);
 
 /** Read the device attestation cert.
  * */
@@ -100,16 +107,17 @@ void device_attestation_read_cert_der(uint8_t * dst);
 
 /** Get size of the attestation cert.
  * */
-int device_attestation_cert_der_get_size();
+int device_attestation_cert_der_get_size(void);
 
 /** Read the device AAGUID.
  * */
 void device_read_aaguid(uint8_t * dst);
 
-/** Solo extensions stubs
- * */
-void boot_solo_bootloader();
-uint8_t solo_is_locked();
+/** Enter ROM USB download mode (Cryptick product HAL). */
+void cryptick_enter_bootloader(void);
+/** Lock stubs (no product lock policy yet). */
+uint8_t cryptick_is_locked(void);
+void cryptick_lock_if_not_already(void);
 
 /** Bridge functions for main application
  * */
@@ -120,21 +128,17 @@ typedef enum {
     BTN_COUNT  = 3
 } ButtonID;
 
-void device_hal_init();
-void device_hal_heartbeat();
+void device_hal_init(void);
+void device_hal_heartbeat(void);
 int device_button_pressed(int btn);
-uint32_t device_get_time_utc();
-uint32_t device_millis();
-void device_reboot();
-uint8_t ctaphid_is_processing();
-void ctaphid_confirm_user_presence();
-void ctaphid_cancel_request();
+uint32_t device_get_time_utc(void);
+uint8_t ctaphid_is_processing(void);
+void ctaphid_confirm_user_presence(void);
+void ctaphid_cancel_request(void);
 void ctaphid_push_report(const uint8_t *report);
-void i2c_lock();
-void i2c_unlock();
-uint32_t get_synced_utc();
-
-
+void i2c_lock(void);
+void i2c_unlock(void);
+uint32_t get_synced_utc(void);
 
 #ifdef __cplusplus
 }

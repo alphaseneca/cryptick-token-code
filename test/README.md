@@ -1,49 +1,64 @@
-# Tests (`test/`)
+# Tests
 
-PlatformIO **Unity** suites — one **folder per suite**. Each run builds a small firmware image, flashes the board, and reads results over **USB Serial/JTAG** (COM with VID `303A`).
+Multi-layer framework for Cryptick Token.
 
-## What’s here
+## Layers
 
-| Path | Covers | Env |
-| ---- | ------ | --- |
-| `test_totp/` | Base32 + TOTP (`core/totp`) | `test_totp` |
-| `test_event_bus/` | Event ring buffer | `test_event_bus` |
-| `test_fp_enroll/` | Fingerprint enroll start (mock `Stream`) | `test_fp_enroll` |
+| Layer | When | Tooling | Path |
+|-------|------|---------|------|
+| **L0 Host** | Every PR / every commit locally | `pytest` | `tests/host/` |
+| **L1 Device Unity** | Board attached | PlatformIO Unity | `test/test_*/` |
+| **L2 Integration** | Hardware bench | Python hidapi scripts | `scripts/tests/` |
+| **L3 Acceptance** | Release | checklists | `docs/MAC_LOGIN.md`, WebAuthn manual |
 
-Legacy flat file `test/test_totp.cpp` was moved into `test/test_totp/test_main.cpp` so each suite is isolated.
+Shared vectors: `tests/vectors/` (L0 and L1 should stay aligned).
 
-## What’s *not* here (yet)
-
-There is no second “secret” test tree. Missing coverage lives on the backlog in `AGENTS.md` (P1/P2):
-
-- RFC 6238 golden codes at fixed timestamps  
-- `totp_storage` JSON round-trip  
-- Full enroll FSM unit tests  
-- Nav state machine via bus inject (no GPIO)  
-- WebAuthn / FIDO smoke (host tools, not Unity)
-
-Reason they were sparse before: product bring-up first; device Unity = full link + flash; OLED/buttons/real R557/CTAP need hardware or heavy mocks.
-
-## Run
+## L0 — host (no board)
 
 ```bash
-# One suite at a time (safer on Windows COM re-enum)
+pip install -r tests/requirements.txt
+pytest tests/host -q
+# or
+scripts/ci/run_host_tests.sh
+```
+
+Covers RFC 6238 TOTP, OATH TLV/APDU shape, PIV SELECT AID builders.
+
+## L1 — device Unity
+
+```bash
 pio test -e test_event_bus
 pio test -e test_totp
 pio test -e test_fp_enroll
-
-# All three (same order as ini)
-pio test -e test_totp -e test_event_bus -e test_fp_enroll
 ```
 
-Test envs force **`ARDUINO_USB_MODE=1`** (Serial/JTAG) and **disable LTO** so sparse `build_src_filter` links correctly. Do **not** use product env `esp32-s3-n16r8` for Unity (TinyUSB MODE=0).
+Test envs force `ARDUINO_USB_MODE=1` and disable LTO. **Do not** use product env `esp32-s3-n16r8` for Unity.
 
-If upload says **port busy / write timeout**: unplug USB-C, close serial monitors, re-plug, retry. Prefer flashing after the 303A COM is stable (`pio device list`).
+| Path | Covers | Env |
+|------|--------|-----|
+| `test_totp/` | Base32 + TOTP | `test_totp` |
+| `test_event_bus/` | Event ring | `test_event_bus` |
+| `test_fp_enroll/` | Enroll mock Stream | `test_fp_enroll` |
 
-## Product firmware smoke (not Unity)
+## L2 — hardware HID
 
 ```bash
-pio run -e esp32-s3-n16r8 -t upload
-python scripts/serial_smoke.py
-# Expect VID 1209:BEEE “Cryptick Token” after unplug/replug if needed
+python scripts/tests/hid_fido_init.py    # CTAPHID_INIT, skip if no device
+python scripts/tests/hid_oath_smoke.py   # OATH LIST
 ```
+
+Requires `pip install hid` and a board showing VID `1209` PID `BEEE`. **Never** enable ENTERBOOT in CI.
+
+## Product firmware
+
+```bash
+pio run -e esp32-s3-n16r8
+# upload…
+python scripts/post_flash_check.py COMxx
+```
+
+## CI
+
+`.github/workflows/ci.yml` runs **L0 pytest** + **`pio run -e esp32-s3-n16r8`**.
+
+Channel model: HID = FIDO + OATH + ENTERBOOT; CDC = logs — see `docs/HID_HOST.md`.

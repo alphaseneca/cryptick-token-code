@@ -18,9 +18,7 @@ enum InputKey : uint8_t {
     KEY_LEFT,
     KEY_RIGHT,
     KEY_UP,
-    KEY_DOWN,
-    KEY_CW,
-    KEY_CCW
+    KEY_DOWN
 };
 
 enum ChargeState : uint8_t {

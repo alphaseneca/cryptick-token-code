@@ -1,0 +1,17 @@
+[
+  {
+    "secret": "12345678901234567890",
+    "secret_encoding": "ascii",
+    "period": 30,
+    "digits": 8,
+    "algorithm": "SHA1",
+    "vectors": [
+      {"timestamp": 59, "otp": "94287082"},
+      {"timestamp": 1111111109, "otp": "07081804"},
+      {"timestamp": 1111111111, "otp": "14050471"},
+      {"timestamp": 1234567890, "otp": "89005924"},
+      {"timestamp": 2000000000, "otp": "69279037"},
+      {"timestamp": 20000000000, "otp": "65353130"}
+    ]
+  }
+]

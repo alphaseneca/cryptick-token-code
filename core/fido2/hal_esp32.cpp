@@ -23,11 +23,6 @@ static TaskHandle_t  _fido_task_handle = NULL;
 SemaphoreHandle_t _i2c_mutex = NULL;
 #define FIDO_STACK_SIZE (32 * 1024)
 
-/* ── Volatile ISR state (legacy stubs; InputSystem owns buttons) ── */
-static volatile bool     _btn_fired[BTN_COUNT]  = { false, false, false };
-static volatile uint32_t _btn_time[BTN_COUNT]   = { 0, 0, 0 };
-static uint32_t _btn_last_accepted[BTN_COUNT] = { 0, 0, 0 };
-
 /* Button ISRs removed — InputSystem owns all navigation pins. */
 
 void i2c_mutex_init() {
@@ -111,22 +106,12 @@ void device_set_status(uint32_t status) {
 }
 
 int device_button_pressed(int btn) {
-    if (btn >= BTN_COUNT) return 0;
-    if (!_btn_fired[btn]) return 0;
-
-    uint32_t t = _btn_time[btn];
-    if (t - _btn_last_accepted[btn] < (uint32_t)BUTTON_DEBOUNCE_MS) {
-        _btn_fired[btn] = false; 
-        return 0;
-    }
-
-    _btn_fired[btn] = false;
-    _btn_last_accepted[btn] = t;
-    return 1;
+    (void)btn;
+    return 0; /* InputSystem owns buttons; FIDO UV is fingerprint only */
 }
 
-int device_is_button_pressed() {
-    return device_button_pressed(BTN_CENTER);
+int device_is_button_pressed(void) {
+    return 0;
 }
 
 uint32_t device_get_time_utc() {
@@ -345,12 +330,12 @@ int device_is_nfc() { return 0; }
 void usbhid_close() {}
 void device_init() {}
 
-void boot_solo_bootloader() {
-    ESP.restart();
+void cryptick_enter_bootloader(void) {
+    usb_device_enter_bootloader();
 }
 
-void solo_lock_if_not_already() {}
-uint8_t solo_is_locked() { return 0; }
+void cryptick_lock_if_not_already(void) {}
+uint8_t cryptick_is_locked(void) { return 0; }
 
 static const uint8_t _attestation_cert_der[] =
 "\x30\x82\x01\xfb\x30\x82\x01\xa1\xa0\x03\x02\x01\x02\x02\x01\x00\x30\x0a\x06\x08"

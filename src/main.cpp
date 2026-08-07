@@ -66,9 +66,9 @@ static void banner(void)
     Serial.println();
     Serial.println(F("--- Cryptick Token ---"));
     Serial.printf("[USB] CDC ready  mounted=%d  VID=0x%04X PID=0x%04X\n",
-                  usb_device_mounted() ? 1 : 0, (unsigned)USB_VID, (unsigned)USB_PID);
-    Serial.println(F("[USB] If host shows VID 303A you are on ROM/JTAG COM — reopen Cryptick COM"));
-    Serial.println(F("[USB] reflash: 1200bps or type BOOTLOADER"));
+                  usb_device_mounted() ? 1 : 0, 0x1209u, 0xBEEEu);
+    Serial.println(F("[USB] CDC = logs; OATH/FIDO/ENTERBOOT on HID (docs/HID_HOST.md)"));
+    Serial.println(F("[USB] reflash: 1200bps, HID ENTERBOOT, or type BOOTLOADER"));
     Serial.flush();
 }
 

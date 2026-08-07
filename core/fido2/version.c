@@ -1,8 +1,8 @@
 #include "version.h"
 
-const version_t firmware_version 
+const version_t firmware_version
 #ifdef SOLO
-__attribute__ ((__used__)) 
+__attribute__ ((__used__))
 #endif
     =  {
       .major = SOLO_VERSION_MAJ,
@@ -11,7 +11,5 @@ __attribute__ ((__used__))
       .reserved = 0
     };
 
-
-// from tinycbor, for a quick static_assert
-#include <compilersupport_p.h>
-cbor_static_assert(sizeof(version_t) == 4);
+/* Local assert — do not pull tinycbor compilersupport (file-scope macro issues). */
+typedef char version_t_size_check[(sizeof(version_t) == 4) ? 1 : -1];

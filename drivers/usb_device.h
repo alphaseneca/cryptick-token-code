@@ -6,11 +6,11 @@
 
 /**
  * USB native device (ESP32-S3 USB-C):
- *   - 1× CDC → Arduino Serial (CLI + logs @ 115200)
- *   - 1× HID → FIDO CTAPHID
+ *   - 1× CDC → logs only @ 115200 (no product credential CLI)
+ *   - 1× HID → FIDO CTAPHID + Cryptick OATH + ENTERBOOT
  *
- * When working, Windows shows VID 0x1209 PID 0xBEEE "Cryptick Token".
- * Espressif VID 0x303A is ROM download / Serial-JTAG only — not app CLI.
+ * When working, host shows VID 0x1209 PID 0xBEEE "Cryptick Token".
+ * Espressif VID 0x303A is ROM download / Serial-JTAG only — not app logs.
  */
 
 #ifdef __cplusplus

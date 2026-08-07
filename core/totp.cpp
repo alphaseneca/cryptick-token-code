@@ -174,6 +174,12 @@ int totp_base32_decode(const char *encoded, uint8_t *result, int bufSize)
 
 String totp_generate(const TOTPCredential &cred, uint32_t timestamp)
 {
+    /* MVP: SHA1 only — reject other algorithms honestly */
+    String algo = cred.algorithm;
+    algo.toUpperCase();
+    if (algo.length() && algo != "SHA1" && algo != "SHA-1")
+        return "Bad Algo";
+
     /* timestamp 0 is a valid RFC 6238 counter window (T=0), not an RTC error */
 
     uint8_t key[64];
@@ -183,6 +189,7 @@ String totp_generate(const TOTPCredential &cred, uint32_t timestamp)
 
     int period = cred.period > 0 ? cred.period : 30;
     int digits = (cred.digits >= 6 && cred.digits <= 8) ? cred.digits : 6;
+    /* Product/OATH MVP defaults 6/30; still compute correctly for golden tests */
 
     /* Counter = floor(timestamp / period), big-endian 8 bytes (RFC 6238 §4) */
     uint64_t counter = (uint64_t)timestamp / (uint64_t)period;

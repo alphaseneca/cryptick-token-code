@@ -542,7 +542,9 @@ extern void _check_ret(CborError ret, int line, const char * filename);
 uint8_t ctaphid_custom_command(int len, CTAP_RESPONSE * ctap_resp, CTAPHID_WRITE_BUFFER * wb);
 
 
-extern void solo_lock_if_not_already();
+extern void cryptick_lock_if_not_already(void);
+extern int cryptick_oath_hid_handle(const uint8_t *req, uint16_t req_len,
+                                    uint8_t *resp, uint16_t *resp_len);
 
 uint8_t ctaphid_handle_packet(uint8_t * pkt_raw)
 {
@@ -731,9 +733,26 @@ uint8_t ctaphid_custom_command(int len, CTAP_RESPONSE * ctap_resp, CTAPHID_WRITE
 #if defined(SOLO)
         case CTAPHID_ENTERBOOT:
             printf1(TAG_HID,"CTAPHID_ENTERBOOT\n");
-            boot_solo_bootloader();
+            cryptick_enter_bootloader();
             wb->bcnt = 0;
             ctaphid_write(wb, NULL, 0);
+            return 1;
+
+        case CTAPHID_CRYPTICK_OATH:
+            printf1(TAG_HID,"CTAPHID_CRYPTICK_OATH\n");
+            {
+                uint16_t rlen = 0;
+                static uint8_t rbuf[512];
+                int rc = cryptick_oath_hid_handle(ctap_buffer, (uint16_t)len, rbuf, &rlen);
+                if (rc != 0 || rlen < 2 || rlen > sizeof(rbuf)) {
+                    rbuf[0] = 0x6F;
+                    rbuf[1] = 0x00;
+                    rlen = 2;
+                }
+                wb->bcnt = rlen;
+                ctaphid_write(wb, rbuf, rlen);
+                ctaphid_write(wb, NULL, 0);
+            }
             return 1;
 #endif
 #if defined(SOLO)
@@ -763,7 +782,7 @@ uint8_t ctaphid_custom_command(int len, CTAP_RESPONSE * ctap_resp, CTAPHID_WRITE
             ctap_buffer[1] = SOLO_VERSION_MIN;
             ctap_buffer[2] = SOLO_VERSION_PATCH;
 #if defined(SOLO)
-            ctap_buffer[3] = solo_is_locked();
+            ctap_buffer[3] = cryptick_is_locked();
 #else
             ctap_buffer[3] = 0;
 #endif
@@ -772,10 +791,9 @@ uint8_t ctaphid_custom_command(int len, CTAP_RESPONSE * ctap_resp, CTAPHID_WRITE
             return 1;
         break;
 
-        // Remove on next release
 #if !defined(IS_BOOTLOADER) && defined(SOLO)
         case 0x99:
-            solo_lock_if_not_already();
+            cryptick_lock_if_not_already();
             wb->bcnt = 0;
             ctaphid_write(wb, NULL, 0);
             return 1;

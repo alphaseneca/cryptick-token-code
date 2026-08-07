@@ -9,6 +9,11 @@
 #include "log.h"
 #include "device.h"
 #include "crypto.h"
+#include <assert.h>
+#include <string.h>
+#if !defined(static_assert)
+#define static_assert _Static_assert
+#endif
 
 // TODO move from macro to function/assert for better readability?
 #define check(x) assert(state_prev_0xff->x == state_tmp_ptr->x);

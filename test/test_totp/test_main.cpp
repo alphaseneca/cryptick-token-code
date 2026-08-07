@@ -71,6 +71,41 @@ void test_totp_counter_steps(void)
     TEST_ASSERT_TRUE(a.length() > 0 && b.length() > 0);
 }
 
+/* RFC 6238 Appendix B — seed ASCII "12345678901234567890", SHA1, 8 digits
+ * secret stored base32 for our totp_generate() path. */
+static TOTPCredential rfc_cred(void)
+{
+    TOTPCredential cred;
+    /* base32 of ASCII seed (no padding) */
+    cred.secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+    cred.digits = 8;
+    cred.period = 30;
+    cred.algorithm = "SHA1";
+    cred.label = "RFC";
+    cred.issuer = "RFC";
+    return cred;
+}
+
+void test_totp_rfc6238_t59(void)
+{
+    String code = totp_generate(rfc_cred(), 59);
+    TEST_ASSERT_EQUAL_STRING("94287082", code.c_str());
+}
+
+void test_totp_rfc6238_t1111111109(void)
+{
+    String code = totp_generate(rfc_cred(), 1111111109UL);
+    TEST_ASSERT_EQUAL_STRING("07081804", code.c_str());
+}
+
+void test_totp_rejects_non_sha1(void)
+{
+    TOTPCredential cred = demo_cred();
+    cred.algorithm = "SHA256";
+    String code = totp_generate(cred, 59);
+    TEST_ASSERT_EQUAL_STRING("Bad Algo", code.c_str());
+}
+
 static void run_all_tests(void)
 {
     RUN_TEST(test_totp_base32_decode);
@@ -78,6 +113,9 @@ static void run_all_tests(void)
     RUN_TEST(test_totp_generate_length);
     RUN_TEST(test_totp_generate_stable);
     RUN_TEST(test_totp_counter_steps);
+    RUN_TEST(test_totp_rfc6238_t59);
+    RUN_TEST(test_totp_rfc6238_t1111111109);
+    RUN_TEST(test_totp_rejects_non_sha1);
 }
 
 void setup()

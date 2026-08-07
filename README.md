@@ -1,15 +1,29 @@
 # Cryptick Token
 
-Hardware security token for **Cryptick PCB v0.1.0** (ESP32-S3 N16R8): **TOTP + FIDO2 + fingerprint**, configured over USB serial.
+Hardware security token for **Cryptick PCB v0.1.0** (ESP32-S3 N16R8): **TOTP + FIDO2 + fingerprint**.
 
-Full agent/product backlog: **[AGENTS.md](AGENTS.md)** · Architecture: **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**
+- Agent guide: **[AGENTS.md](AGENTS.md)**
+- Architecture: **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**
+- Host HID protocol: **[docs/HID_HOST.md](docs/HID_HOST.md)**
+- Mac login (PIV roadmap): **[docs/MAC_LOGIN.md](docs/MAC_LOGIN.md)**
+- Security: **[docs/SECURITY_ROADMAP.md](docs/SECURITY_ROADMAP.md)**
 
 ## Features
 
-- OLED UI: clock, TOTP, settings, enroll, FIDO prompt
+- OLED UI: clock, TOTP, settings, enroll, FIDO prompt / success
 - R557 fingerprint (UI gate + FIDO user presence)
-- USB composite: CDC CLI @ 115200 + FIDO HID
-- Firmware USB programming **without BOOT/RESET buttons**
+- USB composite: **CDC logs** + **FIDO HID** (CTAP + Cryptick OATH + ENTERBOOT)
+- Firmware programming **without BOOT/RESET buttons**
+
+## USB channels
+
+| Interface | Use |
+|-----------|-----|
+| HID CTAPHID | WebAuthn FIDO2; put/list/calculate TOTP secrets; ENTERBOOT |
+| CDC @ 115200 | Logs; `BOOTLOADER` reflash only (no product secret CLI) |
+| CCID | Future PIV Mac login (scaffold) |
+
+Brand: VID **`0x1209`** PID **`0xBEEE`** “Cryptick Token”.
 
 ## PCB pins
 
@@ -20,80 +34,55 @@ Full agent/product backlog: **[AGENTS.md](AGENTS.md)** · Architecture: **[docs/
 | Fingerprint RX/TX/IRQ | 17 / 18 / 16 (UART auto-swap at boot) |
 | STAT1/STAT2 | 38 / 39 |
 
-After flash, open serial and confirm:
+After flash, confirm:
 
 ```text
 [IN] map  RIGHT=5 DOWN=4 UP=7 LEFT=6 CENTER=15
 ```
 
-Press each direction — the printed name **must** match the physical key. If not, fix numbers in `include/board_config.h` and re-upload (not a soft remap).
+If directions are wrong, edit pin numbers in `include/board_config.h` only.
 
 ## Build & flash
 
 ```bash
 pio run -e esp32-s3-n16r8
-pio run -e esp32-s3-n16r8 -t upload   # close Serial Monitor first
+pio run -e esp32-s3-n16r8 -t upload
 pio device monitor -e esp32-s3-n16r8 -b 115200
 ```
 
-**Programming path:** 1200bps touch on running CDC, or type `BOOTLOADER` then upload to the download COM.  
-Stuck port: unplug USB-C and re-plug.
-
-## Serial CLI
-
-| Command | Action |
-| ------- | ------ |
-| `DATE` / `SETTIME <unix>` | RTC |
-| `TOTP_ADD <otpauth_uri>` | Add account |
-| `TOTP_LIST` / `TOTP <i>` / `TOTP_DELETE <i>` | Manage TOTP |
-| `FINGER_ENROLL` / `FINGER_ABORT` | Async enroll |
-| `FINGER_COUNT` / `FINGER_CLEAR` / `FINGER_DELETE <id>` | Templates |
-| `BOOTLOADER` | Enter ROM download |
-| `FIDO_RESET` | Wipe FIDO NVS |
-| `HELP` | List commands |
+Programming: CTAPHID **ENTERBOOT**, **1200 bps** on CDC, or type `BOOTLOADER`. Then esptool/`pio` upload; hard_reset after flash.
 
 ## Enroll fingerprint
 
-Settings → Enroll, **or** `FINGER_ENROLL`:
+Settings → Enroll:
 
 1. Place finger firmly → 2. Lift completely → 3. Place again → stored.
 
-Watch `[FP] enroll …` lines. Lift failures advance incorrectly if the finger never fully leaves the window — hold clear of the sensor when asked.
+Watch `[FP] enroll …` lines.
 
 ## Tests
 
 ```bash
-pio test -e esp32-s3-n16r8 -f test_totp
+# Host L0 (no board)
+pip install -r tests/requirements.txt && pytest tests/host -q
+
+# Device Unity (needs board, MODE=1 test envs)
+pio test -e test_totp -e test_event_bus -e test_fp_enroll
 ```
+
+See **[test/README.md](test/README.md)**.
 
 ## Layout
 
 ```text
 include/     board_config.h
-hal/         device HAL headers
-drivers/     fingerprint, usb_device
-core/        totp, crypto, fido2
+drivers/     fingerprint, usb_device, usb_ccid scaffold
+core/        totp, crypto, fido2, piv stub, ble_fido scaffold
 src/systems  UI + FP + auth + battery
-src/host     serial CLI, storage
-test/        Unity tests
+src/host     CDC logs, totp_storage, cryptick_oath_hid
+tests/host   L0 pytest
+test/        L1 Unity
+scripts/tests  L2 HID smoke
 ```
 
-## Troubleshooting
-
-| Issue | Check |
-| ----- | ----- |
-| Directions wrong after map fix | Serial still shows **old** `[IN] map` → flash never landed / stale bin |
-| Enroll hangs | Serial logs; ensure lift step; `FINGER_ABORT` |
-| Upload fail | Close COM tools; re-plug; `upload_port = COMx` |
-| OLED blank | I2C 8/9, 3.3 V |
-| TOTP wrong codes | `SETTIME` / RTC |
-
-## Security notes
-
-- TOTP secrets in LittleFS are **not encrypted**.
-- Serial USB can manage credentials without a fingerprint.
-- Physical access allows flash readout.
-
-## License
-
-See repository license if present.
+**Security note:** TOTP secrets on LittleFS are **not encrypted** yet (`docs/SECURITY_ROADMAP.md`).

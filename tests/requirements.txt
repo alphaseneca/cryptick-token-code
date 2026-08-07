@@ -1,0 +1,4 @@
+# Host unit tests (L0) — no board required
+pytest>=7.0
+# L2 hardware (optional): pip install -e ".[hw]" style extra not required;
+# install hidapi manually when running scripts/tests against a device.

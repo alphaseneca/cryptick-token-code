@@ -12,12 +12,24 @@ The PlatformIO board profile **`esp32-s3-devkitc-1` forces `-DARDUINO_USB_MODE=1
 
 ```ini
 build_unflags = -DARDUINO_USB_MODE=1
-build_flags = -DARDUINO_USB_MODE=0 -DARDUINO_USB_CDC_ON_BOOT=1 -DCFG_TUD_CDC=1
+build_flags = -DARDUINO_USB_MODE=0 -DARDUINO_USB_CDC_ON_BOOT=1
 ```
+
+(Do **not** fight `-DCFG_TUD_CDC=1` against the Adafruit port default.)
 
 When MODE=1, Windows only shows **COM with VID 303A** and the app CDC/FIDO composite never appears → **nothing useful on serial**.
 
 When MODE=0 works, open the COM with **VID `1209` PID `BEEE` "Cryptick Token"**, not the 303A port.
+
+**Channel model**
+
+| Channel | Role |
+|---------|------|
+| USB HID CTAPHID | FIDO2 + OATH (TOTP secrets) + ENTERBOOT |
+| USB CDC | Logs only (optional debug CLI if `CRYPTICK_SERIAL_DEBUG_CMDS`) |
+| USB CCID | Future PIV / Mac login (scaffold only) |
+
+See `docs/HID_HOST.md`.
 
 ---
 
@@ -27,11 +39,11 @@ Battery-powered **hardware security token**:
 
 | Area | Goal |
 | ---- | ---- |
-| **TOTP** | Time-based OTP on OLED; accounts over serial (otpauth URI); secrets in LittleFS |
+| **TOTP** | OLED codes after FP; secrets via **HID OATH**, stored LittleFS |
 | **FIDO2** | USB HID CTAPHID security key; fingerprint = user presence |
 | **Fingerprint** | Gate TOTP UI; enroll 2-place R557; clear templates |
-| **USB-C** | One cable: serial CLI + FIDO HID + firmware programming |
-| **No BOOT buttons** | Enter ROM download via firmware (1200 bps or `BOOTLOADER`) |
+| **USB-C** | One cable: logs CDC + FIDO HID + firmware programming |
+| **No BOOT buttons** | Enter ROM download via HID ENTERBOOT, 1200 bps, or `BOOTLOADER` |
 
 Brand: VID `0x1209`, PID `0xBEEE`, product **Cryptick Token**.
 
@@ -40,13 +52,8 @@ Brand: VID `0x1209`, PID `0xBEEE`, product **Cryptick Token**.
 ## Architecture (layers)
 
 ```text
-include/board_config.h     pins + timeouts (ONLY place for pin numbers)
-hal/ + core/fido2/hal_esp32.cpp   I2C mutex, FIDO HAL, NVS
-drivers/                   fingerprint_r558s, usb_device (CDC+HID)
-core/                      totp, crypto_esp32, fido2 (CTAP/U2F)
-src/systems/               input, nav, display, fp, auth, battery, event_bus
-src/host/                  serial CLI, totp_storage
-src/main.cpp               setup + cooperative loop
+board_config → drivers (USB, R557) → core (TOTP, Solo FIDO) → systems + host → main
+  host: serial (logs), totp_storage, cryptick_oath_hid
 ```
 
 **Ownership rules**
@@ -54,7 +61,7 @@ src/main.cpp               setup + cooperative loop
 - Only `input_system` reads button GPIOs.
 - Only `display_system` draws the OLED.
 - Cross-system communication: `event_bus` (or FIDO `_fido_ui_request` / `ctaphid_confirm_*`).
-- Do not reintroduce BLE, SSD1306 driver stubs, Super Mini, or ESP8266 envs without an explicit request.
+- Do not reintroduce full product BLE without enabling scaffold deliberately; no SSD1306 stubs / Super Mini / ESP8266 envs.
 
 ---
 
@@ -134,13 +141,17 @@ Work these in order unless the user prioritizes otherwise:
 
 - [ ] WebAuthn register/assert smoke
 - [ ] Decide: PIN / resident keys / attestation cert strategy (`core/FEATURES_TODO.md`)
-- [ ] Wire or remove dead `UI_FIDO_SUCCESS` state
+- [x] Wire `UI_FIDO_SUCCESS` (post-presence flash)
 
 ### P3 — security / ship
 
-- [ ] Encrypt TOTP secrets at rest (today: plaintext LittleFS)
-- [ ] Optional serial lock until FP auth
-- [ ] CI: `pio run` + `pio test` on every PR
+- [ ] Encrypt TOTP secrets at rest (today: plaintext LittleFS) — `docs/SECURITY_ROADMAP.md`
+- [ ] Optional FP-gate sensitive OATH HID ops
+- [x] CI: `pio run` + host `pytest` (`.github/workflows/ci.yml`)
+
+### Mac login (PIV)
+
+- [ ] USB CCID composite + full PIV 9a/9d — scaffold in `core/piv` + `docs/MAC_LOGIN.md`
 
 ### Do not do by default
 

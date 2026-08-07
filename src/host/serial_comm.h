@@ -6,18 +6,12 @@
 #include "totp.h"
 
 /**
- * Serial commands (line-based, one command per line). Time = Unix/POSIX seconds (UTC).
+ * USB CDC handler — product path is logs + reflash only.
  *
- * DATE              Show current date/time and Unix timestamp.
- * DATE <unix_ts>    Set RTC from Unix timestamp (alias for SETTIME).
- * SETTIME <unix_ts> Set RTC from Unix timestamp.
- * TOTP_ADD <otpauth_uri>  Add TOTP credential (otpauth://totp/... or otp://totp/...).
- * TOTP_LIST        List credentials (index, label, issuer, digits, period).
- * TOTP <index>     Generate current TOTP code for credential at index.
- * TOTP_DELETE <index>  Delete credential at index and save.
- * HELP, ?          Show commands.
- * BOOTLOADER, DFU, DOWNLOAD  Enter ROM USB download (no BOOT button).
- * FINGER_ENROLL [id], FINGER_DELETE <id>, FINGER_COUNT, FINGER_CLEAR  (if ENABLE_FINGERPRINT).
+ * Always: BOOTLOADER / DFU / DOWNLOAD → ROM USB download; HELP
+ * Optional (CRYPTICK_SERIAL_DEBUG_CMDS): DATE/SETTIME, TOTP_*, FINGER_*, FIDO_RESET
+ *
+ * Product TOTP secret manage / clock set over HID: docs/HID_HOST.md
  */
 void processSerialCommands(Stream &serial, std::vector<TOTPCredential> &credentials,
     void *finger = nullptr, bool fingerprintReady = false);
