@@ -4,6 +4,11 @@ on:
   push:
   pull_request:
 
+# A push that lands while an earlier run is still going supersedes it.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   host-and-build:
     runs-on: ubuntu-latest
@@ -13,14 +18,41 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: pip
+          cache-dependency-path: tests/requirements-host.txt
 
-      - name: Host L0 pytest
+      # L0 only needs pure-Python deps; pyserial/hidapi are bench-side.
+      - name: L0 host pytest
         run: |
-          pip install -r tests/requirements.txt
+          pip install -r tests/requirements-host.txt
           pytest tests/host -q
 
       - name: Install PlatformIO
         run: pip install -U platformio
 
-      - name: Product firmware build
-        run: pio run -e esp32-s3-n16r8
+      - name: Cache PlatformIO toolchains
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio/.cache
+            ~/.platformio/packages
+            ~/.platformio/platforms
+          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+          restore-keys: pio-${{ runner.os }}-
+
+      # All four envs: the jtag fallback broke once and went unnoticed for
+      # weeks because CI only built the product image.
+      - name: Firmware builds (all environments)
+        run: |
+          for e in esp32-s3-n16r8 esp32-s3-n16r8-ship esp32-s3-n16r8-jtag esp32-s3-n16r8-install; do
+            echo "==== $e ===="
+            pio run -e "$e"
+          done
+
+      # Keep this list in sync with UNITY_ENVS in scripts/run_all_tests.sh.
+      - name: L1 Unity compile (no board)
+        run: |
+          for e in test_totp test_event_bus test_fp_enroll test_nav test_secret_crypto; do
+            echo "==== $e ===="
+            pio test -e "$e" --without-uploading --without-testing
+          done

@@ -275,6 +275,7 @@ static void ctaphid_write(CTAPHID_WRITE_BUFFER * wb, void * _data, int len)
         {
             memset(wb->buf + wb->offset, 0, HID_MESSAGE_SIZE - wb->offset);
             usbhid_send(wb->buf);
+            /* Pacing is inside usbhid_send (wait until IN ready again). */
         }
         return;
     }
@@ -348,6 +349,15 @@ static void send_init_response(uint32_t oldcid, uint32_t newcid, uint8_t * nonce
 void ctaphid_check_timeouts()
 {
     uint8_t i;
+    /*
+     * 750ms CID idle is only for incomplete multi-report framing. Never fire
+     * while authenticator is in CBOR processing / user-presence wait — that
+     * would send CTAP1_ERR_TIMEOUT to the browser (NotAllowedError) while OLED
+     * still shows Place finger.
+     */
+    if (ctaphid_is_processing())
+        return;
+
     for(i = 0; i < CID_MAX; i++)
     {
         if (CIDS[i].busy && ((millis() - CIDS[i].last_used) >= 750))
@@ -367,16 +377,34 @@ void ctaphid_check_timeouts()
 
 void ctaphid_update_status(int8_t status)
 {
-    CTAPHID_WRITE_BUFFER wb;
-    printf1(TAG_HID, "Send device update %d!\n",status);
-    ctaphid_write_buffer_init(&wb);
+    /*
+     * Best-effort only: never use the reliable usbhid_send path. A blocked
+     * keepalive during place-finger held the FIDO task for seconds per tick and
+     * delayed the post-UV multi-frame MSG (U2F_REGISTER) writeback.
+     */
+    static uint8_t last_logged = 0xff;
+    static uint16_t sent_ok;
+    uint8_t buf[HID_MESSAGE_SIZE];
+    uint32_t cid = buffer_cid();
 
-    wb.cid = buffer_cid();
-    wb.cmd = CTAPHID_KEEPALIVE;
-    wb.bcnt = 1;
+    cid_refresh(cid);
 
-    ctaphid_write(&wb, &status, 1);
-    ctaphid_write(&wb, NULL, 0);
+    memset(buf, 0, sizeof(buf));
+    memmove(buf, &cid, 4);
+    buf[4] = CTAPHID_KEEPALIVE;
+    buf[5] = 0;
+    buf[6] = 1; /* bcnt = 1 */
+    buf[7] = (uint8_t)status;
+    usbhid_send_besteffort(buf);
+
+    /* Rate-limit logs: CDC flood during UP compounded HID stalls. */
+    if (status != last_logged) {
+        printf1(TAG_HID, "Send device update %d (keepalive best-effort)\n", status);
+        last_logged = (uint8_t)status;
+        sent_ok = 0;
+    } else if ((++sent_ok % 50u) == 0u) {
+        printf1(TAG_HID, "keepalive status=%d still running\n", status);
+    }
 }
 
 static int ctaphid_buffer_packet(uint8_t * pkt_raw, uint8_t * cmd, uint32_t * cid, int * len)
@@ -510,8 +538,11 @@ static int ctaphid_buffer_packet(uint8_t * pkt_raw, uint8_t * cmd, uint32_t * ci
             ret = cid_refresh(pkt->cid);
             if (ret != 0)
             {
+                /* CID vanished from the table mid-transaction — tell the host
+                 * to re-INIT rather than aborting the whole authenticator. */
                 printf2(TAG_ERR,"Error, refresh cid failed\n");
-                exit(1);
+                *cmd = CTAP1_ERR_CHANNEL_BUSY;
+                return HID_ERROR;
             }
         }
         else if (is_cont_pkt(pkt))
@@ -533,11 +564,6 @@ static int ctaphid_buffer_packet(uint8_t * pkt_raw, uint8_t * cmd, uint32_t * ci
     *cmd = buffer_cmd();
     return buffer_status();
 }
-
-extern void _check_ret(CborError ret, int line, const char * filename);
-#define check_hardcore(r)   _check_ret(r,__LINE__, __FILE__);\
-                            if ((r) != CborNoError) exit(1);
-
 
 uint8_t ctaphid_custom_command(int len, CTAP_RESPONSE * ctap_resp, CTAPHID_WRITE_BUFFER * wb);
 
@@ -592,18 +618,20 @@ uint8_t ctaphid_handle_packet(uint8_t * pkt_raw)
     {
 
         case CTAPHID_INIT:
+            /* Handled earlier in ctaphid_buffer_packet(); reaching here is an
+             * internal invariant break, but the host still deserves an answer. */
             printf2(TAG_ERR,"CTAPHID_INIT, error this should already be handled\n");
-            exit(1);
-            break;
+            ctaphid_send_error(cid, CTAP1_ERR_INVALID_COMMAND);
+            return 0;
 #ifndef DISABLE_CTAPHID_PING
         case CTAPHID_PING:
             printf1(TAG_HID,"CTAPHID_PING\n");
 
             wb.bcnt = len;
-            timestamp();
+            solo_timestamp();
             ctaphid_write(&wb, ctap_buffer, len);
             ctaphid_write(&wb, NULL,0);
-            printf1(TAG_TIME,"PING writeback: %d ms\n",timestamp());
+            printf1(TAG_TIME,"PING writeback: %d ms\n",solo_timestamp());
 
             break;
 #endif
@@ -637,9 +665,6 @@ uint8_t ctaphid_handle_packet(uint8_t * pkt_raw)
             is_busy = 1;
             ctap_response_init(&ctap_resp);
             status = ctap_request(ctap_buffer, len, &ctap_resp);
-            if (status != 0) {
-                device_set_status(0); // IDLE - Clear "Performing Setup" on error
-            }
 
             wb.bcnt = (ctap_resp.length+1);
             wb.cid = cid;
@@ -647,11 +672,25 @@ uint8_t ctaphid_handle_packet(uint8_t * pkt_raw)
 
 
 
-            timestamp();
+            solo_timestamp();
+            printf1(TAG_HID, "CBOR writeback status=0x%02x len=%u cmd=0x%02x\n",
+                    status, (unsigned)ctap_resp.length,
+                    (len > 0) ? (unsigned)ctap_buffer[0] : 0);
             ctaphid_write(&wb, &status, 1);
             ctaphid_write(&wb, ctap_resp.data, ctap_resp.length);
             ctaphid_write(&wb, NULL, 0);
-            printf1(TAG_TIME,"CBOR writeback: %d ms\n",timestamp());
+            printf1(TAG_TIME,"CBOR writeback: %d ms\n",solo_timestamp());
+            /*
+             * Success OLED only for create/get (not GetInfo/ClientPin).
+             * GetInfo used to toast OK while browser still needed finger for U2F.
+             */
+            {
+                uint8_t ctap_cmd = (len > 0) ? ctap_buffer[0] : 0;
+                int toast = (ctap_cmd == CTAP_MAKE_CREDENTIAL ||
+                             ctap_cmd == CTAP_GET_ASSERTION ||
+                             ctap_cmd == GET_NEXT_ASSERTION);
+                device_ctap_finished(status, toast);
+            }
             is_busy = 0;
             break;
 #endif
@@ -672,19 +711,45 @@ uint8_t ctaphid_handle_packet(uint8_t * pkt_raw)
             }
             is_busy = 1;
             ctap_response_init(&ctap_resp);
-            u2f_request((struct u2f_request_apdu*)ctap_buffer, &ctap_resp);
+            u2f_request(ctap_buffer, (uint32_t)len, &ctap_resp);
 
             wb.bcnt = (ctap_resp.length);
             wb.cid = cid;
             wb.cmd = cmd;
 
-
+            /*
+             * Chrome uses U2F_REGISTER as create / presence; multi-frame write
+             * must complete before finishing UI. Large packed attest cert is
+             * paced in ctaphid_write/usbhid_send.
+             */
+            solo_timestamp();
+            printf1(TAG_HID, "MSG writeback len=%u\n", (unsigned)ctap_resp.length);
             ctaphid_write(&wb, ctap_resp.data, ctap_resp.length);
             ctaphid_write(&wb, NULL, 0);
+            printf1(TAG_TIME,"MSG writeback: %d ms\n",solo_timestamp());
+            /*
+             * U2F_REGISTER / AUTHENTICATE success: body + SW=0x9000 (not VERSION-only).
+             * Chrome GetTouch is a bogus U2F_REGISTER — parseable 0x9000 but not a
+             * WebAuthn create. Do not toast OLED success; CTAP2 MakeCredential follows.
+             */
+            {
+                int sw_ok = 0;
+                if (ctap_resp.length >= 2)
+                {
+                    uint8_t *d = ctap_resp.data;
+                    uint16_t n = ctap_resp.length;
+                    sw_ok = (d[n - 2] == 0x90 && d[n - 1] == 0x00);
+                }
+                int toast = (sw_ok && ctap_resp.length > 8 &&
+                             !u2f_last_was_presence_probe());
+                device_ctap_finished(sw_ok ? 0 : 1, toast);
+            }
             is_busy = 0;
             break;
         case CTAPHID_CANCEL:
             printf1(TAG_HID,"CTAPHID_CANCEL\n");
+            /* Abort in-flight UP wait (nav LEFT / host cancel). */
+            ctaphid_cancel_request();
             is_busy = 0;
             break;
 

@@ -28,6 +28,13 @@ struct logtag
     const char * tag;
 };
 
+/*
+ * Plain-text tags only. Upstream Solo wraps these in ANSI colour escapes, but
+ * the product console is the CDC log that post_flash_check.py and the
+ * tests/device suite parse, so raw escape bytes there are noise. The table also
+ * carried a second, unreachable copy of every coloured row - the lookup below
+ * stops at the first tag match.
+ */
 struct logtag tagtable[] = {
     {TAG_GEN,""},
     {TAG_MC,"MC"},
@@ -41,22 +48,14 @@ struct logtag tagtable[] = {
     {TAG_DUMP2,"DUMP2"},
     {TAG_HID,"HID"},
     {TAG_USB,"USB"},
-    {TAG_GREEN,"[1;32mDEBUG[0m"},
-    {TAG_RED,"[1;31mDEBUG[0m"},
-    {TAG_TIME,"[1;33mTIME[0m"},
-    {TAG_WALLET,"[1;34mWALLET[0m"},
-    {TAG_STOR,"[1;35mSTOR[0m"},
-    {TAG_BOOT,"[1;36mBOOT[0m"},
-    {TAG_EXT,"[1;37mEXT[0m"},
-    {TAG_NFC,"[1;38mNFC[0m"},
-    {TAG_GREEN," [1;32mDEBUG [0m"},
-    {TAG_RED," [1;31mDEBUG [0m"},
-    {TAG_TIME," [1;33mTIME [0m"},
-    {TAG_WALLET," [1;34mWALLET [0m"},
-    {TAG_STOR," [1;35mSTOR [0m"},
-    {TAG_BOOT," [1;36mBOOT [0m"},
-    {TAG_EXT," [1;37mEXT [0m"},
-    {TAG_NFC," [1;38mNFC [0m"},
+    {TAG_GREEN,"DEBUG"},
+    {TAG_RED,"DEBUG"},
+    {TAG_TIME,"TIME"},
+    {TAG_WALLET,"WALLET"},
+    {TAG_STOR,"STOR"},
+    {TAG_BOOT,"BOOT"},
+    {TAG_EXT,"EXT"},
+    {TAG_NFC,"NFC"},
     {TAG_NFC_APDU, "NAPDU"},
     {TAG_CCID, "CCID"},
     {TAG_CM, "CRED_MGMT"},
@@ -125,7 +124,7 @@ void LOG_HEX(uint32_t tag, uint8_t * data, int length)
     dump_hex(data,length);
 }
 
-uint32_t timestamp()
+uint32_t solo_timestamp_ms(void)
 {
     static uint32_t t1 = 0;
     uint32_t t2 = millis();

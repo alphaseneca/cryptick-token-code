@@ -1,53 +1,44 @@
 #!/usr/bin/env python3
-"""L2: CTAPHID_INIT smoke against Cryptick FIDO HID (VID 1209 PID BEEE).
+"""L3 ad-hoc: CTAPHID_INIT smoke against Cryptick FIDO HID (1209:BEEE).
 
-Requires: pip install hid
-Skips cleanly if no device. Never ENTERBOOT.
+Exits 0 and prints "skip: ..." when hidapi or the device is missing, so it is
+safe to call from a shell loop. Never sends ENTERBOOT.
+
+The framing lives in tests/support/cryptick_ctaphid.py — the same module the
+L2 pytest suite uses, so this script cannot drift from it.
 """
 from __future__ import annotations
 
-import struct
 import sys
+from pathlib import Path
 
-VID, PID = 0x1209, 0xBEEE
-CTAPHID_INIT = 0x86
-BROADCAST = 0xFFFFFFFF
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tests"))
+
+from support.cryptick_ctaphid import HidError, ctaphid_init, open_fido  # noqa: E402
 
 
 def main() -> int:
     try:
-        import hid
+        import hid  # noqa: F401
     except ImportError:
-        print("skip: hid module not installed")
+        print("skip: hidapi not installed (pip install -r tests/requirements.txt)")
         return 0
 
-    dev = None
-    for d in hid.enumerate(VID, PID):
-        # Prefer FIDO usage page if present
-        dev = hid.device()
-        try:
-            dev.open_path(d["path"])
-            break
-        except Exception:
-            dev = None
-    if not dev:
-        print("skip: no Cryptick HID 1209:BEEE")
+    try:
+        dev = open_fido()
+    except HidError as e:
+        print(f"skip: {e}")
         return 0
 
-    nonce = b"\x11\x22\x33\x44\x55\x66\x77\x88"
-    pkt = bytearray(64)
-    struct.pack_into("<I", pkt, 0, BROADCAST)
-    pkt[4] = CTAPHID_INIT
-    pkt[5] = 0
-    pkt[6] = 8
-    pkt[7:15] = nonce
-    dev.write(b"\x00" + bytes(pkt))  # report id 0
-    resp = bytes(dev.read(64, timeout_ms=1000))
-    dev.close()
-    if len(resp) < 17:
-        print("fail: short response", resp.hex())
+    try:
+        cid = ctaphid_init(dev)
+    except HidError as e:
+        print(f"fail: {e}")
         return 1
-    print("ok: CTAPHID_INIT response", resp[:17].hex())
+    finally:
+        dev.close()
+
+    print(f"ok: CTAPHID_INIT assigned cid=0x{cid:08x}")
     return 0
 
 

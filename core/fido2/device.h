@@ -28,9 +28,12 @@ uint32_t device_millis(void);
 uint32_t millis(void);
 #endif
 
-/** Handle one HID packet.
+/** Handle one HID packet (reliable — waits for host to take the IN report).
  * */
 void usbhid_send(uint8_t * msg);
+
+/** Best-effort CTAPHID keepalive; may drop if IN endpoint busy. */
+void usbhid_send_besteffort(uint8_t * msg);
 
 /** Reboot the device.
  * */
@@ -44,9 +47,14 @@ int authenticator_read_state(AuthenticatorState * s);
  * */
 void authenticator_write_state(AuthenticatorState * s);
 
-/** Not used.
- * */
+/** Update CTAPHID UI/keepalive status (IDLE / PROCESSING / UPNEEDED). */
 void device_set_status(uint32_t status);
+
+/** After full CTAPHID writeback. allow_success_ui: only for MakeCredential/GetAssertion. */
+void device_ctap_finished(uint8_t ctap_status, int allow_success_ui);
+
+/** Millisecond sleep (used to pace CTAPHID multi-frame writeback). */
+void device_delay_ms(uint32_t ms);
 
 /** Standard button check.
  * */
@@ -57,6 +65,14 @@ int device_is_button_pressed(void);
  *  1 if confirmed, 0 if it times out.
  * */
 int ctap_user_presence_test(uint32_t delay);
+
+/** Same as ctap_user_presence_test. allow_uv_cache: consume a GetTouch credit
+ *  (MakeCredential only). GetAssertion / U2F_AUTHENTICATE must pass 0.
+ */
+int ctap_user_presence_test_ex(uint32_t delay, int allow_uv_cache);
+
+/** Arm a one-shot UV cache after Chrome's bogus U2F_REGISTER GetTouch. */
+void ctap_uv_cache_arm_gettouch(void);
 
 /** Standard user presence check.  Set whether it is always confirmed or not.
  * */
@@ -134,11 +150,39 @@ int device_button_pressed(int btn);
 uint32_t device_get_time_utc(void);
 uint8_t ctaphid_is_processing(void);
 void ctaphid_confirm_user_presence(void);
+/** Bridge-only: host CTAPHID_CANCEL while UP is blocked on FIDO task. */
 void ctaphid_cancel_request(void);
 void ctaphid_push_report(const uint8_t *report);
+/** OLED (display_system) and the RTC share one bus; serialise transactions. */
+void i2c_mutex_init(void);
 void i2c_lock(void);
 void i2c_unlock(void);
 uint32_t get_synced_utc(void);
+/** Immediate soft-clock (and HW RTC if present). Used by SETTIME / OATH SET_TIME. */
+void set_synced_utc(uint32_t utc);
+void device_set_time_utc(uint32_t utc);
+
+/**
+ * Fingerprint presence when caller blocks the Arduino loop (CDC OATH UV).
+ * FIDO task path leaves matching to main-loop nav; main-core path self-services.
+ */
+void device_presence_fp_begin(void);
+void device_presence_fp_end(void);
+int device_presence_fp_poll(void); /* 1=match, 0=wait */
+
+/** 1 when the caller is the core-0 FIDO task, 0 on the Arduino loop. */
+int device_on_fido_task(void);
+
+/**
+ * Hand a prompt caption ("Manage", "Code", …) to the UI.
+ *
+ * nav_system is owned by the Arduino loop, so the FIDO task may not call it.
+ * Instead it parks the caption here and the loop drains it with
+ * device_take_ui_label() alongside the _fido_ui_request poll.
+ */
+void device_set_ui_label(const char *label);
+/** Main loop only: copy out a pending caption. 1 when one was waiting. */
+int device_take_ui_label(char *out, size_t cap);
 
 #ifdef __cplusplus
 }

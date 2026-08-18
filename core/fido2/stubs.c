@@ -49,9 +49,27 @@ void ctap_response_init(CTAP_RESPONSE * resp)
 {
 }
 
-void u2f_request(struct u2f_request_apdu* req, CTAP_RESPONSE * resp)
+void u2f_request(uint8_t *pkt, uint32_t len, CTAP_RESPONSE * resp)
 {
+    (void)pkt;
+    (void)len;
     printf1(TAG_GEN,"STUB: u2f_request\n");
+}
+
+int u2f_last_was_presence_probe(void)
+{
+    return 0;
+}
+
+void ctap_uv_cache_arm_gettouch(void)
+{
+}
+
+int ctap_user_presence_test_ex(uint32_t delay, int allow_uv_cache)
+{
+    (void)delay;
+    (void)allow_uv_cache;
+    return 1;
 }
 
 uint8_t ctap_request(uint8_t * pkt_raw, int length, CTAP_RESPONSE * resp)

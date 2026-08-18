@@ -12,7 +12,9 @@ ChargeState battery_system_state(void);
 uint8_t battery_system_stat1(void);
 uint8_t battery_system_stat2(void);
 
-/** Short label for status bar: "   ", "CHG", "FULL", "FLT" */
+/** Short label: "CHG", "FULL", "FLT", or "" for idle half-bar */
 const char *battery_system_label(void);
+/** True while the charger reports done with VIN still present (USB mounted). */
+bool battery_system_show_full(void);
 
 #endif

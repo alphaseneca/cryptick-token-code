@@ -7,6 +7,8 @@
 #include "esp_random.h"
 #include "LittleFS.h"
 #include <board_config.h>
+#include <cryptick_console.h>
+#include <cryptick_log.h>
 #include <RTClib.h>
 #include "usb_device.h"
 
@@ -14,14 +16,45 @@ extern "C" {
 
 #define HID_QUEUE_LEN 16
 static bool _up_disabled = false;
-static bool _is_processing = false;
-static bool _user_confirmed = false;
-static bool _request_cancelled = false;
-volatile int8_t _fido_ui_request = 0; // 0=Idle, 1=Prompt, 2=Processing
+/*
+ * Cross-core (FIDO task core0 ↔ Arduino loop): all must be volatile so main
+ * never sees UI prompt without processing, which used to clear Place-finger
+ * after 1.5s and stop MATCH_FIDO while CTAP still waited.
+ */
+static volatile bool _is_processing = false;
+static volatile bool _user_confirmed = false;
+static volatile bool _request_cancelled = false;
+volatile int8_t _fido_ui_request = 0; // 0=Idle, 1=Prompt, 2=Processing, 3=Success
+static volatile unsigned long _last_status_1_or_2_ms = 0;
+/* One-shot GetTouch → MakeCredential credit. Never used for assert/auth. */
+static volatile uint32_t _uv_cache_until_ms = 0;
 QueueHandle_t volatile _hid_queue = NULL; // Volatile for cross-core safety
 static TaskHandle_t  _fido_task_handle = NULL;
 SemaphoreHandle_t _i2c_mutex = NULL;
 #define FIDO_STACK_SIZE (32 * 1024)
+
+/* CTAPHID packet[4] = type|cmd; CANCEL is TYPE_INIT|0x11 */
+static bool hid_pkt_is_cancel(const uint8_t *pkt)
+{
+    if (!pkt) return false;
+    uint8_t type_cmd = pkt[4];
+    return (type_cmd & TYPE_INIT) && ((type_cmd & 0x7f) == 0x11);
+}
+
+/** Drop queued CTAPHID_CANCEL while blocked in UP (FIDO task cannot handle). */
+static void poll_queued_cancel(void)
+{
+    if (!_hid_queue) return;
+    uint8_t pkt[64];
+    if (xQueuePeek((QueueHandle_t)_hid_queue, pkt, 0) != pdTRUE)
+        return;
+    if (!hid_pkt_is_cancel(pkt))
+        return;
+    if (xQueueReceive((QueueHandle_t)_hid_queue, pkt, 0) == pdTRUE) {
+        _request_cancelled = true;
+        CLOG_I("HAL", "UP: host CTAPHID_CANCEL");
+    }
+}
 
 /* Button ISRs removed — InputSystem owns all navigation pins. */
 
@@ -41,25 +74,52 @@ void i2c_unlock() {
 }
 
 void usbhid_send(uint8_t *msg) {
-    if (msg) {
-        usb_hid_send_report(msg);
+    if (!msg)
+        return;
+    /*
+     * Reliable multi-frame CTAPHID (U2F_REGISTER ~12 × 64B after UV).
+     * usb_hid_send_report is ready-gated (~500ms budget, no retransmit-after-submit).
+     * One short outer retry if endpoint was briefly busy (keepalive just submitted).
+     */
+    if (usb_hid_send_report(msg))
+        return;
+    vTaskDelay(pdMS_TO_TICKS(2));
+    if (usb_hid_send_report(msg))
+        return;
+    CLOG_E("USB", "HID TX FAILED (IN not accepted)");
+}
+
+void usbhid_send_besteffort(uint8_t *msg) {
+    if (!msg)
+        return;
+    /*
+     * Keepalives must never stack 3s failure waits during place-finger —
+     * that delayed MSG writeback by ~12 × 3s (~38s) and froze the browser dialog.
+     */
+    static uint16_t drops;
+    if (usb_hid_try_send_report(msg)) {
+        drops = 0;
+        return;
     }
+    drops++;
+    if ((drops % 20u) == 0u)
+        CLOG_D("USB", "HID keepalive drop x%u (IN busy/unread)", (unsigned)drops);
 }
 
 void ctaphid_push_report(const uint8_t *report) {
     if (!report) return;
     if (!_hid_queue) {
-        Serial.println("[FIDO] ERR: Bridge Queue not initialized!");
+        CLOG_E("FIDO", "ERR: Bridge Queue not initialized!");
         return;
     }
 
     if (xQueueSend(_hid_queue, report, 0) != pdTRUE) {
-        Serial.println("[FIDO] Bridge FULL! Recovering...");
-        Serial.flush();
+        CLOG_D("FIDO", "Bridge FULL! Recovering...");
+        CryptickLog.flush();
         xQueueReset(_hid_queue);
         xQueueSend(_hid_queue, report, 0); 
     } else {
-        Serial.println("[FIDO] Bridge: Packet Queued.");
+        CLOG_D("FIDO", "Bridge: Packet Queued.");
     }
 }
 
@@ -69,18 +129,27 @@ void ctaphid_confirm_user_presence() {
 
 void ctaphid_cancel_request() {
     _request_cancelled = true;
+    _uv_cache_until_ms = 0;
 }
 
 uint8_t ctaphid_is_processing() {
-    return _is_processing;
+    return _is_processing ? 1 : 0;
 }
-
-static unsigned long _last_status_1_or_2_ms = 0;
 
 void device_hal_heartbeat() {
     unsigned long now = millis();
-    // Persist UI states 1 and 2 for at least 1500ms 
-    // to prevent flickering during protocol segmenting.
+    /*
+     * Auto-clear residual UI:
+     *  - req 1/2 only after !_is_processing (legacy latch)
+     *  - req 3 (success) held ~1.5s then clock
+     * Never invent success from clearing processing.
+     */
+    if (_fido_ui_request == 3) {
+        if (now - _last_status_1_or_2_ms > 1500) {
+            _fido_ui_request = 0;
+        }
+        return;
+    }
     if (_fido_ui_request != 0 && !_is_processing) {
         if (now - _last_status_1_or_2_ms > 1500) {
             _fido_ui_request = 0;
@@ -92,7 +161,13 @@ void device_set_status(uint32_t status) {
     unsigned long now = millis();
     if (status == CTAPHID_STATUS_PROCESSING) {
         _is_processing = true;
-        _fido_ui_request = 2; // Processing
+        /*
+         * PROCESSING latches the CID timeout, not the OLED. GetInfo used to
+         * flash "Working…" and wake from sleep before any user gesture.
+         * Only promote UI when we were already in a presence ceremony.
+         */
+        if (_fido_ui_request == 1 || _fido_ui_request == 2 || _fido_ui_request == 3)
+            _fido_ui_request = 2;
         _last_status_1_or_2_ms = now;
     } else if (status == CTAPHID_STATUS_UPNEEDED) {
         _is_processing = true;
@@ -100,9 +175,34 @@ void device_set_status(uint32_t status) {
         _last_status_1_or_2_ms = now;
     } else if (status == CTAPHID_STATUS_IDLE) {
         _is_processing = false;
-        // Don't clear immediately; let the heartbeat handled it once 1500ms has passed.
+        /* Do not map IDLE→Success; see device_ctap_finished(). */
+        _last_status_1_or_2_ms = now;
     }
-    Serial.printf("[HAL] Status: %d | UI Req: %d\n", status, _fido_ui_request);
+    CLOG_D("HAL", "Status: %d | UI Req: %d proc=%d",
+           (int)status, (int)_fido_ui_request, _is_processing ? 1 : 0);
+}
+
+/** After CTAPHID has fully written the CBOR reply (or error status byte). */
+void device_ctap_finished(uint8_t ctap_status, int allow_success_ui) {
+    _is_processing = false;
+    if (allow_success_ui && ctap_status == 0) {
+        _fido_ui_request = 3; /* real create/get success only */
+        CLOG_I("HAL", "CTAP OK → UI success");
+    } else {
+        /* GetInfo / ClientPin / errors: no success toast */
+        if (_fido_ui_request == 1 || _fido_ui_request == 2 || _fido_ui_request == 3)
+            _fido_ui_request = 0;
+        if (ctap_status != 0)
+            CLOG_W("HAL", "CTAP status=0x%02x toast=%d → UI idle",
+                   ctap_status, allow_success_ui);
+    }
+    _last_status_1_or_2_ms = millis();
+}
+
+void device_delay_ms(uint32_t ms) {
+    if (ms == 0)
+        return;
+    vTaskDelay(pdMS_TO_TICKS(ms));
 }
 
 int device_button_pressed(int btn) {
@@ -115,8 +215,13 @@ int device_is_button_pressed(void) {
 }
 
 uint32_t device_get_time_utc() {
-    extern uint32_t get_synced_utc();
+    extern uint32_t get_synced_utc(void);
     return get_synced_utc();
+}
+
+void device_set_time_utc(uint32_t utc) {
+    extern void set_synced_utc(uint32_t);
+    set_synced_utc(utc);
 }
 
 uint32_t device_millis() {
@@ -127,61 +232,143 @@ void device_reboot() {
     ESP.restart();
 }
 
+void ctap_uv_cache_arm_gettouch(void)
+{
+    uint32_t now = (uint32_t)millis();
+    _uv_cache_until_ms = now + (uint32_t)CRYPTICK_FIDO_UV_CACHE_MS;
+    CLOG_I("HAL", "UP cache armed %u ms (GetTouch→MakeCredential only)",
+           (unsigned)CRYPTICK_FIDO_UV_CACHE_MS);
+}
+
 int ctap_user_presence_test(uint32_t delay_ms) {
+    return ctap_user_presence_test_ex(delay_ms, 0);
+}
+
+int ctap_user_presence_test_ex(uint32_t delay_ms, int allow_uv_cache) {
     if (_up_disabled) {
-        Serial.println("[HAL] UP Warning: UP is disabled, auto-confirming.");
+        CLOG_W("HAL", "UP Warning: UP is disabled, auto-confirming.");
         return 1; // Success
     }
 
+    uint32_t now0 = (uint32_t)millis();
+    if (allow_uv_cache && _uv_cache_until_ms != 0 &&
+        (int32_t)(_uv_cache_until_ms - now0) > 0) {
+        /*
+         * Chrome GetTouch already took a fingerprint. MakeCredential may
+         * consume that credit once. Authenticate / GetAssertion never do.
+         */
+        CLOG_I("HAL", "UP cached GetTouch→MC (%lu ms left)",
+               (unsigned long)(_uv_cache_until_ms - now0));
+        _uv_cache_until_ms = 0;
+        _is_processing = true;
+        if (_fido_ui_request == 1)
+            _fido_ui_request = 2;
+        _last_status_1_or_2_ms = now0;
+        return 1;
+    }
+
+    /* A new finger wait is a new ceremony — drop a leftover GetTouch credit. */
+    if (_uv_cache_until_ms != 0) {
+        CLOG_D("HAL", "UP cache dropped (assert/auth needs finger)");
+        _uv_cache_until_ms = 0;
+    }
+
+    if (delay_ms < 2000)
+        delay_ms = CRYPTICK_FIDO_UP_TIMEOUT_MS;
+
     uint32_t start = millis();
     uint32_t last_keepalive = 0;
-    _fido_ui_request = 1; // Request Prompt UI → fingerprint match on main core
+    /*
+     * Hold UI + FP match for the whole delay_ms. Heartbeat may only clear
+     * UI when !_is_processing — latch processing for the full wait.
+     *
+     * FIDO task (core 0): main loop arms MATCH_FIDO via nav _fido_ui_request.
+     * Main-core callers (CDC OATH UV, SETTIME path): loop is blocked, so we
+     * self-service GenImg/Search via device_presence_fp_* (no FP on core 0).
+     */
     _user_confirmed = false;
     _request_cancelled = false;
+    _is_processing = true;
+    _fido_ui_request = 1; /* Prompt UI → fingerprint match on main core */
+    _last_status_1_or_2_ms = millis();
 
-    Serial.println("[HAL] UP Wait: place enrolled finger to confirm");
+    const bool self_service = !device_on_fido_task();
+    if (self_service)
+        device_presence_fp_begin();
+
+    CLOG_I("HAL", "UP Wait: place enrolled finger (%lu ms) self_svc=%d",
+           (unsigned long)delay_ms, self_service ? 1 : 0);
 
     while (millis() - start < delay_ms) {
         uint32_t now = millis();
 
+        poll_queued_cancel();
+
+        if (self_service && device_presence_fp_poll() == 1) {
+            _user_confirmed = true;
+        }
+
         /* FIDO user presence is fingerprint only (bridge from FpSystem/NavSystem) */
         if (_user_confirmed) {
-            Serial.println("[HAL] UP Success (fingerprint)");
-            _fido_ui_request = 2; // Request Processing UI
+            CLOG_I("HAL", "UP Success (fingerprint%s)",
+                   self_service ? " self-service" : "");
+            _fido_ui_request = 2; /* Processing UI */
+            _last_status_1_or_2_ms = now;
+            /* Do not arm cache here — only GetTouch (u2f.c) may. */
+            if (self_service)
+                device_presence_fp_end();
+            /* Keep processing true until device_set_status(IDLE) after CTAP */
             return 1;
         }
 
+        if (_request_cancelled) {
+            CLOG_I("HAL", "UP Cancelled");
+            _fido_ui_request = 0;
+            _is_processing = false;
+            _uv_cache_until_ms = 0;
+            if (self_service)
+                device_presence_fp_end();
+            return -1;
+        }
+
+        /*
+         * CTAP keepalive ~100 ms. Best-effort only (usbhid_send_besteffort);
+         * if host is not reading IN, we drop instead of 3s blocking.
+         * For self-service (CDC), keepalive is harmless no-op if no active CID.
+         */
         if (now - last_keepalive >= 100) {
             extern void ctaphid_update_status(int8_t status);
             ctaphid_update_status(CTAPHID_STATUS_UPNEEDED);
             last_keepalive = now;
-        }
-
-        if (_request_cancelled) {
-            Serial.println("[HAL] UP Cancelled by User");
-            _fido_ui_request = 0;
-            return -1;
+            /* Re-latch in case of any stray IDLE / non-volatile race */
+            _fido_ui_request = 1;
+            _is_processing = true;
+            _last_status_1_or_2_ms = now;
         }
 
         vTaskDelay(pdMS_TO_TICKS(10));
         yield();
     }
 
-    Serial.println("[HAL] UP Timeout");
+    CLOG_E("HAL", "UP Timeout");
     _fido_ui_request = 0;
+    _is_processing = false;
+    _uv_cache_until_ms = 0;
+    if (self_service)
+        device_presence_fp_end();
     return 0;
 }
 
 void _fido_task_loop(void *pvParameters) {
-    Serial.println("[FIDO] Starting Task on Core 0...");
+    CLOG_I("FIDO", "Starting Task on Core 0...");
     ctap_init();
-    Serial.println("[FIDO] Protocol Stack Ready.");
+    CLOG_I("FIDO", "Protocol Stack Ready.");
     
     uint8_t pkt[64];
     uint32_t last_heartbeat = 0;
     while(true) {
         if (_hid_queue && xQueueReceive(_hid_queue, pkt, pdMS_TO_TICKS(10)) == pdTRUE) {
-            Serial.printf("[FIDO] RX Packet: CMD 0x%02X\n", pkt[4]);
+            CLOG_D("FIDO", "RX Packet: CMD 0x%02X", pkt[4]);
             ctaphid_handle_packet(pkt);
         }
         ctaphid_check_timeouts();
@@ -193,7 +380,7 @@ void _fido_task_loop(void *pvParameters) {
 void device_init_esp32() {
     static bool _initialized = false;
     if (_initialized) {
-        Serial.println("[FIDO] HAL Already Active. Skipping Re-init.");
+        CLOG_I("FIDO", "HAL Already Active. Skipping Re-init.");
         return;
     }
     _initialized = true;
@@ -209,7 +396,7 @@ void device_init_esp32() {
 
     if (_hid_queue == NULL) {
         _hid_queue = xQueueCreate(HID_QUEUE_LEN, 64);
-        Serial.println("[FIDO] Bridge Queue Initialized.");
+        CLOG_I("FIDO", "Bridge Queue Initialized.");
     }
     i2c_mutex_init();
     
@@ -223,12 +410,22 @@ void device_init_esp32() {
             &_fido_task_handle,
             0
         );
-        Serial.println("[FIDO] Task Created.");
+        CLOG_D("FIDO", "Task Created.");
     }
 }
 
 void device_hal_init() {
     device_init_esp32();
+    /* Product attestation identity (always log at INFO once at boot) */
+    uint8_t aaguid[16];
+    device_read_aaguid(aaguid);
+    CLOG_I("ATTEST",
+           "AAGUID=%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x "
+           "cert_der=%d batch=self-signed CN=Cryptick Token",
+           aaguid[0], aaguid[1], aaguid[2], aaguid[3], aaguid[4], aaguid[5],
+           aaguid[6], aaguid[7], aaguid[8], aaguid[9], aaguid[10], aaguid[11],
+           aaguid[12], aaguid[13], aaguid[14], aaguid[15],
+           device_attestation_cert_der_get_size());
 }
 
 uint32_t millis_esp32() {
@@ -256,6 +453,44 @@ void authenticator_write_state(AuthenticatorState *s) {
 
 void device_disable_up(bool disable) {
     _up_disabled = disable;
+}
+
+int device_on_fido_task(void) {
+    return (_fido_task_handle != NULL &&
+            xTaskGetCurrentTaskHandle() == _fido_task_handle) ? 1 : 0;
+}
+
+/*
+ * Prompt caption handoff. The FIDO task writes, the Arduino loop reads; the
+ * spinlock keeps a caption from being half-overwritten while being copied out.
+ */
+static char _ui_label[64];
+static bool _ui_label_pending = false;
+static portMUX_TYPE _ui_label_mux = portMUX_INITIALIZER_UNLOCKED;
+
+void device_set_ui_label(const char *label) {
+    if (!label || !label[0])
+        return;
+    portENTER_CRITICAL(&_ui_label_mux);
+    strncpy(_ui_label, label, sizeof(_ui_label) - 1);
+    _ui_label[sizeof(_ui_label) - 1] = 0;
+    _ui_label_pending = true;
+    portEXIT_CRITICAL(&_ui_label_mux);
+}
+
+int device_take_ui_label(char *out, size_t cap) {
+    if (!out || cap == 0)
+        return 0;
+    int taken = 0;
+    portENTER_CRITICAL(&_ui_label_mux);
+    if (_ui_label_pending) {
+        strncpy(out, _ui_label, cap - 1);
+        out[cap - 1] = 0;
+        _ui_label_pending = false;
+        taken = 1;
+    }
+    portEXIT_CRITICAL(&_ui_label_mux);
+    return taken;
 }
 
 int ctap_generate_rng(uint8_t *dst, size_t num) {
@@ -322,7 +557,7 @@ void ctap_overwrite_rk(int index, CTAP_residentKey *rk) {
 }
 
 void device_wink() {
-    Serial.println("WINK!");
+    CLOG_I("HAL", "WINK");
 }
 
 void device_set_clock_rate(DEVICE_CLOCK_RATE param) {}
@@ -337,55 +572,34 @@ void cryptick_enter_bootloader(void) {
 void cryptick_lock_if_not_already(void) {}
 uint8_t cryptick_is_locked(void) { return 0; }
 
-static const uint8_t _attestation_cert_der[] =
-"\x30\x82\x01\xfb\x30\x82\x01\xa1\xa0\x03\x02\x01\x02\x02\x01\x00\x30\x0a\x06\x08"
-"\x2a\x86\x48\xce\x3d\x04\x03\x02\x30\x2c\x31\x0b\x30\x09\x06\x03\x55\x04\x06\x13"
-"\x02\x55\x53\x31\x0b\x30\x09\x06\x03\x55\x04\x08\x0c\x02\x4d\x44\x31\x10\x30\x0e"
-"\x06\x03\x55\x04\x0a\x0c\x07\x54\x45\x53\x54\x20\x43\x41\x30\x20\x17\x0d\x31\x38"
-"\x30\x35\x31\x30\x30\x33\x30\x36\x32\x30\x5a\x18\x0f\x32\x30\x36\x38\x30\x34\x32"
-"\x37\x30\x33\x30\x36\x32\x30\x5a\x30\x7c\x31\x0b\x30\x09\x06\x03\x55\x04\x06\x13"
-"\x02\x55\x53\x31\x0b\x30\x09\x06\x03\x55\x04\x08\x0c\x02\x4d\x44\x31\x0f\x30\x0d"
-"\x06\x03\x55\x04\x07\x0c\x06\x4c\x61\x75\x72\x65\x6c\x31\x15\x30\x13\x06\x03\x55"
-"\x04\x0a\x0c\x0c\x54\x45\x53\x54\x20\x43\x4f\x4d\x50\x41\x4e\x59\x31\x22\x30\x20"
-"\x06\x03\x55\x04\x0b\x0c\x19\x41\x75\x74\x68\x65\x6e\x74\x69\x63\x61\x74\x6f\x72"
-"\x20\x41\x74\x74\x65\x73\x74\x61\x74\x69\x6f\x6e\x31\x14\x30\x12\x06\x03\x55\x04"
-"\x03\x0c\x0b\x63\x6f\x6e\x6f\x72\x70\x70\x2e\x63\x6f\x6d\x30\x59\x30\x13\x06\x07"
-"\x2a\x86\x48\xce\x3d\x02\x01\x06\x08\x2a\x86\x48\xce\x3d\x03\x01\x07\x03\x42\x00"
-"\x04\x45\xa9\x02\xc1\x2e\x9c\x0a\x33\xfa\x3e\x84\x50\x4a\xb8\x02\xdc\x4d\xb9\xaf"
-"\x15\xb1\xb6\x3a\xea\x8d\x3f\x03\x03\x55\x65\x7d\x70\x3f\xb4\x02\xa4\x97\xf4\x83"
-"\xb8\xa6\xf9\x3c\xd0\x18\xad\x92\x0c\xb7\x8a\x5a\x3e\x14\x48\x92\xef\x08\xf8\xca"
-"\xea\xfb\x32\xab\x20\xa3\x62\x30\x60\x30\x46\x06\x03\x55\x1d\x23\x04\x3f\x30\x3d"
-"\xa1\x30\xa4\x2e\x30\x2c\x31\x0b\x30\x09\x06\x03\x55\x04\x06\x13\x02\x55\x53\x31"
-"\x0b\x30\x09\x06\x03\x55\x04\x08\x0c\x02\x4d\x44\x31\x10\x30\x0e\x06\x03\x55\x04"
-"\x0a\x0c\x07\x54\x45\x53\x54\x20\x43\x41\x82\x09\x00\xf7\xc9\xec\x89\xf2\x63\x94"
-"\xd9\x30\x09\x06\x03\x55\x1d\x13\x04\x02\x30\x00\x30\x0b\x06\x03\x55\x1d\x0f\x04"
-"\x04\x03\x02\x04\xf0\x30\x0a\x06\x08\x2a\x86\x48\xce\x3d\x04\x03\x02\x03\x48\x00"
-"\x30\x45\x02\x20\x18\x38\xb0\x45\x03\x69\xaa\xa7\xb7\x38\x62\x01\xaf\x24\x97\x5e"
-"\x7e\x74\x64\x1b\xa3\x7b\xf7\xe6\xd3\xaf\x79\x28\xdb\xdc\xa5\x88\x02\x21\x00\xcd"
-"\x06\xf1\xe3\xab\x16\x21\x8e\xd8\xc0\x14\xaf\x09\x4f\x5b\x73\xef\x5e\x9e\x4b\xe7"
-"\x35\xeb\xdd\x9b\x6d\x8f\x7d\xf3\xc4\x3a\xd7";
+/* Product batch attestation — Cryptick Token (self-signed batch; mfr Ucaselabs). */
+#include "cryptick_attestation.inc"
 
 void device_attestation_read_cert_der(uint8_t * dst) {
-    memmove(dst, _attestation_cert_der, sizeof(_attestation_cert_der) - 1);
+    if (!dst)
+        return;
+    memmove(dst, kCryptickTokenAttestCertDer, sizeof(kCryptickTokenAttestCertDer));
 }
 
 int device_attestation_cert_der_get_size() {
-    return sizeof(_attestation_cert_der) - 1;
+    return (int)sizeof(kCryptickTokenAttestCertDer);
 }
 
-static uint8_t _attestation_key[32] = {0xcd, 0x67, 0xaa, 0x31, 0x0d, 0x09, 0x1e, 0xd1, 0x6e, 0x7e, 0x98, 0x92, 0xaa, 0x07, 0x0e, 0x19, 0x94, 0xfc, 0xd7, 0x14, 0xae, 0x7c, 0x40, 0x8f, 0xb9, 0x46, 0xb7, 0x2e, 0x5f, 0xe7, 0x5d, 0x30};
-
 uint8_t *device_get_attestation_key() {
-    return _attestation_key;
+    /* Return writable-looking pointer required by Solo API; content is product key */
+    static uint8_t key_ram[32];
+    static int ready = 0;
+    if (!ready) {
+        memmove(key_ram, kCryptickTokenAttestKey, 32);
+        ready = 1;
+    }
+    return key_ram;
 }
 
 void device_read_aaguid(uint8_t * dst){
-    // "UCASELABS" based AAGUID
-    static const uint8_t aaguid[16] = {
-        0x00, 0x55, 0x43, 0x41, 0x53, 0x45, 0x4c, 0x41, 
-        0x42, 0x53, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01
-    };
-    memmove(dst, aaguid, 16);
+    if (!dst)
+        return;
+    memmove(dst, kCryptickTokenAaguid, 16);
 }
 
 } // extern C

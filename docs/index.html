@@ -1,4 +1,4 @@
-<!doctype html>
+[<!doctype html>
 <html lang="en">
 
 <head>
@@ -1397,7 +1397,7 @@
 					<div>
 						<h1>Cryptick Token Dashboard</h1>
 						<p class="header-subtitle">
-							Configuration & Management Interface
+							USB HID OATH programmer · TOTP secrets on Cryptick Token
 						</p>
 					</div>
 				</div>
@@ -1413,14 +1413,14 @@
 						<span>🔌</span>
 						<span>WebHID Mode</span>
 					</div>
-					<div class="mode-tab-desc">Primary USB Interface</div>
+					<div class="mode-tab-desc">Program secrets (CTAPHID OATH)</div>
 				</button>
 				<button class="mode-tab" data-mode="webserial" onclick="switchMode('webserial')">
 					<div class="mode-tab-title">
 						<span>💻</span>
 						<span>Web Serial Mode</span>
 					</div>
-					<div class="mode-tab-desc">Debug & Alternative Interface</div>
+					<div class="mode-tab-desc">CDC logs / lab CLI only</div>
 				</button>
 			</div>
 		</div>
@@ -1434,7 +1434,7 @@
 		<!-- Toasts (auto-closing popups) -->
 		<div id="toastContainer" aria-live="polite"></div>
 
-		<!-- WebHID Interface -->
+		<!-- WebHID Interface (product path: CTAPHID OATH 0xE3) -->
 		<div id="webhidInterface">
 			<div class="grid">
 				<!-- Connection & Controls -->
@@ -1445,18 +1445,24 @@
 							Device Connection
 						</h2>
 					</div>
+					<p class="form-hint" id="hidConnHint" style="margin-bottom: var(--spacing-md); color: var(--slate-500); font-size: 0.875rem;">
+						Cryptick Token · USB FIDO HID · VID <code>0x1209</code> PID <code>0xBEEE</code>
+					</p>
 					<div class="btn-group">
-						<button class="btn btn-success" onclick="connectWebHID()">
+						<button class="btn btn-success" id="btnHidConnect" onclick="connectWebHID()">
 							<span>📱</span>
-							Connect Device
+							Connect
 						</button>
-						<button class="btn btn-success" onclick="syncTime()">
+						<button class="btn btn-secondary" id="btnHidDisconnect" onclick="disconnectWebHID()" style="display:none;">
+							Disconnect
+						</button>
+						<button class="btn btn-success" onclick="syncTime()" id="btnHidSyncTime">
 							<span>⏰</span>
-							Sync Time
+							Set Time (UTC)
 						</button>
-						<button class="btn btn-secondary" onclick="loadAccounts()">
+						<button class="btn btn-secondary" onclick="loadAccounts()" id="btnHidList">
 							<span>🔄</span>
-							Sync Accounts
+							List Accounts
 						</button>
 					</div>
 				</div>
@@ -1466,7 +1472,7 @@
 					<div class="card-header">
 						<h2 class="card-title">
 							<span class="card-title-icon">➕</span>
-							Add New Account
+							Add TOTP Account
 						</h2>
 					</div>
 					<div class="qr-import">
@@ -1487,32 +1493,38 @@
 						<div class="form-group">
 							<label class="form-label">Account Name *</label>
 							<input type="text" class="form-input" id="accountName" required
-								placeholder="e.g., GitHub" />
+								placeholder="e.g., user@example.com" />
 						</div>
 
 						<div class="form-group">
-							<label class="form-label">Issuer *</label>
-							<input type="text" class="form-input" id="accountIssuer" required
-								placeholder="e.g., github.com" />
+							<label class="form-label">Issuer</label>
+							<input type="text" class="form-input" id="accountIssuer"
+								placeholder="e.g., GitHub (optional)" />
 						</div>
 
 						<div class="form-group">
-							<label class="form-label">Secret Key (Base32) *</label>
+							<label class="form-label">Secret Key (Base32 or otpauth URI) *</label>
 							<input type="text" class="form-input" id="accountSecret" required
-								placeholder="e.g., JBSWY3DPEHPK3PXP" />
+								placeholder="Base32 e.g. JBSWY3DPEHPK3PXP — or full otpauth://totp/… URI"
+								autocomplete="off" spellcheck="false" />
 						</div>
 
 						<div class="form-group">
 							<label class="form-label">Digits</label>
 							<select class="form-select" id="accountDigits">
-								<option value="6" selected>6 digits</option>
-								<option value="8">8 digits</option>
+								<option value="6" selected>6 digits (product)</option>
 							</select>
 						</div>
 
+						<p class="form-hint" style="margin-bottom: var(--spacing-md); color: var(--slate-500); font-size: 0.8125rem;">
+							Sends OATH PUT (Base32) or PUT_OTPAUTH (full URI) over HID. If fingerprints are enrolled,
+							place finger when OLED shows <strong>Manage</strong> (SW <code>6985</code> if timeout).
+							No templates yet → bootstrap, no UV.
+						</p>
+
 						<button type="submit" class="btn btn-primary">
 							<span>✨</span>
-							Add Account
+							Send to Token
 						</button>
 					</form>
 				</div>
@@ -1526,17 +1538,27 @@
 						Stored Accounts
 					</h2>
 				</div>
+				<p class="form-hint" style="margin-bottom: var(--spacing-md); color: var(--slate-500); font-size: 0.8125rem;">
+					Codes are meant for the device OLED after fingerprint unlock. Optional
+					<strong>Calculate</strong> below uses OATH CALCULATE (may need finger — <strong>Code</strong> on OLED).
+				</p>
 				<div id="accountsGrid" class="accounts-grid">
 					<div class="empty-state">
 						<div class="empty-state-icon">🔍</div>
 						<div class="empty-state-title">No Accounts Loaded</div>
 						<div class="empty-state-text">
-							Connect your device and click "Sync Accounts" to view stored
-							accounts
+							Connect → Set Time (UTC) → List Accounts, then add secrets above.
 						</div>
 					</div>
 				</div>
 			</div>
+
+			<p class="hid-security-note" style="margin-top: var(--spacing-lg); padding: var(--spacing-md) var(--spacing-lg); background: rgba(15, 23, 42, 0.35); border-radius: var(--radius-md); color: var(--slate-300); font-size: 0.8125rem; line-height: 1.55;">
+				<strong style="color: var(--slate-100);">Security:</strong>
+				Secrets travel in the clear over WebHID while this tab is connected — use a trusted computer only, not random public kiosks.
+				On the token, secrets are encrypted at rest (AES-GCM); the NVS wrap key is not eFuse-locked yet.
+				TOTP codes live on the OLED product path; this page is a <em>programmer</em>, not a full authenticator app.
+			</p>
 		</div>
 
 		<!-- Web Serial Interface -->
@@ -1693,15 +1715,38 @@
 
 		let currentMode = "webhid";
 		let hidDevice = null;
+		let hidCid = 0;
+		let hidInputQueue = [];
+		let hidInputWaiters = [];
+		let hidBusy = false;
 		let serialPort = null;
 		let serialReader = null;
 		let currentSerialBaud = null;
 		let accounts = [];
 		let otpTimers = {};
 
-		const VENDOR_ID = 0x303a;
-		const PRODUCT_ID = 0x4002;
-		const REPORT_ID = 0x01;
+		// Product Cryptick Token USB — FIDO HID (see docs/HID_HOST.md)
+		const VENDOR_ID = 0x1209;
+		const PRODUCT_ID = 0xbeee;
+		const REPORT_LEN = 64;
+		const CTAPHID_INIT = 0x86;
+		const CTAPHID_ERROR = 0x3f;
+		const CTAPHID_KEEPALIVE = 0x3b;
+		const CTAPHID_OATH = 0xe3; // TYPE_INIT | 0x63
+		const CTAPHID_BROADCAST = 0xffffffff;
+		const OATH_INS_PUT = 0x01;
+		const OATH_INS_DELETE = 0x02;
+		const OATH_INS_SET_TIME = 0x04;
+		const OATH_INS_LIST = 0xa1;
+		const OATH_INS_CALCULATE = 0xa2;
+		const OATH_INS_PUT_OTPAUTH = 0x40;
+		const OATH_TAG_NAME = 0x71;
+		const OATH_TAG_KEY = 0x73;
+		const OATH_TAG_CHALLENGE = 0x74;
+		const OATH_TAG_RESPONSE = 0x75;
+		const SW_OK = 0x9000;
+		const SW_CONDITIONS = 0x6985;
+		const OATH_UV_TIMEOUT_MS = 30000;
 
 		// ====================================================================
 		// MODE SWITCHING
@@ -1725,7 +1770,14 @@
 
 			// Update status
 			if (mode === "webhid") {
-				setStatus('WebHID mode: Click "Connect Device" to begin', "info");
+				if (hidDevice && hidDevice.opened) {
+					setStatus(
+						`Connected: ${hidDevice.productName || "Cryptick Token"} (cid 0x${(hidCid >>> 0).toString(16)})`,
+						"success",
+					);
+				} else {
+					setStatus('WebHID: Connect Cryptick Token (0x1209:0xBEEE) to program TOTP secrets', "info");
+				}
 			} else {
 				updateSerialStatusBar();
 			}
@@ -1827,11 +1879,12 @@
 			if (digitsEl) digitsEl.value = String(data.digits === 8 ? 8 : 6);
 		}
 
-		function processQrImage(file, isSerial) {
+		function processQrImage(file, which) {
 			if (!file || !file.type.startsWith("image/")) {
 				showToast("Please choose an image file (PNG, JPG, etc.)", "warning");
 				return;
 			}
+			const isSerial = which === "serial" || which === true;
 			const reader = new FileReader();
 			reader.onload = function () {
 				const img = new Image();
@@ -1916,7 +1969,7 @@
                     <div class="empty-state">
                         <div class="empty-state-icon">🔍</div>
                         <div class="empty-state-title">No Accounts Loaded</div>
-                        <div class="empty-state-text">Connect your device and click "Sync Accounts" to view stored accounts</div>
+                        <div class="empty-state-text">Connect your device and click List Accounts to view stored accounts</div>
                     </div>
                 `;
 				return;
@@ -1925,20 +1978,22 @@
 			grid.innerHTML = accounts
 				.map((account) => {
 					const index = account.index !== undefined ? account.index : accounts.indexOf(account);
+					const issuer = account.issuer || "";
+					const displayName = account.name || account.label || "Account";
 					return `
                 <div class="account-card" id="account-${p}-${index}" onclick="toggleAccountOTP(${index})">
                     <div class="account-header">
                         <div class="account-info">
-                            <h3>${escapeHtml(account.name)}</h3>
-                            <div class="account-issuer">${escapeHtml(account.issuer)}</div>
+                            <h3>${escapeHtml(displayName)}</h3>
+                            <div class="account-issuer">${escapeHtml(issuer || (account.fullName || ""))}</div>
                         </div>
                         <div class="account-index">#${index}</div>
                     </div>
                     <div class="account-otp-section" id="otp-section-${p}-${index}" style="display: none;">
                         <div class="account-otp-wrapper">
-                            <div class="account-otp-label">Tap code to copy · ${account.digits || 6} digits</div>
+                            <div class="account-otp-label">${currentMode === "webhid" ? "Optional CALCULATE (UV may be required)" : "Tap code to copy · " + (account.digits || 6) + " digits"}</div>
                             <div class="account-otp-code loading" id="otp-code-${p}-${index}" role="button" tabindex="0" onclick="event.stopPropagation(); copyOtpCode(${index})" onkeydown="if(event.key==='Enter'||event.key===' ') { event.preventDefault(); copyOtpCode(${index}); }" title="Copy code">${"•".repeat(account.digits || 6)}</div>
-                            <div class="account-otp-timer" id="otp-timer-${p}-${index}" role="button" tabindex="0" onclick="event.stopPropagation(); refreshOTP(${index})" onkeydown="if(event.key==='Enter'||event.key===' ') { event.preventDefault(); refreshOTP(${index}); }" title="Get new code">Tap to get code</div>
+                            <div class="account-otp-timer" id="otp-timer-${p}-${index}" role="button" tabindex="0" onclick="event.stopPropagation(); refreshOTP(${index})" onkeydown="if(event.key==='Enter'||event.key===' ') { event.preventDefault(); refreshOTP(${index}); }" title="Get code">${currentMode === "webhid" ? "Tap to CALCULATE" : "Tap to get code"}</div>
                         </div>
                         <div class="account-actions">
                             <button class="btn btn-sm btn-secondary" type="button" onclick="event.stopPropagation(); copyOtpCode(${index})" title="Copy">📋 Copy</button>
@@ -1985,27 +2040,21 @@
 
 			try {
 				if (currentMode === "webhid") {
-					await getTOTPHID(index);
-					// For WebHID, we'd need to listen for device response
-					// For now, simulate since WebHID doesn't have the same response handling
-					setTimeout(() => {
-						const otp = Math.floor(
-							100000 + Math.random() * 900000,
-						).toString();
-						codeElement.className = "account-otp-code";
-						codeElement.textContent = otp;
-						startOTPTimer(index);
-					}, 500);
+					const acct = accounts[index];
+					if (!acct || !acct.fullName) throw new Error("Unknown account");
+					setStatus(`CALCULATE "${acct.fullName}" — place finger if OLED shows Code…`, "warning");
+					const { code, remaining } = await oathCalculateByIndex(index);
+					codeElement.className = "account-otp-code";
+					codeElement.textContent = code;
+					startOTPTimer(index, remaining);
+					setStatus(`CALCULATE OK · SW 9000 · ${code}`, "success");
 				} else {
-					// For serial mode, send TOTP command and wait for response
 					lastTOTPIndex = index;
-					console.log("[DEBUG] Requesting TOTP for index", index);
 					await sendSerialCommand(`TOTP ${index}`);
-					// The response will be handled by parseSerialResponse
 				}
 			} catch (error) {
 				codeElement.textContent = "ERROR";
-				timerElement.textContent = "Failed to generate";
+				if (timerElement) timerElement.textContent = "Failed";
 				setStatus("Failed to generate OTP: " + error.message, "error");
 			}
 		}
@@ -2053,45 +2102,386 @@
 		}
 
 		async function deleteAccount(index) {
-			if (!confirm(`Delete account "${accounts[index].name}"?`)) {
+			const acct = accounts[index];
+			const label = acct ? (acct.fullName || acct.name) : String(index);
+			if (!confirm(`Delete account "${label}"?`)) {
 				return;
 			}
 
 			try {
 				if (currentMode === "webhid") {
 					await deleteAccountHID(index);
+					setStatus(`Deleted "${label}" · SW 9000`, "success");
+					await loadAccounts();
 				} else {
 					await sendSerialCommand(`TOTP_DELETE ${index}`);
+					setStatus(`Account "${label}" delete sent`, "success");
+					setTimeout(() => loadAccountsSerial(), 500);
 				}
-
-				setStatus(`Account "${accounts[index].name}" deleted`, "success");
-
-				// Reload accounts
-				setTimeout(() => {
-					if (currentMode === "webhid") {
-						loadAccounts();
-					} else {
-						loadAccountsSerial();
-					}
-				}, 500);
 			} catch (error) {
 				setStatus("Failed to delete account: " + error.message, "error");
 			}
 		}
 
 		// ====================================================================
-		// WEBHID FUNCTIONS
+		// WEBHID + CTAPHID OATH (parity with tests/support/cryptick_ctaphid.py)
 		// ====================================================================
+
+		function u32le(n) {
+			return new Uint8Array([
+				n & 0xff,
+				(n >>> 8) & 0xff,
+				(n >>> 16) & 0xff,
+				(n >>> 24) & 0xff,
+			]);
+		}
+
+		function readU32le(buf, off) {
+			return (
+				(buf[off] |
+					(buf[off + 1] << 8) |
+					(buf[off + 2] << 16) |
+					(buf[off + 3] << 24)) >>>
+				0
+			);
+		}
+
+		function updateHidConnectButtons() {
+			const open = !!(hidDevice && hidDevice.opened);
+			const btnC = document.getElementById("btnHidConnect");
+			const btnD = document.getElementById("btnHidDisconnect");
+			if (btnC) btnC.style.display = open ? "none" : "inline-flex";
+			if (btnD) btnD.style.display = open ? "inline-flex" : "none";
+		}
+
+		function onHidInputReport(event) {
+			if (!hidDevice || event.device !== hidDevice) return;
+			let data = new Uint8Array(event.data.buffer);
+			// Some stacks deliver report-id-prefixed reads; FIDO reports are 64 bytes plain
+			if (data.length === REPORT_LEN + 1 && data[0] === 0) {
+				data = data.subarray(1);
+			}
+			if (data.length < REPORT_LEN) {
+				const pad = new Uint8Array(REPORT_LEN);
+				pad.set(data);
+				data = pad;
+			} else if (data.length > REPORT_LEN) {
+				data = data.subarray(0, REPORT_LEN);
+			}
+			if (hidInputWaiters.length) {
+				const resolve = hidInputWaiters.shift();
+				resolve(data);
+			} else {
+				hidInputQueue.push(data);
+			}
+		}
+
+		function clearHidIo() {
+			hidInputQueue = [];
+			while (hidInputWaiters.length) {
+				const r = hidInputWaiters.shift();
+				try {
+					r(null);
+				} catch (_) { /* ignore */ }
+			}
+		}
+
+		function hidReadPacket(timeoutMs) {
+			if (hidInputQueue.length) {
+				return Promise.resolve(hidInputQueue.shift());
+			}
+			return new Promise((resolve, reject) => {
+				const timer = setTimeout(() => {
+					const i = hidInputWaiters.indexOf(entry);
+					if (i >= 0) hidInputWaiters.splice(i, 1);
+					reject(new Error("HID read timeout"));
+				}, timeoutMs);
+				function entry(pkt) {
+					clearTimeout(timer);
+					if (!pkt) {
+						reject(new Error("HID disconnected"));
+						return;
+					}
+					resolve(pkt);
+				}
+				hidInputWaiters.push(entry);
+			});
+		}
+
+		async function hidWritePacket(pkt) {
+			if (!hidDevice || !hidDevice.opened) {
+				throw new Error("Device not connected");
+			}
+			if (pkt.length !== REPORT_LEN) {
+				throw new Error("HID packet must be 64 bytes");
+			}
+			// FIDO HID: no report ID (reportId 0) — send raw 64-byte CTAPHID frame
+			await hidDevice.sendReport(0, pkt);
+		}
+
+		async function ctaphidInit() {
+			const nonce = new Uint8Array([0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]);
+			const pkt = new Uint8Array(REPORT_LEN);
+			pkt.set(u32le(CTAPHID_BROADCAST), 0);
+			pkt[4] = CTAPHID_INIT;
+			pkt[5] = 0;
+			pkt[6] = 8;
+			pkt.set(nonce, 7);
+			clearHidIo();
+			await hidWritePacket(pkt);
+			const resp = await hidReadPacket(3000);
+			const cmd = resp[4];
+			if ((cmd & 0x7f) !== (CTAPHID_INIT & 0x7f)) {
+				throw new Error(`unexpected INIT cmd 0x${cmd.toString(16)}`);
+			}
+			// payload @ offset 7: nonce(8) + new_cid(4) …
+			let newCid = readU32le(resp, 15);
+			if (newCid === 0 || newCid === CTAPHID_BROADCAST) {
+				newCid = readU32le(resp, 7 + 8);
+			}
+			if (newCid === 0 || newCid === CTAPHID_BROADCAST) {
+				throw new Error("INIT failed to assign channel");
+			}
+			hidCid = newCid;
+			return newCid;
+		}
+
+		/**
+		 * Send CTAPHID init+cont packets; reassemble response payload.
+		 * Skips KEEPALIVE (UV / fingerprint wait). timeoutMs = wall-clock budget.
+		 */
+		async function ctaphidSend(cmd, payload, timeoutMs) {
+			if (!hidDevice || !hidDevice.opened) throw new Error("Device not connected");
+			if (!hidCid) throw new Error("No CTAPHID channel — Connect first");
+			if (payload.length > 7609) throw new Error("payload too large");
+			if (hidBusy) throw new Error("Another HID operation in progress");
+			hidBusy = true;
+			try {
+				let remaining = payload;
+				let seq = 0;
+				// init packet
+				{
+					const pkt = new Uint8Array(REPORT_LEN);
+					pkt.set(u32le(hidCid), 0);
+					pkt[4] = cmd;
+					pkt[5] = (payload.length >> 8) & 0xff;
+					pkt[6] = payload.length & 0xff;
+					const take = Math.min(REPORT_LEN - 7, remaining.length);
+					pkt.set(remaining.subarray(0, take), 7);
+					remaining = remaining.subarray(take);
+					await hidWritePacket(pkt);
+				}
+				while (remaining.length) {
+					const pkt = new Uint8Array(REPORT_LEN);
+					pkt.set(u32le(hidCid), 0);
+					pkt[4] = seq & 0x7f;
+					seq++;
+					const take = Math.min(REPORT_LEN - 5, remaining.length);
+					pkt.set(remaining.subarray(0, take), 5);
+					remaining = remaining.subarray(take);
+					await hidWritePacket(pkt);
+				}
+
+				const deadline = performance.now() + timeoutMs;
+				const out = [];
+				let total = null;
+				let got = 0;
+				const pollMs = Math.min(1000, Math.max(200, Math.floor(timeoutMs / 30)));
+
+				while (true) {
+					const left = deadline - performance.now();
+					if (left <= 0) throw new Error("HID read timeout (incl. UV wait)");
+					let resp;
+					try {
+						resp = await hidReadPacket(Math.min(pollMs, left));
+					} catch (e) {
+						if (performance.now() >= deadline) throw e;
+						continue;
+					}
+					const rcid = readU32le(resp, 0);
+					if (rcid !== hidCid && rcid !== CTAPHID_BROADCAST) continue;
+					const rcmd = resp[4];
+					const opcode = rcmd & 0x7f;
+					if (opcode === CTAPHID_KEEPALIVE) {
+						// Device waiting for fingerprint
+						continue;
+					}
+					if (opcode === CTAPHID_ERROR) {
+						const err = resp.length > 7 ? resp[7] : 0;
+						throw new Error(`CTAPHID error frame err=0x${err.toString(16)}`);
+					}
+					if (total === null) {
+						if (opcode !== (cmd & 0x7f)) continue;
+						total = (resp[5] << 8) | resp[6];
+						const chunk = resp.subarray(7);
+						const n = Math.min(chunk.length, total);
+						for (let i = 0; i < n; i++) out.push(chunk[i]);
+						got = out.length;
+					} else {
+						if (rcmd & 0x80) continue; // ignore unexpected init-style frames
+						const chunk = resp.subarray(5);
+						const need = total - got;
+						for (let i = 0; i < Math.min(chunk.length, need); i++) out.push(chunk[i]);
+						got = out.length;
+					}
+					if (total !== null && got >= total) {
+						return new Uint8Array(out.slice(0, total));
+					}
+				}
+			} finally {
+				hidBusy = false;
+			}
+		}
+
+		function oathApdu(ins, data) {
+			data = data || new Uint8Array(0);
+			if (data.length > 255) throw new Error("Lc single-byte only (MVP APDU)");
+			const apdu = new Uint8Array(5 + data.length);
+			apdu[0] = 0x00;
+			apdu[1] = ins;
+			apdu[2] = 0x00;
+			apdu[3] = 0x00;
+			apdu[4] = data.length;
+			apdu.set(data, 5);
+			return apdu;
+		}
+
+		function oathSw(payload) {
+			if (!payload || payload.length < 2) throw new Error("short OATH response");
+			return ((payload[payload.length - 2] << 8) | payload[payload.length - 1]) & 0xffff;
+		}
+
+		function formatSw(sw) {
+			return "0x" + sw.toString(16).toUpperCase().padStart(4, "0");
+		}
+
+		function throwIfOathBad(payload, op) {
+			const sw = oathSw(payload);
+			if (sw === SW_OK) return sw;
+			if (sw === SW_CONDITIONS) {
+				throw new Error(
+					`${op} SW 6985 — UV required / timeout. Place enrolled finger when OLED shows Manage or Code (bootstrap: no FP templates = no UV).`,
+				);
+			}
+			const hints = {
+				0x6a80: "wrong data",
+				0x6a82: "not found",
+				0x6d00: "unsupported INS",
+				0x6700: "wrong length",
+				0x6a84: "no space",
+			};
+			const hint = hints[sw] ? ` (${hints[sw]})` : "";
+			throw new Error(`${op} failed SW ${formatSw(sw)}${hint}`);
+		}
+
+		function tlv(tag, data) {
+			const out = new Uint8Array(2 + data.length);
+			out[0] = tag;
+			out[1] = data.length;
+			out.set(data, 2);
+			return out;
+		}
+
+		function concatBytes(parts) {
+			let n = 0;
+			for (const p of parts) n += p.length;
+			const out = new Uint8Array(n);
+			let o = 0;
+			for (const p of parts) {
+				out.set(p, o);
+				o += p.length;
+			}
+			return out;
+		}
+
+		/** RFC 4648 Base32 decode (TOTP secrets). */
+		function base32Decode(str) {
+			const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+			let cleaned = String(str || "")
+				.toUpperCase()
+				.replace(/=+$/g, "")
+				.replace(/[\s-]/g, "");
+			if (!cleaned) throw new Error("empty Base32 secret");
+			let bits = 0;
+			let value = 0;
+			const out = [];
+			for (let i = 0; i < cleaned.length; i++) {
+				const idx = alphabet.indexOf(cleaned[i]);
+				if (idx < 0) throw new Error("invalid Base32 character: " + cleaned[i]);
+				value = (value << 5) | idx;
+				bits += 5;
+				if (bits >= 8) {
+					out.push((value >>> (bits - 8)) & 0xff);
+					bits -= 8;
+				}
+			}
+			return new Uint8Array(out);
+		}
+
+		function oathAccountName(name, issuer) {
+			name = (name || "").trim();
+			issuer = (issuer || "").trim();
+			if (issuer) return issuer + ":" + name;
+			return name;
+		}
+
+		function parseOathList(payload) {
+			const sw = oathSw(payload);
+			throwIfOathBad(payload, "LIST");
+			const body = payload.subarray(0, payload.length - 2);
+			const list = [];
+			let i = 0;
+			const td = new TextDecoder();
+			while (i + 2 <= body.length) {
+				const tag = body[i++];
+				const len = body[i++];
+				if (i + len > body.length) break;
+				if (tag === OATH_TAG_NAME && len >= 1) {
+					// YKOATH LIST: type byte + name UTF-8
+					const typeByte = body[i];
+					const nameBytes = body.subarray(i + 1, i + len);
+					const fullName = td.decode(nameBytes);
+					let issuer = "";
+					let name = fullName;
+					const colon = fullName.indexOf(":");
+					if (colon >= 0) {
+						issuer = fullName.slice(0, colon);
+						name = fullName.slice(colon + 1);
+					}
+					list.push({
+						index: list.length,
+						fullName,
+						name,
+						issuer,
+						digits: 6,
+						typeByte,
+					});
+				}
+				i += len;
+			}
+			return list;
+		}
+
+		async function oathExchange(ins, data, timeoutMs, opLabel) {
+			const apdu = oathApdu(ins, data || new Uint8Array(0));
+			const resp = await ctaphidSend(CTAPHID_OATH, apdu, timeoutMs || 5000);
+			throwIfOathBad(resp, opLabel || "OATH");
+			return resp;
+		}
 
 		async function connectWebHID() {
 			try {
 				if (!navigator.hid) {
-					setStatus("WebHID not supported. Use Chrome or Edge.", "error");
+					setStatus("WebHID not supported. Use Chrome or Edge on desktop.", "error");
 					return;
 				}
 
 				const devices = await navigator.hid.requestDevice({
-					filters: [{ vendorId: VENDOR_ID }],
+					filters: [
+						{ vendorId: VENDOR_ID, productId: PRODUCT_ID, usagePage: 0xf1d0 },
+						{ vendorId: VENDOR_ID, productId: PRODUCT_ID },
+						{ vendorId: VENDOR_ID, usagePage: 0xf1d0 },
+					],
 				});
 
 				if (!devices.length) {
@@ -2099,103 +2489,164 @@
 					return;
 				}
 
-				hidDevice = devices[0];
-				await hidDevice.open();
+				if (hidDevice) {
+					try {
+						hidDevice.removeEventListener("inputreport", onHidInputReport);
+						if (hidDevice.opened) await hidDevice.close();
+					} catch (_) { /* ignore */ }
+				}
 
+				hidDevice = devices[0];
+				if (!hidDevice.opened) await hidDevice.open();
+				clearHidIo();
+				hidDevice.addEventListener("inputreport", onHidInputReport);
+				hidDevice.addEventListener("disconnect", () => {
+					hidCid = 0;
+					hidDevice = null;
+					clearHidIo();
+					updateHidConnectButtons();
+					setStatus("Device disconnected", "warning");
+				});
+
+				setStatus("CTAPHID_INIT…", "info");
+				await ctaphidInit();
+				updateHidConnectButtons();
 				setStatus(
-					`Connected: ${hidDevice.productName || "Cryptick Device"}`,
+					`Connected: ${hidDevice.productName || "Cryptick Token"} · CTAPHID cid 0x${(hidCid >>> 0).toString(16)} · ready for OATH`,
 					"success",
 				);
 			} catch (error) {
+				updateHidConnectButtons();
 				setStatus("Connection failed: " + error.message, "error");
 			}
 		}
 
-		async function sendHIDPacket(cmd, payload) {
-			if (!hidDevice || !hidDevice.opened) {
-				setStatus("Device not connected", "error");
-				throw new Error("Device not connected");
-			}
-
-			const buffer = new Uint8Array(64);
-			buffer[0] = cmd;
-			buffer[1] = payload.length;
-			buffer.set(payload, 2);
-
-			await hidDevice.sendReport(REPORT_ID, buffer);
+		async function disconnectWebHID() {
+			try {
+				if (hidDevice) {
+					hidDevice.removeEventListener("inputreport", onHidInputReport);
+					if (hidDevice.opened) await hidDevice.close();
+				}
+			} catch (_) { /* ignore */ }
+			hidDevice = null;
+			hidCid = 0;
+			clearHidIo();
+			updateHidConnectButtons();
+			setStatus("Disconnected", "info");
 		}
 
 		async function syncTime() {
 			try {
-				const timestamp = Math.floor(Date.now() / 1000);
-				const payload = new Uint8Array(4);
-
-				payload[0] = (timestamp >> 24) & 0xff;
-				payload[1] = (timestamp >> 16) & 0xff;
-				payload[2] = (timestamp >> 8) & 0xff;
-				payload[3] = timestamp & 0xff;
-
-				await sendHIDPacket(0x10, payload);
-				setStatus("Time synchronized successfully", "success");
+				const ts = Math.floor(Date.now() / 1000) >>> 0;
+				const data = new Uint8Array([
+					(ts >>> 24) & 0xff,
+					(ts >>> 16) & 0xff,
+					(ts >>> 8) & 0xff,
+					ts & 0xff,
+				]);
+				setStatus(`SET_TIME ${ts} (UTC)…`, "info");
+				await oathExchange(OATH_INS_SET_TIME, data, 5000, "SET_TIME");
+				setStatus(`Time set · SW 9000 · unix ${ts}`, "success");
+				showToast("Device clock set from browser UTC", "success");
 			} catch (error) {
 				setStatus("Time sync failed: " + error.message, "error");
 			}
 		}
 
 		async function addAccountHID(name, issuer, secret, digits) {
-			const encoder = new TextEncoder();
-
-			const nameBytes = encoder.encode(name);
-			const issuerBytes = encoder.encode(issuer);
-			const secretBytes = encoder.encode(secret);
-
-			const payloadLength =
-				4 + nameBytes.length + issuerBytes.length + secretBytes.length;
-			const payload = new Uint8Array(payloadLength);
-
-			payload[0] = nameBytes.length;
-			payload[1] = issuerBytes.length;
-			payload[2] = digits;
-			payload[3] = 0x01; // SHA1
-
-			let offset = 4;
-			payload.set(nameBytes, offset);
-			offset += nameBytes.length;
-			payload.set(issuerBytes, offset);
-			offset += issuerBytes.length;
-			payload.set(secretBytes, offset);
-
-			await sendHIDPacket(0x20, payload);
+			// Full otpauth URI → PUT_OTPAUTH (device parses); else Base32 → PUT.
+			const secretTrim = String(secret || "").trim();
+			if (/^otpauth:\/\/totp\//i.test(secretTrim) || /^otp:\/\/totp\//i.test(secretTrim)) {
+				if (secretTrim.length > 400) throw new Error("otpauth URI too long");
+				const parsed = parseOtpauthUri(secretTrim);
+				const fullName = parsed
+					? oathAccountName(parsed.name, parsed.issuer)
+					: "otpauth";
+				const uriBytes = new TextEncoder().encode(secretTrim);
+				setStatus(`PUT_OTPAUTH "${fullName}" — place finger if OLED shows Manage…`, "warning");
+				await oathExchange(OATH_INS_PUT_OTPAUTH, uriBytes, OATH_UV_TIMEOUT_MS, "PUT_OTPAUTH");
+				return fullName;
+			}
+			if (digits && digits !== 6) {
+				throw new Error("Product OATH only supports 6 digits");
+			}
+			const fullName = oathAccountName(name, issuer);
+			if (!fullName) throw new Error("Account name required");
+			const secretBytes = base32Decode(secretTrim);
+			const nameBytes = new TextEncoder().encode(fullName);
+			if (nameBytes.length > 64) throw new Error("Name too long (max 64)");
+			// key = type_algo(0x21 TOTP|SHA1) | digits(6) | secret
+			const key = new Uint8Array(2 + secretBytes.length);
+			key[0] = 0x21;
+			key[1] = 0x06;
+			key.set(secretBytes, 2);
+			const data = concatBytes([tlv(OATH_TAG_NAME, nameBytes), tlv(OATH_TAG_KEY, key)]);
+			setStatus(`PUT "${fullName}" — place finger if OLED shows Manage…`, "warning");
+			await oathExchange(OATH_INS_PUT, data, OATH_UV_TIMEOUT_MS, "PUT");
+			return fullName;
 		}
 
 		async function loadAccounts() {
 			try {
-				await sendHIDPacket(0x30, new Uint8Array(0));
-
-				// For WebHID, you'd need to implement a response listener
-				// Since HID is more complex for reading responses, you might need to:
-				// 1. Set up an input report listener
-				// 2. Parse the binary response
-				// For now, instruct user to check serial console or implement HID input reports
-				setStatus(
-					"Account list request sent. For full functionality, use Web Serial mode or implement HID input reports.",
-					"warning",
+				setStatus("LIST…", "info");
+				const resp = await ctaphidSend(
+					CTAPHID_OATH,
+					oathApdu(OATH_INS_LIST, new Uint8Array(0)),
+					5000,
+				);
+				accounts = parseOathList(resp);
+				renderAccounts();
+				setStatus(`LIST OK · SW 9000 · ${accounts.length} account(s)`, "success");
+				showToast(
+					`Loaded ${accounts.length} account${accounts.length !== 1 ? "s" : ""}`,
+					"success",
 				);
 			} catch (error) {
 				setStatus("Failed to load accounts: " + error.message, "error");
 			}
 		}
 
-		async function getTOTPHID(index) {
-			const payload = new Uint8Array(1);
-			payload[0] = index;
-			await sendHIDPacket(0x40, payload);
+		async function oathCalculateByIndex(index) {
+			const acct = accounts[index];
+			if (!acct || !acct.fullName) throw new Error("Unknown account");
+			const nameBytes = new TextEncoder().encode(acct.fullName);
+			const counter = Math.floor(Date.now() / 1000 / 30);
+			const chal = new Uint8Array(8);
+			// big-endian uint64 counter
+			let c = counter;
+			for (let i = 7; i >= 0; i--) {
+				chal[i] = c & 0xff;
+				c = Math.floor(c / 256);
+			}
+			const data = concatBytes([
+				tlv(OATH_TAG_NAME, nameBytes),
+				tlv(OATH_TAG_CHALLENGE, chal),
+			]);
+			const resp = await oathExchange(
+				OATH_INS_CALCULATE,
+				data,
+				OATH_UV_TIMEOUT_MS,
+				"CALCULATE",
+			);
+			// 0x75 0x05 digits code_u32_BE | SW
+			if (resp.length < 9 || resp[0] !== OATH_TAG_RESPONSE || resp[1] !== 5) {
+				throw new Error("unexpected CALCULATE body");
+			}
+			const digits = resp[2] || 6;
+			const codeN =
+				((resp[3] << 24) | (resp[4] << 16) | (resp[5] << 8) | resp[6]) >>> 0;
+			const code = String(codeN).padStart(digits, "0");
+			const remaining = 30 - (Math.floor(Date.now() / 1000) % 30);
+			return { code, remaining, digits };
 		}
 
 		async function deleteAccountHID(index) {
-			const payload = new Uint8Array(1);
-			payload[0] = index;
-			await sendHIDPacket(0x50, payload);
+			const acct = accounts[index];
+			if (!acct || !acct.fullName) throw new Error("Unknown account");
+			const nameBytes = new TextEncoder().encode(acct.fullName);
+			const data = tlv(OATH_TAG_NAME, nameBytes);
+			setStatus(`DELETE "${acct.fullName}" — place finger if Manage…`, "warning");
+			await oathExchange(OATH_INS_DELETE, data, OATH_UV_TIMEOUT_MS, "DELETE");
 		}
 
 		// ====================================================================
@@ -2496,36 +2947,31 @@
 				name = document.getElementById("accountName").value;
 				issuer = document.getElementById("accountIssuer").value;
 				secret = document.getElementById("accountSecret").value;
-				digits = parseInt(document.getElementById("accountDigits").value);
+				digits = parseInt(document.getElementById("accountDigits").value, 10) || 6;
 			} else {
 				name = document.getElementById("accountNameSerial").value;
 				issuer = document.getElementById("accountIssuerSerial").value;
 				secret = document.getElementById("accountSecretSerial").value;
 				digits = parseInt(
 					document.getElementById("accountDigitsSerial").value,
+					10,
 				);
 			}
 
 			try {
 				if (currentMode === "webhid") {
-					await addAccountHID(name, issuer, secret, digits);
-					setStatus(`Account "${name}" added successfully`, "success");
+					const fullName = await addAccountHID(name, issuer, secret, digits);
+					setStatus(`PUT OK · SW 9000 · "${fullName}" — codes on device OLED after FP unlock`, "success");
+					showToast(`Account sent: ${fullName}`, "success");
+					event.target.reset();
+					await loadAccounts();
 				} else {
 					sendAddAccountSerial(name, issuer, secret, digits);
 					showToast(`Account "${name}" add command sent`, "info");
 					updateSerialStatusBar();
+					event.target.reset();
+					setTimeout(() => loadAccountsSerial(), 1000);
 				}
-
-				event.target.reset();
-
-				// Reload accounts after adding
-				setTimeout(() => {
-					if (currentMode === "webhid") {
-						loadAccounts();
-					} else {
-						loadAccountsSerial();
-					}
-				}, 1000);
 			} catch (error) {
 				setStatus("Failed to add account: " + error.message, "error");
 			}
@@ -2559,6 +3005,7 @@
 			setInterval(updateBrowserTime, 1000);
 			const serialCmd = document.getElementById("serialCommand");
 			if (serialCmd) serialCommandChange();
+			updateHidConnectButtons();
 
 			// Check browser capabilities
 			if (!navigator.hid && !navigator.serial) {
@@ -2574,8 +3021,13 @@
 				switchMode("webserial");
 			} else if (!navigator.serial) {
 				setStatus(
-					"Web Serial not supported. WebHID mode available.",
+					"Web Serial not supported. WebHID OATH programmer available.",
 					"warning",
+				);
+			} else {
+				setStatus(
+					"Connect Cryptick Token (0x1209:0xBEEE) → Set Time → Add account (HID OATH)",
+					"info",
 				);
 			}
 		};

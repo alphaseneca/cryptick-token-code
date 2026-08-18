@@ -21,11 +21,36 @@ void test_totp_base32_decode(void)
     TEST_ASSERT_EQUAL_UINT8('!', buf[5]);
 }
 
-void test_totp_base32_decode_invalid(void)
+void test_totp_base32_decode_empty(void)
 {
     uint8_t buf[32];
     int n = totp_base32_decode("", buf, sizeof(buf));
     TEST_ASSERT_EQUAL(0, n);
+}
+
+void test_totp_base32_accepts_separators(void)
+{
+    /* Authenticator apps print secrets in space/dash separated groups. */
+    uint8_t buf[32];
+    int n = totp_base32_decode("JBSW Y3DP-EHPK 3PXP", buf, sizeof(buf));
+    TEST_ASSERT_EQUAL(10, n);
+    TEST_ASSERT_EQUAL_UINT8('H', buf[0]);
+    TEST_ASSERT_EQUAL_UINT8('!', buf[5]);
+}
+
+void test_totp_base32_rejects_invalid_char(void)
+{
+    /* '1' and '0' are not in the RFC 4648 alphabet; skipping them silently
+     * would decode to a different, wrong secret. */
+    uint8_t buf[32];
+    TEST_ASSERT_EQUAL(-1, totp_base32_decode("JBSWY3DP1HPK3PXP", buf, sizeof(buf)));
+    TEST_ASSERT_EQUAL(-1, totp_base32_decode("JBSW!Y3DP", buf, sizeof(buf)));
+}
+
+void test_totp_base32_rejects_overflow(void)
+{
+    uint8_t buf[4];
+    TEST_ASSERT_EQUAL(-1, totp_base32_decode("JBSWY3DPEHPK3PXP", buf, sizeof(buf)));
 }
 
 static TOTPCredential demo_cred(void)
@@ -98,6 +123,24 @@ void test_totp_rfc6238_t1111111109(void)
     TEST_ASSERT_EQUAL_STRING("07081804", code.c_str());
 }
 
+void test_totp_rfc6238_t1111111111(void)
+{
+    String code = totp_generate(rfc_cred(), 1111111111UL);
+    TEST_ASSERT_EQUAL_STRING("14050471", code.c_str());
+}
+
+void test_totp_rfc6238_t1234567890(void)
+{
+    String code = totp_generate(rfc_cred(), 1234567890UL);
+    TEST_ASSERT_EQUAL_STRING("89005924", code.c_str());
+}
+
+void test_totp_rfc6238_t2000000000(void)
+{
+    String code = totp_generate(rfc_cred(), 2000000000UL);
+    TEST_ASSERT_EQUAL_STRING("69279037", code.c_str());
+}
+
 void test_totp_rejects_non_sha1(void)
 {
     TOTPCredential cred = demo_cred();
@@ -106,16 +149,30 @@ void test_totp_rejects_non_sha1(void)
     TEST_ASSERT_EQUAL_STRING("Bad Algo", code.c_str());
 }
 
+void test_totp_rejects_invalid_secret(void)
+{
+    TOTPCredential cred = demo_cred();
+    cred.secret = "JBSWY3DP1HPK3PXP"; /* '1' is not base32 */
+    TEST_ASSERT_EQUAL_STRING("Bad Key", totp_generate(cred, 59).c_str());
+}
+
 static void run_all_tests(void)
 {
     RUN_TEST(test_totp_base32_decode);
-    RUN_TEST(test_totp_base32_decode_invalid);
+    RUN_TEST(test_totp_base32_decode_empty);
+    RUN_TEST(test_totp_base32_accepts_separators);
+    RUN_TEST(test_totp_base32_rejects_invalid_char);
+    RUN_TEST(test_totp_base32_rejects_overflow);
     RUN_TEST(test_totp_generate_length);
     RUN_TEST(test_totp_generate_stable);
     RUN_TEST(test_totp_counter_steps);
     RUN_TEST(test_totp_rfc6238_t59);
     RUN_TEST(test_totp_rfc6238_t1111111109);
+    RUN_TEST(test_totp_rfc6238_t1111111111);
+    RUN_TEST(test_totp_rfc6238_t1234567890);
+    RUN_TEST(test_totp_rfc6238_t2000000000);
     RUN_TEST(test_totp_rejects_non_sha1);
+    RUN_TEST(test_totp_rejects_invalid_secret);
 }
 
 void setup()

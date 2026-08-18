@@ -18,7 +18,15 @@ struct TOTPCredential
     String algorithm;/* e.g. SHA1 */
 };
 
-/** Decode Base32 string into bytes. Returns number of bytes decoded, or <=0 on error. */
+/**
+ * Strict RFC 4648 Base32 decode into `result`.
+ *
+ * Whitespace, '-' separators and trailing '=' padding are accepted; any other
+ * character out of the alphabet is an error rather than being skipped.
+ *
+ * Returns bytes written, 0 for empty input, or -1 on an invalid character or
+ * a secret longer than `bufSize`.
+ */
 int totp_base32_decode(const char *encoded, uint8_t *result, int bufSize);
 
 /** Generate TOTP for credential at given Unix timestamp (RFC 6238). Returns 6-digit code or error string. */

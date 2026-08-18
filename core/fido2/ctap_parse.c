@@ -724,7 +724,8 @@ uint8_t ctap_parse_make_credential(CTAP_makeCredential * MC, CborEncoder * encod
 
     memset(MC, 0, sizeof(CTAP_makeCredential));
     MC->up = 0xff;
-    ret = cbor_parser_init(request, length, CborValidateCanonicalFormat, &parser, &it);
+    /* Browsers do not always emit tinycbor-canonical map key order/int forms. */
+    ret = cbor_parser_init(request, length, 0, &parser, &it);
     check_retr(ret);
 
     CborType type = cbor_value_get_type(&it);
@@ -1087,7 +1088,7 @@ uint8_t ctap_parse_cred_mgmt(CTAP_credMgmt * CM, uint8_t * request, int length)
     CborValue it,map;
 
     memset(CM, 0, sizeof(CTAP_credMgmt));
-    ret = cbor_parser_init(request, length, CborValidateCanonicalFormat, &parser, &it);
+    ret = cbor_parser_init(request, length, 0, &parser, &it);
     check_ret(ret);
 
     CborType type = cbor_value_get_type(&it);
@@ -1179,7 +1180,7 @@ uint8_t ctap_parse_get_assertion(CTAP_getAssertion * GA, uint8_t * request, int 
     GA->creds = getAssertionState.creds;     // Save stack memory
     GA->up = 0xff;
 
-    ret = cbor_parser_init(request, length, CborValidateCanonicalFormat, &parser, &it);
+    ret = cbor_parser_init(request, length, 0, &parser, &it);
     check_ret(ret);
 
     CborType type = cbor_value_get_type(&it);
@@ -1414,7 +1415,7 @@ uint8_t ctap_parse_client_pin(CTAP_clientPin * CP, uint8_t * request, int length
     CborValue it,map;
 
     memset(CP, 0, sizeof(CTAP_clientPin));
-    ret = cbor_parser_init(request, length, CborValidateCanonicalFormat, &parser, &it);
+    ret = cbor_parser_init(request, length, 0, &parser, &it);
     check_ret(ret);
 
     CborType type = cbor_value_get_type(&it);

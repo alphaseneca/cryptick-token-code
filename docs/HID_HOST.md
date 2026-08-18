@@ -35,28 +35,32 @@ CLA (0x00) | INS | P1 (0x00) | P2 (0x00) | Lc | TLV…
 [TLV…] | SW1 | SW2
 ```
 
-`SW = 0x9000` success. Common errors: `6A80` wrong data, `6A82` not found, `6D00` INS, `6985` unsupported options, `6700` length.
+`SW = 0x9000` success. Common errors: `6A80` wrong data, `6A82` not found, `6D00` INS, `6985` conditions (UV required / timeout), `6700` length.
 
-### Instructions (MVP)
+### Instructions (product)
 
-| INS | Name | Request | Response |
-|-----|------|---------|----------|
-| `0x01` | PUT | Tag `0x71` name, `0x73` key | SW |
-| `0x02` | DELETE | Tag `0x71` name | SW |
-| `0xa1` | LIST | empty | name TLVs + SW |
-| `0xa2` | CALCULATE | `0x71` name + `0x74` 8-byte counter BE | `0x75` response + SW |
-| `0x04` | SET_TIME | 4-byte UTC unix BE (not TLV) | SW |
-| `0x40` | PUT_OTPAUTH | UTF-8 `otpauth://totp/…` | SW |
+| INS | Name | Request | Response | UV |
+|-----|------|---------|----------|----|
+| `0x01` | PUT | Tag `0x71` name, `0x73` key | SW | Yes if FP enrolled |
+| `0x02` | DELETE | Tag `0x71` name | SW | Yes if FP enrolled |
+| `0xa1` | LIST | empty | name TLVs + SW | No |
+| `0xa2` | CALCULATE | `0x71` name + `0x74` 8-byte counter BE | `0x75` response + SW | Yes if FP enrolled |
+| `0x04` | SET_TIME | 4-byte UTC unix BE (not TLV) | SW | No |
+| `0x40` | PUT_OTPAUTH | UTF-8 `otpauth://totp/…` | SW | Yes if FP enrolled |
+
+**UV policy (`CRYPTICK_OATH_REQUIRE_FP`, default 1):** if the sensor has zero templates, management is allowed without touch (first-time setup). After enroll, OLED shows **Manage** / **Code** and waits up to 25s for fingerprint (same path as FIDO). Active unlock session from OLED TOTP also satisfies UV. Lab: `-DCRYPTICK_OATH_REQUIRE_FP=0`.
+
+Secrets on device are stored encrypted (AES-GCM); see `docs/SECURITY_ROADMAP.md`.
 
 ### Tag `0x73` (key) for PUT
 
 ```text
 type_algo (1) | digits (1) | secret_bytes…
 type_algo = 0x21  // high nibble TOTP 0x20, low nibble SHA1 0x01
-digits    = 6      // MVP fixed
+digits    = 6      // product fixed for now
 ```
 
-Host base32-decodes secrets before PUT. MVP rejects non-SHA1, non-6-digit, non-30s period in PUT_OTPAUTH.
+Host base32-decodes secrets before PUT. Rejects non-SHA1, non-6-digit, non-30s period in PUT_OTPAUTH.
 
 ### CALCULATE challenge
 

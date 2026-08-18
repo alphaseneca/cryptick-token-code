@@ -28,6 +28,7 @@ enum ChargeState : uint8_t {
     CHARGE_FAULT
 };
 
+/* Appended to, never reordered: the numeric value shows up in [NAV] logs. */
 enum UiState : uint8_t {
     UI_CLOCK = 0,
     UI_MENU,
@@ -39,7 +40,9 @@ enum UiState : uint8_t {
     UI_FP_CLEAR_CONFIRM,
     UI_FIDO_PROMPT,
     UI_FIDO_PROCESSING,
-    UI_FIDO_SUCCESS
+    UI_FIDO_SUCCESS,
+    UI_SLEEP,        /* panel off; CENTER or a host request wakes it */
+    UI_DEVICE_INFO   /* Settings → Info */
 };
 
 enum FpEventKind : uint8_t {

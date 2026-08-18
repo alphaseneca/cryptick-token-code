@@ -1,0 +1,5 @@
+# L0 host tests — pure Python, no hardware, no native USB libs.
+# CI installs only this file so a bench-only dependency can never break the
+# build gate.
+pytest>=7.0
+cryptography>=41.0

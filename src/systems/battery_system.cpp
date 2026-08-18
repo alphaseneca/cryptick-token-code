@@ -1,5 +1,8 @@
 #include "battery_system.h"
+#include "usb_device.h"
 #include <board_config.h>
+#include <cryptick_console.h>
+#include <cryptick_log.h>
 #include <Arduino.h>
 #if defined(ESP32)
 #include "driver/gpio.h"
@@ -14,8 +17,13 @@
  *   LOW     HIGH    Recoverable fault
  *   LOW     LOW     Non-recoverable / latch fault
  *
- * No battery: STAT2 toggles between charge and complete.
- * N16R8: GPIO33–37 reserved for Octal flash/PSRAM (IO37 NC). STAT1=38 STAT2=39 are free.
+ * HIGH/HIGH is both "battery full, VIN present" and "unplugged / sleep".
+ * This PCB has no dedicated VBUS pin, so USB enumeration is the VIN proxy:
+ * while the host is mounted, HIGH/HIGH means FULL. Unplug → idle half-bar.
+ *
+ * `_saw_charging` covers the gap before TinyUSB mounts and charge-only cables
+ * that never enumerate. It is cleared on USB unmount so a finished charge does
+ * not keep saying FULL after the cable is gone.
  */
 
 static ChargeState _state = CHARGE_IDLE;
@@ -26,6 +34,8 @@ static bool _use_stat1 = true;
 static unsigned long _s2_last_edge = 0;
 static bool _s2_blinks = false;
 static int _stat1_stuck_low = 0;
+static bool _saw_charging = false;
+static bool _usb_was_mounted = false;
 
 static void cfg_pin(int pin)
 {
@@ -45,15 +55,30 @@ static uint8_t rd(int pin)
     return digitalRead(pin) == HIGH ? 1 : 0;
 }
 
+static bool charger_present(void)
+{
+    return usb_device_mounted() || _saw_charging;
+}
+
 static ChargeState decode(uint8_t s1, uint8_t s2)
 {
-    if (s1 && !s2) return CHARGE_CHARGING; /* H L */
+    if (s1 && !s2) return CHARGE_CHARGING;
     if (s1 && s2) {
-        /* H H = done/sleep; if STAT2 was blinking (no cell), treat as charging/power present */
-        return _s2_blinks ? CHARGE_CHARGING : CHARGE_DONE;
+        if (_s2_blinks) return CHARGE_CHARGING;
+        return charger_present() ? CHARGE_DONE : CHARGE_IDLE;
     }
-    if (!s1 && s2) return CHARGE_FAULT;    /* L H */
-    return CHARGE_FAULT;                   /* L L */
+    if (!s1 && s2) return CHARGE_FAULT;
+    return CHARGE_FAULT;
+}
+
+static void publish(void)
+{
+    BusEvent e{};
+    e.type = EVT_BATTERY;
+    e.kind = (uint8_t)_state;
+    e.a = _s1;
+    e.b = _s2;
+    bus_publish(e);
 }
 
 void battery_system_init(void)
@@ -70,18 +95,17 @@ void battery_system_init(void)
     delay(10);
     _s1 = _use_stat1 ? rd(STAT1_PIN) : 1;
     _s2 = rd(STAT2_PIN);
+    _usb_was_mounted = usb_device_mounted();
     _state = decode(_s1, _s2);
+    if (_state == CHARGE_CHARGING)
+        _saw_charging = true;
 
-    Serial.printf("[BAT] init S1=%u S2=%u → %s (STAT1_PIN=%d STAT2_PIN=%d)\n",
-                  (unsigned)_s1, (unsigned)_s2, battery_system_label(),
-                  STAT1_PIN, STAT2_PIN);
+    const char *lab = battery_system_label();
+    CLOG_I("BAT", "init S1=%u S2=%u usb=%d → %s (STAT1_PIN=%d STAT2_PIN=%d)",
+           (unsigned)_s1, (unsigned)_s2, _usb_was_mounted ? 1 : 0,
+           lab[0] ? lab : "idle", STAT1_PIN, STAT2_PIN);
 
-    BusEvent e{};
-    e.type = EVT_BATTERY;
-    e.kind = (uint8_t)_state;
-    e.a = _s1;
-    e.b = _s2;
-    bus_publish(e);
+    publish();
 }
 
 void battery_system_tick(unsigned long nowMs)
@@ -100,7 +124,6 @@ void battery_system_tick(unsigned long nowMs)
         _s2_blinks = false;
     }
 
-    /* Detect dead STAT1 (always asserted) — should not happen on IO38 */
     if (_use_stat1) {
         if (s1 == 0)
             _stat1_stuck_low++;
@@ -109,40 +132,58 @@ void battery_system_tick(unsigned long nowMs)
         if (_stat1_stuck_low > 25) {
             _use_stat1 = false;
             s1 = 1;
-            Serial.println("[BAT] STAT1 stuck low — using STAT2-only mode");
+            CLOG_E("BAT", "STAT1 stuck low — using STAT2-only mode");
         }
     } else {
         s1 = 1;
     }
 
+    bool usb = usb_device_mounted();
+    if (_usb_was_mounted && !usb)
+        _saw_charging = false;
+    _usb_was_mounted = usb;
+
     ChargeState next = decode(s1, s2);
+    if (next == CHARGE_CHARGING)
+        _saw_charging = true;
+    /* Re-decode after the latch so a charge-complete edge becomes FULL even
+     * before TinyUSB has mounted. */
+    if (next == CHARGE_IDLE && charger_present())
+        next = CHARGE_DONE;
+
     if (next == _state && s1 == _s1 && s2 == _s2)
         return;
 
     _s1 = s1;
     _s2 = s2;
     _state = next;
-    Serial.printf("[BAT] S1=%u S2=%u → %s\n",
-                  (unsigned)_s1, (unsigned)_s2, battery_system_label());
+    const char *lab = battery_system_label();
+    CLOG_D("BAT", "S1=%u S2=%u usb=%d → %s",
+           (unsigned)_s1, (unsigned)_s2, usb ? 1 : 0,
+           lab[0] ? lab : "idle");
 
-    BusEvent e{};
-    e.type = EVT_BATTERY;
-    e.kind = (uint8_t)_state;
-    e.a = _s1;
-    e.b = _s2;
-    bus_publish(e);
+    publish();
 }
 
 ChargeState battery_system_state(void) { return _state; }
 uint8_t battery_system_stat1(void) { return _s1; }
 uint8_t battery_system_stat2(void) { return _s2; }
 
+bool battery_system_show_full(void)
+{
+    return _state == CHARGE_DONE;
+}
+
 const char *battery_system_label(void)
 {
     switch (_state) {
-    case CHARGE_CHARGING: return "CHG";
-    case CHARGE_DONE:     return "OK";   /* done or sleep / not charging */
-    case CHARGE_FAULT:    return "FLT";
-    default:              return "BAT";
+    case CHARGE_CHARGING:
+        return "CHG";
+    case CHARGE_DONE:
+        return "FULL";
+    case CHARGE_FAULT:
+        return "FLT";
+    default:
+        return "";
     }
 }

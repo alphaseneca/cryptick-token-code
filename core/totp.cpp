@@ -140,31 +140,48 @@ static void hmac_sha1(const uint8_t *key, int keyLen,
  * TOTP (RFC 6238 / RFC 4226)
  * ════════════════════════════════════════════════════════════════════════ */
 
+/*
+ * Strict RFC 4648 base32 decode.
+ *
+ * Returns the number of bytes written, or -1 if the input contains a character
+ * outside the alphabet or does not fit in `bufSize`. Silently skipping bad
+ * characters (the previous behaviour) turned a mistyped secret into a
+ * plausible-looking but permanently wrong TOTP code, with no way for the user
+ * to tell the difference from a clock problem.
+ *
+ * Separators that authenticator apps commonly print are still accepted:
+ * whitespace, '-' and trailing '=' padding.
+ */
 int totp_base32_decode(const char *encoded, uint8_t *result, int bufSize)
 {
     const char *base32_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
     int buffer = 0, bitsLeft = 0, count = 0;
 
-    for (const char *ptr = encoded; *ptr && count < bufSize; ++ptr)
+    if (!encoded || !result || bufSize <= 0)
+        return -1;
+
+    for (const char *ptr = encoded; *ptr; ++ptr)
     {
         char ch = *ptr;
-        if (isspace(ch) || ch == '-')
+        if (isspace((unsigned char)ch) || ch == '-')
             continue;
-            
-        ch = toupper(ch);
+
+        ch = (char)toupper((unsigned char)ch);
         if (ch == '=')
             break;
 
         const char *p = strchr(base32_chars, ch);
         if (!p)
-            continue;
+            return -1;
 
         buffer <<= 5;
-        buffer |= (p - base32_chars);
+        buffer |= (int)(p - base32_chars);
         bitsLeft += 5;
 
         if (bitsLeft >= 8)
         {
+            if (count >= bufSize)
+                return -1;
             result[count++] = (uint8_t)((buffer >> (bitsLeft - 8)) & 0xFF);
             bitsLeft -= 8;
         }

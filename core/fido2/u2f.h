@@ -95,8 +95,12 @@ struct u2f_authenticate_request
 };
 
 // u2f_request send a U2F message to U2F protocol
-// @req U2F message
-void u2f_request(struct u2f_request_apdu* req, CTAP_RESPONSE * resp);
+// @pkt raw CTAPHID_MSG payload (short or extended APDU)
+// @len payload length in bytes
+void u2f_request(uint8_t *pkt, uint32_t len, CTAP_RESPONSE * resp);
+
+/** 1 if the last MSG was Chrome's bogus U2F_REGISTER GetTouch (not a real create). */
+int u2f_last_was_presence_probe(void);
 
 // u2f_request send a U2F message to NFC protocol
 // @req data with iso7816 apdu message

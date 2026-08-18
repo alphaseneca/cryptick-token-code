@@ -2,9 +2,14 @@
 #include <Wire.h>
 #include <LittleFS.h>
 #include <RTClib.h>
+#include <sys/time.h>
+#include <time.h>
 
 #include <board_config.h>
-#include <device_hal.h>
+#include <cryptick_console.h>
+#include <cryptick_log.h>
+#include <device.h>
+#include "host/credential_store.h"
 #include "host/totp_storage.h"
 #include "host/serial_comm.h"
 
@@ -25,7 +30,7 @@ extern "C" {
 
     void fido_log_print(const char *msg)
     {
-        Serial.print(msg);
+        cryptick_log_raw(msg);
     }
 }
 
@@ -34,23 +39,53 @@ static bool g_rtc_ok = false;
 std::vector<TOTPCredential> credentials;
 bool g_setup_finished = false;
 
-extern "C" uint32_t get_synced_utc()
-{
-    static uint32_t baseUtc = 0;
-    static unsigned long baseMillis = 0;
+/*
+ * Soft clock: baseUnix + (millis - baseMillis)/1000.
+ * First call seeds from HW RTC (if present) else a fixed lab epoch.
+ * set_synced_utc() updates base immediately and writes RTC when present
+ * so SETTIME / OATH SET_TIME apply without reboot.
+ */
+static uint32_t s_baseUtc = 0;
+static unsigned long s_baseMillis = 0;
+static bool s_time_seeded = false;
 
-    if (baseUtc == 0) {
+extern "C" uint32_t get_synced_utc(void)
+{
+    if (!s_time_seeded) {
         if (g_rtc_ok) {
             i2c_lock();
-            baseUtc = rtc.now().unixtime();
+            s_baseUtc = rtc.now().unixtime();
             i2c_unlock();
         } else {
-            /* Epoch fallback so TOTP/UI never touch a dead RTC bus. */
-            baseUtc = 1700000000UL;
+            s_baseUtc = 1700000000UL; /* soft-only bootstrap; use SETTIME */
         }
-        baseMillis = millis();
+        s_baseMillis = millis();
+        s_time_seeded = true;
     }
-    return baseUtc + (millis() - baseMillis) / 1000;
+    return s_baseUtc + (uint32_t)((millis() - s_baseMillis) / 1000UL);
+}
+
+extern "C" void set_synced_utc(uint32_t utc)
+{
+    if (utc == 0)
+        return;
+    s_baseUtc = utc;
+    s_baseMillis = millis();
+    s_time_seeded = true;
+
+    if (g_rtc_ok) {
+        i2c_lock();
+        rtc.adjust(DateTime(utc));
+        i2c_unlock();
+    }
+
+    /* ESP system clock (time()/localtime for libs that use it) */
+    struct timeval tv;
+    tv.tv_sec = (time_t)utc;
+    tv.tv_usec = 0;
+    settimeofday(&tv, nullptr);
+
+    CLOG_I("TIME", "set utc=%lu rtc=%d", (unsigned long)utc, g_rtc_ok ? 1 : 0);
 }
 
 static void dispatch_event(const BusEvent &e)
@@ -63,54 +98,59 @@ static void dispatch_event(const BusEvent &e)
 
 static void banner(void)
 {
-    Serial.println();
-    Serial.println(F("--- Cryptick Token ---"));
-    Serial.printf("[USB] CDC ready  mounted=%d  VID=0x%04X PID=0x%04X\n",
-                  usb_device_mounted() ? 1 : 0, 0x1209u, 0xBEEEu);
-    Serial.println(F("[USB] CDC = logs; OATH/FIDO/ENTERBOOT on HID (docs/HID_HOST.md)"));
-    Serial.println(F("[USB] reflash: 1200bps, HID ENTERBOOT, or type BOOTLOADER"));
-    Serial.flush();
+    CryptickLog.println();
+    CryptickLog.println(F("--- Cryptick Token ---"));
+#if defined(ARDUINO_USB_MODE) && (ARDUINO_USB_MODE == 0)
+    CLOG_I("USB", "TinyUSB CDC+HID mounted=%d VID=0x1209 PID=0xBEEE",
+                       usb_device_mounted() ? 1 : 0);
+    CLOG_I("USB", "reflash: 1200bps / HID ENTERBOOT / BOOTLOADER");
+#elif defined(CRYPTICK_USB_STACK) && CRYPTICK_USB_STACK
+    CLOG_I("USB", "Serial/JTAG CDC MODE=1 @115200 (bring-up)");
+    CLOG_I("USB", "open this COM @115200 — type HELP");
+#else
+    CLOG_D("UART", "console @115200");
+#endif
+    CryptickLog.flush();
 }
 
 void setup()
 {
     /*
-     * Boot order: bring-up UI first, USB last-ish.
-     * If TinyUSB or FP hang, OLED/buttons already work so the board is not a brick.
+     * 1) USB CDC first so all probe lines are visible on the host.
+     * 2) OLED / buttons / FP after Serial is up (blank-screen diagnosis).
      */
-    delay(100);
+    cryptick_log_init();
     i2c_mutex_init();
+    credential_store_init();
     bus_init();
 
-    /* 1) OLED — first visible life sign (independent of USB/Serial) */
-    display_system_init();
-
-    /* 2) Inputs — buttons work even if USB stack fails */
-    input_system_init();
-
-    /* 3) USB CDC + FIDO (short mount wait; see usb_device.cpp) */
     usb_device_init();
     banner();
-    /* Re-log pin map after Serial is up */
+    CLOG_I("BOOT", "log_level=%d (%s)  set via LOGLEVEL 0..5",
+           (int)cryptick_log_get_level(),
+           cryptick_log_level_name(cryptick_log_get_level()));
+
+    display_system_init();
+    display_system_boot_animation();
     input_system_init();
 
     if (!LittleFS.begin(true))
-        Serial.println(F("[BOOT] LittleFS FAIL"));
+        CLOG_E("BOOT", "LittleFS FAIL");
     else
-        Serial.println(F("[BOOT] LittleFS OK"));
+        CLOG_I("BOOT", "LittleFS OK");
 
     Wire.setTimeOut(50);
     i2c_lock();
     g_rtc_ok = rtc.begin();
     i2c_unlock();
-    Serial.println(g_rtc_ok ? F("[BOOT] RTC OK") : F("[BOOT] RTC missing (millis time)"));
+    CLOG_I("BOOT", "RTC %s", g_rtc_ok ? "OK" : "missing (millis time)");
 
     battery_system_init();
     auth_system_init();
     nav_system_init();
 
     device_hal_init();
-    Serial.println(F("[BOOT] FIDO HAL"));
+    CLOG_D("BOOT", "FIDO HAL");
 
     loadConfiguration(credentials);
     display_system_set_credentials(&credentials);
@@ -121,10 +161,10 @@ void setup()
 
     crypto_ecc256_init();
 
-    Serial.println(F("[BOOT] Ready — type HELP"));
+    CLOG_I("BOOT", "Ready — type HELP");
     g_setup_finished = true;
-    Serial.print(F("cryptick> "));
-    Serial.flush();
+    CryptickLog.print(F("cryptick> "));
+    CryptickLog.flush();
     display_system_force_redraw();
 }
 
@@ -132,19 +172,33 @@ void loop()
 {
     unsigned long now = millis();
 
+    /* Buttons are timer-scanned; drain queue first every loop */
+    input_system_tick(now);
+
     usb_device_poll_bootloader();
     device_hal_heartbeat();
 
-    /* Re-emit heartbeat so late monitor open still sees life */
     static uint32_t lastBeat = 0;
     if (now - lastBeat >= 5000) {
         lastBeat = now;
         if (g_setup_finished) {
-            Serial.printf("[HB] up=%lus mounted=%d\n",
-                          (unsigned long)(now / 1000),
-                          usb_device_mounted() ? 1 : 0);
-            Serial.flush();
+            CLOG_T("HB", "up=%lus mounted=%d",
+                               (unsigned long)(now / 1000),
+                               usb_device_mounted() ? 1 : 0);
+            /* no flush — CDC flush can stall loop for tens of ms */
         }
+    }
+
+    /*
+     * nav_system is loop-owned. The FIDO task signals it indirectly: a prompt
+     * caption via device_take_ui_label() and the prompt/processing/success
+     * state via _fido_ui_request. Apply the caption first so the prompt screen
+     * draws with the right text on its very first frame.
+     */
+    char fido_label[64];
+    if (device_take_ui_label(fido_label, sizeof(fido_label))) {
+        nav_system_set_fido_label(fido_label);
+        display_system_force_redraw();
     }
 
     static int8_t lastUi = -1;
@@ -154,11 +208,13 @@ void loop()
         display_system_force_redraw();
     }
 
+#if defined(CRYPTICK_USB_STACK) && CRYPTICK_USB_STACK
     uint8_t hid_report[64];
     if (usb_hid_read_report(hid_report))
         ctaphid_push_report(hid_report);
+#endif
 
-    processSerialCommands(Serial, credentials,
+    processSerialCommands(CryptickLog, credentials,
 #ifdef ENABLE_FINGERPRINT
                           fp_system_driver(), fp_system_ready()
 #else
@@ -166,12 +222,22 @@ void loop()
 #endif
     );
 
-    input_system_tick(now);
+    /*
+     * Re-drain buttons after the serial CLI: an OATH command can block here
+     * for the whole place-finger window, and the 2 ms scan queue is only 16
+     * deep, so presses made during the wait would otherwise be lost.
+     */
+    input_system_tick(millis());
+
     battery_system_tick(now);
     fp_system_tick(now);
+
     auth_system_set_fingerprint_enabled(fp_system_ready());
 
-    nav_system_set_account_count((int)credentials.size());
+    {
+        CredentialLock guard;
+        nav_system_set_account_count((int)credentials.size());
+    }
     display_system_set_credentials(&credentials);
 
     BusEvent e;
@@ -179,12 +245,7 @@ void loop()
     while (bus_pop(e) && n++ < 64)
         dispatch_event(e);
 
+    now = millis();
     nav_system_tick(now);
-
-    n = 0;
-    while (bus_pop(e) && n++ < 32)
-        dispatch_event(e);
-
     display_system_tick(now);
-    yield();
 }

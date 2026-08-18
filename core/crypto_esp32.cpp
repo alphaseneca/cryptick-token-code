@@ -1,6 +1,7 @@
 #include "crypto.h"
 #include <string.h>
 #include <Arduino.h>
+#include "esp_random.h"
 #include "mbedtls/sha256.h"
 #include "mbedtls/sha512.h"
 #include "mbedtls/md.h"
@@ -75,9 +76,17 @@ void crypto_sha256_hmac_final(uint8_t * key, uint32_t klen, uint8_t * hmac) {
     mbedtls_md_free(&hmac_ctx);
 }
 
+/* uECC_RNG_Function: second arg is unsigned (not size_t) — cast was unsafe. */
+static int cryptick_uecc_rng(uint8_t *dest, unsigned size)
+{
+    if (!dest || size == 0)
+        return 0;
+    esp_fill_random(dest, (size_t)size);
+    return 1;
+}
+
 void crypto_ecc256_init(void) {
-    extern int ctap_generate_rng(uint8_t * dst, size_t num);
-    uECC_set_rng((uECC_RNG_Function)ctap_generate_rng);
+    uECC_set_rng(cryptick_uecc_rng);
     _es256_curve = uECC_secp256r1();
 }
 
@@ -88,12 +97,72 @@ void crypto_ecc256_load_attestation_key(void) {
     _key_len = 32;
 }
 
+/* secp256r1 group order n (big-endian). Chrome/BoringSSL reject high-S ECDSA. */
+static const uint8_t SECP256R1_N[32] = {
+    0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0xBC, 0xE6, 0xFA, 0xAD, 0xA7, 0x17, 0x9E, 0x84,
+    0xF3, 0xB9, 0xCA, 0xC2, 0xFC, 0x63, 0x25, 0x51
+};
+/* floor(n/2) — if s > n/2, replace s with n-s (RFC 6979 low-S). */
+static const uint8_t SECP256R1_HALF_N[32] = {
+    0x7F, 0xFF, 0xFF, 0xFF, 0x80, 0x00, 0x00, 0x00,
+    0x7F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0xDE, 0x73, 0x7D, 0x56, 0xD3, 0x8B, 0xCF, 0x42,
+    0x79, 0xDC, 0xE5, 0x61, 0x7E, 0x31, 0x92, 0xA8
+};
+
+static int cmp_be32(const uint8_t *a, const uint8_t *b)
+{
+    for (int i = 0; i < 32; i++) {
+        if (a[i] < b[i]) return -1;
+        if (a[i] > b[i]) return 1;
+    }
+    return 0;
+}
+
+static void sub_be32(uint8_t *out, const uint8_t *a, const uint8_t *b)
+{
+    int borrow = 0;
+    for (int i = 31; i >= 0; i--) {
+        int v = (int)a[i] - (int)b[i] - borrow;
+        if (v < 0) {
+            v += 256;
+            borrow = 1;
+        } else {
+            borrow = 0;
+        }
+        out[i] = (uint8_t)v;
+    }
+}
+
+/** Normalize r||s (64 bytes) so S is low — required by Chrome WebAuthn/U2F. */
+static void ecdsa_normalize_low_s(uint8_t *sig)
+{
+    uint8_t *s = sig + 32;
+    if (cmp_be32(s, SECP256R1_HALF_N) > 0) {
+        uint8_t ns[32];
+        sub_be32(ns, SECP256R1_N, s);
+        memcpy(s, ns, 32);
+    }
+}
+
 void crypto_ecc256_sign(uint8_t * data, int len, uint8_t * sig) {
-    uECC_sign(_signing_key, data, len, sig, _es256_curve);
+    int ok = 0;
+    for (int attempt = 0; attempt < 8 && !ok; attempt++) {
+        ok = uECC_sign(_signing_key, data, (unsigned)len, sig, _es256_curve);
+    }
+    if (!ok) {
+        /* Never emit uninitialized garbage to the host/browser */
+        memset(sig, 0, 64);
+        return;
+    }
+    ecdsa_normalize_low_s(sig);
 }
 
 void crypto_ecdsa_sign(uint8_t * data, int len, uint8_t * sig, int MBEDTLS_ECP_ID) {
-    uECC_sign(_signing_key, data, len, sig, _es256_curve);
+    (void)MBEDTLS_ECP_ID;
+    crypto_ecc256_sign(data, len, sig);
 }
 
 static mbedtls_aes_context aes_ctx;

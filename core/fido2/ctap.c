@@ -26,6 +26,7 @@
 
 #include "device.h"
 #include "data_migration.h"
+#include <board_config.h>
 
 uint8_t PIN_TOKEN[PIN_TOKEN_SIZE];
 uint8_t KEY_AGREEMENT_PUB[64];
@@ -138,21 +139,38 @@ uint8_t ctap_get_info(CborEncoder * encoder)
     uint8_t aaguid[16];
     device_read_aaguid(aaguid);
 
-    ret = cbor_encoder_create_map(encoder, &map, 10);
+    /*
+     * Product policy (browser WebAuthn):
+     *  - UV = fingerprint (options.uv=true), not clientPin.
+     *  - NEVER advertise clientPin:false — presence of the key means "PIN capable".
+     *    Chrome then sends empty pinAuth as a touch probe; after finger we returned
+     *    CTAP2_ERR_PIN_NOT_SET → generic browser NotAllowedError while OLED still
+     *    showed Place finger. Only list clientPin when a PIN is actually set.
+     *  - versions: U2F_V2 + FIDO_2_0 (Chrome often creates via CTAPHID_MSG/U2F).
+     *  - Not FIDO_2_1_PRE: stay on CTAP2.0 built-in UV, not pinUvAuthToken-only.
+     */
+    const int pin_set = (ctap_is_pin_set() != 0);
+    const int map_keys = pin_set ? 10 : 9;
+    const int opt_keys = pin_set ? 6 : 5;
+
+    ret = cbor_encoder_create_map(encoder, &map, map_keys);
     check_ret(ret);
     {
 
         ret = cbor_encode_uint(&map, RESP_versions);     //  versions key
         check_ret(ret);
         {
-            ret = cbor_encoder_create_array(&map, &array, 3);
+            /*
+             * Prefer FIDO_2_0 first so platforms that pick versions[0] use CTAP2
+             * MakeCredential (fmt "none") when possible. Keep U2F_V2 for macOS
+             * Chrome CTAPHID_MSG fallback (do not set CAPABILITY_NMSG).
+             */
+            ret = cbor_encoder_create_array(&map, &array, 2);
             check_ret(ret);
             {
-                ret = cbor_encode_text_stringz(&array, "U2F_V2");
-                check_ret(ret);
                 ret = cbor_encode_text_stringz(&array, "FIDO_2_0");
                 check_ret(ret);
-                ret = cbor_encode_text_stringz(&array, "FIDO_2_1_PRE");
+                ret = cbor_encode_text_stringz(&array, "U2F_V2");
                 check_ret(ret);
             }
             ret = cbor_encoder_close_container(&map, &array);
@@ -185,57 +203,47 @@ uint8_t ctap_get_info(CborEncoder * encoder)
         ret = cbor_encode_uint(&map, RESP_options);
         check_ret(ret);
         {
-            ret = cbor_encoder_create_map(&map, &options,5);
+            ret = cbor_encoder_create_map(&map, &options, opt_keys);
             check_ret(ret);
             {
-                ret = cbor_encode_text_string(&options, "rk", 2);
-                check_ret(ret);
+                /*
+                 * Canonical CBOR text-key order (bytewise):
+                 * clientPin?, credMgmt, plat, rk, up, uv
+                 * Non-canonical maps break some strict WebAuthn platforms into
+                 * U2F-only fall-back after GetInfo.
+                 */
+                if (pin_set)
                 {
-                    ret = cbor_encode_boolean(&options, 1);     // Capable of storing keys locally
+                    ret = cbor_encode_text_string(&options, "clientPin", 9);
                     check_ret(ret);
-                }
-
-                ret = cbor_encode_text_string(&options, "up", 2);
-                check_ret(ret);
-                {
-                    ret = cbor_encode_boolean(&options, 1);     // Capable of testing user presence
-                    check_ret(ret);
-                }
-
-                // NOT [yet] capable of verifying user
-                // Do not add option if UV isn't supported.
-                //
-                // ret = cbor_encode_text_string(&options, "uv", 2);
-                // check_ret(ret);
-                // {
-                //     ret = cbor_encode_boolean(&options, 0);
-                //     check_ret(ret);
-                // }
-
-                ret = cbor_encode_text_string(&options, "plat", 4);
-                check_ret(ret);
-                {
-                    ret = cbor_encode_boolean(&options, 0);     // Not attached to platform
+                    ret = cbor_encode_boolean(&options, 1);
                     check_ret(ret);
                 }
 
                 ret = cbor_encode_text_string(&options, "credMgmt", 8);
                 check_ret(ret);
-                {
-                    ret = cbor_encode_boolean(&options, 1);
-                    check_ret(ret);
-                }
-
-                ret = cbor_encode_text_string(&options, "clientPin", 9);
+                ret = cbor_encode_boolean(&options, 1);
                 check_ret(ret);
-                {
-                    ret = cbor_encode_boolean(&options, ctap_is_pin_set());
-                    check_ret(ret);
-                }
 
+                ret = cbor_encode_text_string(&options, "plat", 4);
+                check_ret(ret);
+                ret = cbor_encode_boolean(&options, 0);
+                check_ret(ret);
 
+                ret = cbor_encode_text_string(&options, "rk", 2);
+                check_ret(ret);
+                ret = cbor_encode_boolean(&options, 1);
+                check_ret(ret);
 
+                ret = cbor_encode_text_string(&options, "up", 2);
+                check_ret(ret);
+                ret = cbor_encode_boolean(&options, 1);
+                check_ret(ret);
 
+                ret = cbor_encode_text_string(&options, "uv", 2);
+                check_ret(ret);
+                ret = cbor_encode_boolean(&options, 1);
+                check_ret(ret);
             }
             ret = cbor_encoder_close_container(&map, &options);
             check_ret(ret);
@@ -248,17 +256,20 @@ uint8_t ctap_get_info(CborEncoder * encoder)
             check_ret(ret);
         }
 
-        ret = cbor_encode_uint(&map, RESP_pinProtocols);
-        check_ret(ret);
+        if (pin_set)
         {
-            ret = cbor_encoder_create_array(&map, &pins, 1);
+            ret = cbor_encode_uint(&map, RESP_pinProtocols);
             check_ret(ret);
             {
-                ret = cbor_encode_int(&pins, 1);
+                ret = cbor_encoder_create_array(&map, &pins, 1);
+                check_ret(ret);
+                {
+                    ret = cbor_encode_int(&pins, 1);
+                    check_ret(ret);
+                }
+                ret = cbor_encoder_close_container(&map, &pins);
                 check_ret(ret);
             }
-            ret = cbor_encoder_close_container(&map, &pins);
-            check_ret(ret);
         }
 
 
@@ -295,13 +306,14 @@ uint8_t ctap_get_info(CborEncoder * encoder)
             check_ret(ret);
             ret = cbor_encoder_create_map(&array, &alg, 2);
             check_ret(ret);
-            ret = cbor_encode_text_stringz(&alg, "type");
-            check_ret(ret);
-            ret = cbor_encode_text_stringz(&alg, "public-key");
-            check_ret(ret);
+            /* Canonical key order: "alg" then "type" */
             ret = cbor_encode_text_stringz(&alg, "alg");
             check_ret(ret);
             ret = cbor_encode_int(&alg, -7); // ES256
+            check_ret(ret);
+            ret = cbor_encode_text_stringz(&alg, "type");
+            check_ret(ret);
+            ret = cbor_encode_text_stringz(&alg, "public-key");
             check_ret(ret);
             ret = cbor_encoder_close_container(&array, &alg);
             check_ret(ret);
@@ -630,10 +642,10 @@ static unsigned int get_credential_id_size(int type)
     return sizeof(CredentialId);
 }
 
-static int ctap2_user_presence_test()
+static int ctap2_user_presence_test(int allow_uv_cache)
 {
-    device_set_status(CTAPHID_STATUS_UPNEEDED);
-    int ret = ctap_user_presence_test(CTAP2_UP_DELAY_MS);
+    /* Cache is a GetTouch credit for MakeCredential only. */
+    int ret = ctap_user_presence_test_ex(CTAP2_UP_DELAY_MS, allow_uv_cache);
     if ( ret > 1 )
     {
         return CTAP2_ERR_PROCESSING;
@@ -670,7 +682,7 @@ static int ctap_make_auth_data(struct rpId * rp, CborEncoder * map, uint8_t * au
     if((sizeof(CTAP_authDataHeader)) > *len)
     {
         printf1(TAG_ERR,"assertion fail, auth_data_buf must be at least %d bytes\n", sizeof(CTAP_authData) - sizeof(CTAP_attestHeader));
-        exit(1);
+        return CTAP2_ERR_VENDOR_FIRST;
     }
 
     crypto_sha256_init();
@@ -681,7 +693,7 @@ static int ctap_make_auth_data(struct rpId * rp, CborEncoder * map, uint8_t * au
 
     int but;
 
-    but = ctap2_user_presence_test();
+    but = ctap2_user_presence_test(credInfo != NULL);
     if (CTAP2_ERR_PROCESSING == but)
     {
         authData->head.flags = (0 << 0);        // User presence disabled
@@ -690,12 +702,18 @@ static int ctap_make_auth_data(struct rpId * rp, CborEncoder * map, uint8_t * au
     {
         check_retr(but);
         authData->head.flags = (1 << 0);        // User presence
+        /*
+         * Product: fingerprint presence is also userVerification (GetInfo uv=true).
+         * clientPin UV still sets the same bit when PIN is configured.
+         */
+        authData->head.flags |= (1 << 2);
     }
 
 
     device_set_status(CTAPHID_STATUS_PROCESSING);
 
-    authData->head.flags |= (ctap_is_pin_set() << 2);
+    if (ctap_is_pin_set())
+        authData->head.flags |= (1 << 2);
 
 
     if (credInfo != NULL)
@@ -778,62 +796,71 @@ done_rk:
 
 
 /**
+ * Pack r||s (64 B) into a DER SEQUENCE for ECDSA-Sig-Value (U2F / packed
+ * attStmt). Strips leading zeros and adds the high-bit INTEGER padding so
+ * Chrome's BoringSSL accepts the signature.
  *
- * @param in_sigbuf IN location to deposit signature (must be 64 bytes)
- * @param out_sigder OUT location to deposit der signature (must be 72 bytes)
- * @return length of der signature
- * // FIXME add tests for maximum and minimum length of the input and output
+ * @param in_sigbuf  IN  raw r||s, exactly 64 bytes
+ * @param out_sigder OUT DER signature, buffer must be at least 72 bytes
+ * @return bytes written: 8 in the degenerate all-zero case, at most 72 when
+ *         both INTEGERs need a pad byte (2 + 2 + 33 + 2 + 33).
  */
 int ctap_encode_der_sig(const uint8_t * const in_sigbuf, uint8_t * const out_sigder)
 {
-    // Need to caress into dumb der format ..
-    uint8_t i;
-    uint8_t lead_s = 0;  // leading zeros
-    uint8_t lead_r = 0;
-    for (i=0; i < 32; i++)
-    {
+    int lead_r = 0;
+    int lead_s = 0;
+    int i;
+
+    for (i = 0; i < 32; i++) {
         if (in_sigbuf[i] == 0)
-        {
             lead_r++;
-        }
         else
-        {
             break;
-        }
     }
-
-    for (i=0; i < 32; i++)
-    {
-        if (in_sigbuf[i+32] == 0)
-        {
+    for (i = 0; i < 32; i++) {
+        if (in_sigbuf[i + 32] == 0)
             lead_s++;
-        }
         else
-        {
             break;
-        }
     }
+    /* never strip everything — INTEGER must contain at least one content byte */
+    if (lead_r >= 32)
+        lead_r = 31;
+    if (lead_s >= 32)
+        lead_s = 31;
 
-    int8_t pad_s = ((in_sigbuf[32 + lead_s] & 0x80) == 0x80);
-    int8_t pad_r = ((in_sigbuf[0 + lead_r] & 0x80) == 0x80);
+    int pad_r = ((in_sigbuf[lead_r] & 0x80) != 0) ? 1 : 0;
+    int pad_s = ((in_sigbuf[32 + lead_s] & 0x80) != 0) ? 1 : 0;
+    int r_len = 32 - lead_r + pad_r;
+    int s_len = 32 - lead_s + pad_s;
+    int total = 2 + r_len + 2 + s_len; /* two INTEGER TLVs inside SEQUENCE */
 
-    memset(out_sigder, 0, 72);
+    /*
+     * r_len and s_len are each at most 33 (32 content + 1 pad), so total is at
+     * most 70 and the encoding always fits the 72-byte output buffer. The old
+     * guard clamped total to 70 on overflow, which would have written a length
+     * byte that disagreed with the bytes actually emitted.
+     */
+
     out_sigder[0] = 0x30;
-    out_sigder[1] = 0x44 + pad_s + pad_r - lead_s - lead_r;
+    out_sigder[1] = (uint8_t)total;
 
-    // R ingredient
-    out_sigder[2] = 0x02;
-    out_sigder[3 + pad_r] = 0;
-    out_sigder[3] = 0x20 + pad_r - lead_r;
-    memmove(out_sigder + 4 + pad_r, in_sigbuf + lead_r, 32u - lead_r);
+    int o = 2;
+    out_sigder[o++] = 0x02;
+    out_sigder[o++] = (uint8_t)r_len;
+    if (pad_r)
+        out_sigder[o++] = 0x00;
+    memmove(out_sigder + o, in_sigbuf + lead_r, (size_t)(32 - lead_r));
+    o += 32 - lead_r;
 
-    // S ingredient
-    out_sigder[4 + 32 + pad_r - lead_r] = 0x02;
-    out_sigder[5 + 32 + pad_r + pad_s - lead_r] = 0;
-    out_sigder[5 + 32 + pad_r - lead_r] = 0x20 + pad_s - lead_s;
-    memmove(out_sigder + 6 + 32 + pad_r + pad_s - lead_r, in_sigbuf + 32u + lead_s, 32u - lead_s);
+    out_sigder[o++] = 0x02;
+    out_sigder[o++] = (uint8_t)s_len;
+    if (pad_s)
+        out_sigder[o++] = 0x00;
+    memmove(out_sigder + o, in_sigbuf + 32 + lead_s, (size_t)(32 - lead_s));
+    o += 32 - lead_s;
 
-    return 0x46 + pad_s + pad_r - lead_r - lead_s;
+    return o;
 }
 
 // require load_key prior to this
@@ -956,10 +983,14 @@ uint8_t ctap_make_credential(CborEncoder * encoder, uint8_t * request, int lengt
     CTAP_makeCredential MC;
     int ret;
     unsigned int i;
-    uint8_t auth_data_buf[310];
+    /* Separate signature temps from authData: shared-buffer layout was tight on large cose keys. */
+    uint8_t auth_data_buf[512];
+#if !(defined(CRYPTICK_ATTEST_FMT_NONE) && CRYPTICK_ATTEST_FMT_NONE)
+    uint8_t hashbuf[32];
+    uint8_t sigbuf[64];
+    uint8_t sigder[72];
+#endif
     CTAP_credentialDescriptor * excl_cred = (CTAP_credentialDescriptor *) auth_data_buf;
-    uint8_t * sigbuf = auth_data_buf + 32;
-    uint8_t * sigder = auth_data_buf + 32 + 64;
 
     ret = ctap_parse_make_credential(&MC,encoder,request,length);
 
@@ -970,7 +1001,13 @@ uint8_t ctap_make_credential(CborEncoder * encoder, uint8_t * request, int lengt
     }
     if (MC.pinAuthEmpty)
     {
-        ret = ctap2_user_presence_test();
+        /*
+         * Empty pinAuth is a platform "touch probe" for clientPin-capable keys.
+         * We omit clientPin from GetInfo when no PIN is set so Chrome should not
+         * send this on product builds. If it still appears, complete UV then return
+         * the CTAP2 pin probe status (never map it into a full successful MC).
+         */
+        ret = ctap2_user_presence_test(0);
         check_retr(ret);
         return ctap_is_pin_set() == 1 ? CTAP2_ERR_PIN_AUTH_INVALID : CTAP2_ERR_PIN_NOT_SET;
     }
@@ -1021,7 +1058,7 @@ uint8_t ctap_make_credential(CborEncoder * encoder, uint8_t * request, int lengt
         {
             if ( check_credential_metadata(&excl_cred->credential.id, MC.pinAuthPresent, 1) == 0)
             {
-                ret = ctap2_user_presence_test();
+                ret = ctap2_user_presence_test(0);
                 check_retr(ret);
                 printf1(TAG_MC, "Cred %d failed!\r\n",i);
                 return CTAP2_ERR_CREDENTIAL_EXCLUDED;
@@ -1040,7 +1077,11 @@ uint8_t ctap_make_credential(CborEncoder * encoder, uint8_t * request, int lengt
     {
         ret = cbor_encode_int(&map,RESP_fmt);
         check_ret(ret);
+#if defined(CRYPTICK_ATTEST_FMT_NONE) && CRYPTICK_ATTEST_FMT_NONE
+        ret = cbor_encode_text_stringz(&map, "none");
+#else
         ret = cbor_encode_text_stringz(&map, "packed");
+#endif
         check_ret(ret);
     }
 
@@ -1070,12 +1111,26 @@ uint8_t ctap_make_credential(CborEncoder * encoder, uint8_t * request, int lengt
         check_ret(ret);
     }
 
+#if defined(CRYPTICK_ATTEST_FMT_NONE) && CRYPTICK_ATTEST_FMT_NONE
+    /* Empty attStmt map — small, reliable CTAPHID multi-frame writeback. */
+    {
+        CborEncoder empty;
+        ret = cbor_encode_int(&map, RESP_attStmt);
+        check_ret(ret);
+        ret = cbor_encoder_create_map(&map, &empty, 0);
+        check_ret(ret);
+        ret = cbor_encoder_close_container(&map, &empty);
+        check_ret(ret);
+    }
+#else
     crypto_ecc256_load_attestation_key();
-    int sigder_sz = ctap_calculate_signature(auth_data_buf, auth_data_sz, MC.clientDataHash, auth_data_buf, sigbuf, sigder, COSE_ALG_ES256);
+    int sigder_sz = ctap_calculate_signature(auth_data_buf, auth_data_sz, MC.clientDataHash,
+                                             hashbuf, sigbuf, sigder, COSE_ALG_ES256);
     printf1(TAG_MC,"der sig [%d]: ", sigder_sz); dump_hex1(TAG_MC, sigder, sigder_sz);
 
     ret = ctap_add_attest_statement(&map, sigder, sigder_sz);
     check_retr(ret);
+#endif
 
     ret = cbor_encoder_close_container(encoder, &map);
     check_ret(ret);
@@ -1868,7 +1923,7 @@ uint8_t ctap_get_assertion(CborEncoder * encoder, uint8_t * request, int length)
 
     if (GA.pinAuthEmpty)
     {
-        ret = ctap2_user_presence_test();
+        ret = ctap2_user_presence_test(0);
         check_retr(ret);
         return ctap_is_pin_set() == 1 ? CTAP2_ERR_PIN_AUTH_INVALID : CTAP2_ERR_PIN_NOT_SET;
     }
@@ -1956,6 +2011,9 @@ uint8_t ctap_get_assertion(CborEncoder * encoder, uint8_t * request, int length)
         device_disable_up(false);
         check_retr(ret);
 
+        /* UP via fingerprint counts as product UV even without clientPin. */
+        if (getAssertionState.buf.authData.flags & 0x01)
+            getAssertionState.user_verified = 1;
         getAssertionState.buf.authData.flags &= ~(1 << 2);
         getAssertionState.buf.authData.flags |= (getAssertionState.user_verified << 2);
 
@@ -2119,9 +2177,7 @@ uint8_t ctap_update_pin_if_verified(uint8_t * pinEnc, int len, uint8_t * platfor
     }
 
 //      set new PIN (update and store PIN_CODE_HASH)
-    ctap_update_pin(pinEnc, ret);
-
-    return 0;
+    return ctap_update_pin(pinEnc, ret);
 }
 
 uint8_t ctap_add_pin_if_verified(uint8_t * pinTokenEnc, uint8_t * platform_pubkey, uint8_t * pinHashEnc)
@@ -2360,9 +2416,9 @@ uint8_t ctap_request(uint8_t * pkt_raw, int length, CTAP_RESPONSE * resp)
     {
         case CTAP_MAKE_CREDENTIAL:
             printf1(TAG_CTAP,"CTAP_MAKE_CREDENTIAL\n");
-            timestamp();
+            solo_timestamp();
             status = ctap_make_credential(&encoder, pkt_raw, length);
-            printf1(TAG_TIME,"make_credential time: %d ms\n", timestamp());
+            printf1(TAG_TIME,"make_credential time: %d ms\n", solo_timestamp());
 
             resp->length = cbor_encoder_get_buffer_size(&encoder, buf);
             dump_hex1(TAG_DUMP, buf, resp->length);
@@ -2370,9 +2426,9 @@ uint8_t ctap_request(uint8_t * pkt_raw, int length, CTAP_RESPONSE * resp)
             break;
         case CTAP_GET_ASSERTION:
             printf1(TAG_CTAP,"CTAP_GET_ASSERTION\n");
-            timestamp();
+            solo_timestamp();
             status = ctap_get_assertion(&encoder, pkt_raw, length);
-            printf1(TAG_TIME,"get_assertion time: %d ms\n", timestamp());
+            printf1(TAG_TIME,"get_assertion time: %d ms\n", solo_timestamp());
 
             resp->length = cbor_encoder_get_buffer_size(&encoder, buf);
 
@@ -2384,20 +2440,20 @@ uint8_t ctap_request(uint8_t * pkt_raw, int length, CTAP_RESPONSE * resp)
             break;
         case CTAP_GET_INFO:
             printf1(TAG_CTAP,"[CTAP] GET_INFO\n");
-            device_set_status(CTAPHID_STATUS_PROCESSING);
+            /* Probe only — never drive Place-finger / Working / success UI. */
             status = ctap_get_info(&encoder);
             resp->length = cbor_encoder_get_buffer_size(&encoder, buf);
             break;
 
         case CTAP_CLIENT_PIN:
             printf1(TAG_CTAP,"[CTAP] CLIENT_PIN\n");
-            device_set_status(CTAPHID_STATUS_PROCESSING);
+            /* PIN probes (getRetries / getKeyAgreement) are not a ceremony. */
             status = ctap_client_pin(&encoder, pkt_raw, length);
             resp->length = cbor_encoder_get_buffer_size(&encoder, buf);
             break;
         case CTAP_RESET:
             printf1(TAG_CTAP,"CTAP_RESET\n");
-            status = ctap2_user_presence_test();
+            status = ctap2_user_presence_test(0);
             if (status == CTAP1_ERR_SUCCESS)
             {
                 ctap_reset();
@@ -2437,9 +2493,12 @@ uint8_t ctap_request(uint8_t * pkt_raw, int length, CTAP_RESPONSE * resp)
 
 done:
     getAssertionState.lastcmd = cmd;
-    
-    // Set IDLE status
-    device_set_status(CTAPHID_STATUS_IDLE);
+
+    /*
+     * Do NOT set IDLE here — CTAPHID still must stream the multi-frame reply.
+     * ctaphid_handle_packet sets IDLE after ctaphid_write completes so the
+     * browser is not left waiting with an incomplete CBOR body while OLED OK.
+     */
 
     if (status != CTAP1_ERR_SUCCESS)
     {
@@ -2470,7 +2529,8 @@ static void ctap_state_init()
 
     if (ctap_generate_rng(STATE.PIN_SALT, sizeof(STATE.PIN_SALT)) != 1) {
         printf2(TAG_ERR, "Error, rng failed\n");
-        exit(1);
+        /* Cannot produce a safe authenticator state; reboot instead of exit(). */
+        device_reboot();
     }
 
     printf1(TAG_STOR, "Generated PIN SALT: ");
@@ -2530,7 +2590,8 @@ void ctap_init()
     if (ctap_generate_rng(PIN_TOKEN, PIN_TOKEN_SIZE) != 1)
     {
         printf2(TAG_ERR,"Error, rng failed\n");
-        exit(1);
+        /* Cannot produce a safe authenticator state; reboot instead of exit(). */
+        device_reboot();
     }
 
     ctap_reset_key_agreement();
@@ -2552,13 +2613,18 @@ uint8_t ctap_is_pin_set()
  * Globals: STATE
  * @param pin new PIN (raw)
  * @param len pin array length
+ * @return 0 on success, CTAP2_ERR_PIN_POLICY_VIOLATION on a bad length
+ *
+ * Callers already range-check the length, so this is a backstop. It must not
+ * abort the process: on a token, that is a host-triggerable reset rather than
+ * a rejected request.
  */
-void ctap_update_pin(uint8_t * pin, int len)
+uint8_t ctap_update_pin(uint8_t * pin, int len)
 {
-    if (len >= NEW_PIN_ENC_MIN_SIZE || len < 4)
+    if (len >= NEW_PIN_ENC_MIN_SIZE || len < NEW_PIN_MIN_SIZE)
     {
         printf2(TAG_ERR, "Update pin fail length\n");
-        exit(1);
+        return CTAP2_ERR_PIN_POLICY_VIOLATION;
     }
 
     crypto_sha256_init();
@@ -2577,6 +2643,7 @@ void ctap_update_pin(uint8_t * pin, int len)
     authenticator_write_state(&STATE);
 
     printf1(TAG_CTAP, "New pin hash set.\n");
+    return 0;
 }
 
 uint8_t ctap_decrement_pin_attempts()
@@ -2739,7 +2806,8 @@ void ctap_reset()
     if (ctap_generate_rng(PIN_TOKEN, PIN_TOKEN_SIZE) != 1)
     {
         printf2(TAG_ERR,"Error, rng failed\n");
-        exit(1);
+        /* Cannot produce a safe authenticator state; reboot instead of exit(). */
+        device_reboot();
     }
 
     ctap_reset_state();

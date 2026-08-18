@@ -1,64 +1,74 @@
-# Tests
+# Cryptick Token — testing framework
 
-Multi-layer framework for Cryptick Token.
+Four layers. **CI always runs L0 + product `pio run`.** Device L2 is bench-local.
 
-## Layers
+| Layer | Name | Tool | When |
+|-------|------|------|------|
+| **L0** | Host pure | `pytest tests/host` | Every commit / CI |
+| **L1** | On-device Unity | `pio test -e test_*` | Board; or compile-only in `scripts/run_all_tests.sh` |
 
-| Layer | When | Tooling | Path |
-|-------|------|---------|------|
-| **L0 Host** | Every PR / every commit locally | `pytest` | `tests/host/` |
-| **L1 Device Unity** | Board attached | PlatformIO Unity | `test/test_*/` |
-| **L2 Integration** | Hardware bench | Python hidapi scripts | `scripts/tests/` |
-| **L3 Acceptance** | Release | checklists | `docs/MAC_LOGIN.md`, WebAuthn manual |
+| **L2** | Hardware integration | `pytest tests/device --device` | Product USB `1209:BEEE` attached |
+| **L3** | Acceptance | Manual + scripts | Release / WebAuthn |
 
-Shared vectors: `tests/vectors/` (L0 and L1 should stay aligned).
-
-## L0 — host (no board)
+## Quick commands
 
 ```bash
-pip install -r tests/requirements.txt
+# L0 only (what CI installs — pure Python, no USB libs)
+pip install -r tests/requirements-host.txt
 pytest tests/host -q
-# or
-scripts/ci/run_host_tests.sh
+
+# Full bench install (adds pyserial + hidapi + fido2 for L2/L3)
+pip install -r tests/requirements.txt
+
+# L0 + L1 compile + L2 (skips if no board)
+chmod +x scripts/run_all_tests.sh
+./scripts/run_all_tests.sh
+
+# L2 only — require hardware (fail if missing)
+./scripts/run_device_tests.sh
+# or:
+pytest tests/device -v --device
+pytest tests/device --port /dev/cu.usbmodemCRYPTICK2 --device
 ```
 
-Covers RFC 6238 TOTP, OATH TLV/APDU shape, PIV SELECT AID builders.
+## L2 design notes
 
-## L1 — device Unity
+- CDC open **must assert DTR** on macOS TinyUSB or the DATA interface is silent.
+- Helpers: `tests/support/cryptick_usb.py`, `cryptick_ctaphid.py` (LIST/PUT/DELETE/CALCULATE, CTAP2 GetInfo).
+- OATH lifecycle (`test_hid_oath_lifecycle.py`): place finger when OLED shows **Manage** / **Code** if templates exist.
+- CTAP2 GetInfo: `test_hid_ctap2_getinfo.py`. Host register/assert: `scripts/tests/webauthn_ctap2_smoke.py` (see `docs/WEBAUTHN_L3.md`).
+- Markers: `@pytest.mark.device`.
+- Without a board attached, L2 **skips**; it never errors at collection. Missing
+  `pyserial`/`hidapi` also skips, so a host-only checkout stays green.
+
+## Shared helpers — do not re-implement
+
+`tests/support/` is the single source of truth for talking to the device, and
+the ad-hoc scripts under `scripts/tests/` import from it rather than carrying
+their own copy of the framing:
+
+| Module | Provides |
+| --- | --- |
+| `cryptick_ctaphid.py` | HID open, CTAPHID INIT/send, OATH APDU + TLV builders, CTAP2 GetInfo |
+| `cryptick_usb.py` | Product CDC discovery, DTR-correct open, console command helper |
+| `totp_secret_enc.py` | AES-GCM blob format mirror for host-side assertions |
+
+A drifted second copy of CTAPHID framing is how the earlier smoke scripts ended
+up silently broken. Add to these modules instead.
+
+## Post-flash smoke
 
 ```bash
-pio test -e test_event_bus
-pio test -e test_totp
-pio test -e test_fp_enroll
+python scripts/post_flash_check.py /dev/cu.usbmodemCRYPTICK2
+python scripts/serial_smoke.py
 ```
 
-Test envs force `ARDUINO_USB_MODE=1` and disable LTO. **Do not** use product env `esp32-s3-n16r8` for Unity.
-
-| Path | Covers | Env |
-|------|--------|-----|
-| `test_totp/` | Base32 + TOTP | `test_totp` |
-| `test_event_bus/` | Event ring | `test_event_bus` |
-| `test_fp_enroll/` | Enroll mock Stream | `test_fp_enroll` |
-
-## L2 — hardware HID
-
-```bash
-python scripts/tests/hid_fido_init.py    # CTAPHID_INIT, skip if no device
-python scripts/tests/hid_oath_smoke.py   # OATH LIST
-```
-
-Requires `pip install hid` and a board showing VID `1209` PID `BEEE`. **Never** enable ENTERBOOT in CI.
+Expect button map `RIGHT=5 DOWN=4 UP=7 LEFT=6 CENTER=15` after a full boot capture.
 
 ## Product firmware
 
 ```bash
-pio run -e esp32-s3-n16r8
-# upload…
-python scripts/post_flash_check.py COMxx
+pio run -e esp32-s3-n16r8 -t upload
+# recovery from JTAG:
+./scripts/flash_product_usb.sh
 ```
-
-## CI
-
-`.github/workflows/ci.yml` runs **L0 pytest** + **`pio run -e esp32-s3-n16r8`**.
-
-Channel model: HID = FIDO + OATH + ENTERBOOT; CDC = logs — see `docs/HID_HOST.md`.

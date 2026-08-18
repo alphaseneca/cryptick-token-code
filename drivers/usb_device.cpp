@@ -1,23 +1,24 @@
 #include "usb_device.h"
+#include <cryptick_log.h>
 #include <string.h>
+#include <Arduino.h>
+#include "cryptick_console.h"
 
-#ifdef ESP32
+/*
+ * Product USB:
+ *  ARDUINO_USB_MODE=0 — ESP32 Arduino TinyUSB (CDC + FIDO HID), VID 0x1209 PID 0xBEEE.
+ *  ARDUINO_USB_MODE=1 — USB Serial/JTAG (Espressif VID 303A) lab fallback only.
+ *
+ * Reflash paths (MODE=0, no BOOT pads):
+ *  1) CDC: host 1200 bps open/close (Arduino enableReboot) → ROM USB download
+ *  2) CLI: type BOOTLOADER → usb_persist_restart(RESTART_BOOTLOADER)
+ *  3) HID: CTAPHID ENTERBOOT → same
+ *  4) CH340 UART esptool if wired
+ */
+
+#if defined(CRYPTICK_USB_STACK) && CRYPTICK_USB_STACK
+
 #include "USB.h"
-#include "esp32-hal-tinyusb.h"
-#endif
-
-/*
- * Prefer class headers; keep tusb API from ESP32 core stack.
- * Umbrella Adafruit_TinyUSB.h pulls MSC headers (SdFat dependency) — avoid it.
- */
-#include "arduino/Adafruit_USBD_CDC.h"
-#include "arduino/hid/Adafruit_USBD_HID.h"
-#include "tusb.h"
-
-/*
- * Single CDC + FIDO HID. Product registers one CDC interface at runtime.
- * VID/PID set via USB API (avoid build-flag clash with board pins_arduino).
- */
 
 #ifndef CRYPTICK_USB_VID
 #define CRYPTICK_USB_VID 0x1209
@@ -26,14 +27,14 @@
 #define CRYPTICK_USB_PID 0xBEEE
 #endif
 
-static Adafruit_USBD_HID _usb_hid;
-Stream &USBLog = Serial;
+#if defined(ARDUINO_USB_MODE) && (ARDUINO_USB_MODE == 0)
 
-#define HID_RX_QUEUE_SIZE 12
-static uint8_t _rx_queue[HID_RX_QUEUE_SIZE][64];
-static volatile uint8_t _rx_head = 0;
-static volatile uint8_t _rx_tail = 0;
+#include "USBHID.h"
+#include "USBCDC.h"
+#include "esp32-hal-tinyusb.h"
+#include "tusb.h"
 
+/* FIDO CTAPHID: FIDO Alliance usage page, 64-byte in/out (no Report ID) */
 static const uint8_t hid_report_descriptor[] = {
     0x06, 0xD0, 0xF1,
     0x09, 0x01,
@@ -53,48 +54,123 @@ static const uint8_t hid_report_descriptor[] = {
     0xC0
 };
 
-static void _hid_report_callback(uint8_t report_id, hid_report_type_t report_type,
-                                 uint8_t const *buffer, uint16_t bufsize)
-{
-    (void)report_id;
-    if (report_type == HID_REPORT_TYPE_OUTPUT && bufsize == 64) {
-        uint8_t next = (uint8_t)((_rx_head + 1) % HID_RX_QUEUE_SIZE);
-        if (next != _rx_tail) {
-            memcpy(_rx_queue[_rx_head], buffer, 64);
-            _rx_head = next;
+/*
+ * OUT reports arrive on the TinyUSB task and are drained by the Arduino loop,
+ * so the ring indices need a spinlock rather than bare `volatile`.
+ */
+#define HID_RX_QUEUE_SIZE 24
+static uint8_t _rx_queue[HID_RX_QUEUE_SIZE][64];
+static uint8_t _rx_head = 0;
+static uint8_t _rx_tail = 0;
+static portMUX_TYPE _rx_mux = portMUX_INITIALIZER_UNLOCKED;
+static volatile uint32_t _rx_drops = 0;
+static SemaphoreHandle_t _usb_mutex = NULL;
+
+static USBHID _hid;
+
+class CryptickFidoHid : public USBHIDDevice {
+public:
+    CryptickFidoHid()
+    {
+        static bool added = false;
+        if (!added) {
+            added = true;
+            _hid.addDevice(this, sizeof(hid_report_descriptor));
         }
+    }
+
+    void begin(void) { _hid.begin(); }
+    bool ready(void) { return _hid.ready(); }
+
+    uint16_t _onGetDescriptor(uint8_t *buffer) override
+    {
+        memcpy(buffer, hid_report_descriptor, sizeof(hid_report_descriptor));
+        return sizeof(hid_report_descriptor);
+    }
+
+    void _onOutput(uint8_t report_id, const uint8_t *buffer, uint16_t len) override
+    {
+        (void)report_id;
+        if (!buffer || len < 64)
+            return;
+        portENTER_CRITICAL(&_rx_mux);
+        uint8_t next = (uint8_t)((_rx_head + 1) % HID_RX_QUEUE_SIZE);
+        if (next == _rx_tail) {
+            /* Dropping a CTAPHID frame strands the transaction; make it visible. */
+            _rx_drops++;
+            portEXIT_CRITICAL(&_rx_mux);
+            return;
+        }
+        memcpy(_rx_queue[_rx_head], buffer, 64);
+        _rx_head = next;
+        portEXIT_CRITICAL(&_rx_mux);
+    }
+
+    /* IN reports go through usb_hid_send_report / _try (ready-gated TinyUSB). */
+};
+
+static CryptickFidoHid _fido_hid;
+/* Own CDC instance — CDC_ON_BOOT=0 so HID can register before USB.begin(). */
+static USBCDC _cdc(0);
+Stream &USBLog = _cdc;
+
+static void usb_cdc_event(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
+{
+    (void)arg;
+    (void)event_base;
+    (void)event_data;
+    if (event_id == ARDUINO_USB_CDC_CONNECTED_EVENT) {
+        /* Host open/DTR — re-state product path so tests/monitors catch lines */
+        CryptickLog.println();
+        CLOG_I("USB", "CDC host connected");
+        CLOG_I("USB", "TinyUSB product CDC+HID  VID=0x1209 PID=0xBEEE");
+        CLOG_I("USB", "reflash: 1200bps | BOOTLOADER | HID ENTERBOOT");
+        CryptickLog.print(F("cryptick> "));
+        CryptickLog.flush();
     }
 }
 
 void usb_device_init(void)
 {
-#ifdef ESP32
+    if (!_usb_mutex)
+        _usb_mutex = xSemaphoreCreateMutex();
+
+    /* Variant pins_arduino sets USB_VID/USB_PID before app_main USB defaults. */
     USB.manufacturerName(USB_MANUFACTURER);
     USB.productName(USB_PRODUCT);
     USB.VID(CRYPTICK_USB_VID);
     USB.PID(CRYPTICK_USB_PID);
-#endif
+    USB.serialNumber("CRYPTICK");
 
-    _usb_hid.setPollInterval(5);
-    _usb_hid.setReportDescriptor(hid_report_descriptor, sizeof(hid_report_descriptor));
-    _usb_hid.setReportCallback(NULL, _hid_report_callback);
-    _usb_hid.begin();
-
-#ifdef ESP32
+    /*
+     * Descriptor order for product composite (Arduino-ESP32 TinyUSB):
+     *   HID + CDC instances register → USB.begin() binds OTG stack.
+     * CDC_ON_BOOT must be 0 so we own the CDC instance (product console).
+     */
+    _fido_hid.begin();
+    _cdc.onEvent(usb_cdc_event);
+    _cdc.begin(115200);
+    _cdc.setTxTimeoutMs(0);
+    _cdc.enableReboot(true); /* PlatformIO/esptool 1200 bps → ROM download */
     USB.begin();
-#endif
 
-    Serial.begin(115200);
-
-    /* Short wait only — never block boot (OLED / buttons must still work). */
     uint32_t t0 = (uint32_t)millis();
-    while ((uint32_t)millis() - t0 < 800) {
-        if (Serial || (tud_inited() && tud_mounted()))
+    while ((uint32_t)millis() - t0 < 2500) {
+        if (tud_inited() && tud_mounted())
             break;
         delay(10);
         yield();
     }
-    delay(30);
+    delay(50);
+
+    CLOG_I("USB", "TinyUSB product CDC+HID");
+    CLOG_I("USB", "VID=0x%04X PID=0x%04X mounted=%d cdc=%d",
+                       CRYPTICK_USB_VID, CRYPTICK_USB_PID,
+                       (tud_inited() && tud_mounted()) ? 1 : 0,
+                       _cdc ? 1 : 0);
+    CLOG_I("USB", "host: 1209:BEEE CDC@115200 + FIDO HID");
+    CLOG_I("USB", "reflash: 1200bps | BOOTLOADER | HID ENTERBOOT");
+    CryptickLog.flush();
 }
 
 bool usb_device_mounted(void)
@@ -104,64 +180,221 @@ bool usb_device_mounted(void)
 
 void usb_device_enter_bootloader(void)
 {
-#ifdef ESP32
-    Serial.println(F("[USB] Entering ROM download mode..."));
-    Serial.flush();
-    delay(50);
+    CLOG_I("USB", "→ ROM USB download (CDC+JTAG PHY)");
+    CryptickLog.flush();
+    delay(80);
+    /*
+     * Espressif: leave TinyUSB product mode and restart into download so the
+     * host sees Espressif Serial/JTAG (303A) for esptool.
+     */
     usb_persist_restart(RESTART_BOOTLOADER);
-    Serial.println(F("[USB] bootloader restart failed"));
-#endif
+    CLOG_E("USB", "bootloader restart failed");
 }
 
 void usb_device_poll_bootloader(void)
 {
-#ifdef ESP32
-    if (!tud_inited() || !tud_mounted())
-        return;
-    if (!tud_cdc_n_connected(0)) {
-        cdc_line_coding_t coding;
-        tud_cdc_n_get_line_coding(0, &coding);
-        if (coding.bit_rate == 1200)
-            usb_persist_restart(RESTART_BOOTLOADER);
-    }
-#endif
+    /*
+     * Bootloader entry is USBCDC enableReboot (host open/close at 1200 bps)
+     * or BOOTLOADER CLI / HID ENTERBOOT → usb_device_enter_bootloader().
+     *
+     * Do not force ROM based on stale line-coding=1200 while still connected:
+     * that ejects the product CDC after host monitor probes and stranding
+     * the board as 303A:1001 until a JTAG reflash.
+     */
 }
 
-extern "C" void __wrap_TinyUSB_Port_EnterDFU(void)
+
+bool usb_hid_read_report(uint8_t buffer[64])
 {
-#ifdef ESP32
-    usb_persist_restart(RESTART_BOOTLOADER);
-#endif
+    bool got = false;
+    portENTER_CRITICAL(&_rx_mux);
+    if (_rx_head != _rx_tail) {
+        memcpy(buffer, _rx_queue[_rx_tail], 64);
+        _rx_tail = (uint8_t)((_rx_tail + 1) % HID_RX_QUEUE_SIZE);
+        got = true;
+    }
+    portEXIT_CRITICAL(&_rx_mux);
+
+    static uint32_t reported_drops = 0;
+    uint32_t drops = _rx_drops;
+    if (drops != reported_drops) {
+        reported_drops = drops;
+        CLOG_W("USB", "HID OUT queue full — dropped %lu report(s)",
+               (unsigned long)drops);
+    }
+    return got;
+}
+
+/*
+ * HID IN via TinyUSB ready + tud_hid_n_report — not USBHID::SendReport().
+ *
+ * Arduino SendReport() waits on a completion semaphore; on timeout the xfer is
+ * often still in flight, then outer retries re-submit the same 64B when ready()
+ * flips → duplicate CONT frames or multi-second nested waits (8×400×250 + 3s).
+ * Keepalives using that path starve the ~670B U2F_REGISTER writeback (~12 frames).
+ *
+ * Model: at most one outstanding IN; next frame waits until ready again.
+ */
+static bool hid_wait_ready(uint32_t deadline_ms)
+{
+    while ((uint32_t)millis() < deadline_ms) {
+        if (tud_inited() && tud_mounted() && tud_hid_n_ready(0))
+            return true;
+        vTaskDelay(pdMS_TO_TICKS(1));
+        yield();
+    }
+    return tud_inited() && tud_mounted() && tud_hid_n_ready(0);
+}
+
+bool usb_hid_try_send_report(const uint8_t buffer[64])
+{
+    if (!buffer || !_usb_mutex)
+        return false;
+    if (!tud_inited() || !tud_mounted() || !tud_hid_n_ready(0))
+        return false;
+    if (xSemaphoreTake(_usb_mutex, 0) != pdTRUE)
+        return false;
+
+    bool ok = false;
+    if (tud_hid_n_ready(0))
+        ok = tud_hid_n_report(0, 0, buffer, 64);
+
+    xSemaphoreGive(_usb_mutex);
+    return ok;
+}
+
+bool usb_hid_send_report(const uint8_t buffer[64])
+{
+    /*
+     * The mutex is created once in usb_device_init(), before the FIDO task
+     * exists. Creating it lazily here raced two callers into two mutexes.
+     */
+    if (!buffer || !_usb_mutex)
+        return false;
+
+    /*
+     * Reliable path: wait free → one submit → wait free again (ordered multi-frame).
+     * After successful submit never retransmit this buffer even if host is slow;
+     * next call blocks on ready first.
+     */
+    const uint32_t budget_ms = 600u;
+    uint32_t t0 = (uint32_t)millis();
+
+    if (xSemaphoreTake(_usb_mutex, pdMS_TO_TICKS(budget_ms)) != pdTRUE)
+        return false;
+
+    if (!hid_wait_ready(t0 + 400u)) {
+        xSemaphoreGive(_usb_mutex);
+        return false;
+    }
+
+    if (!tud_hid_n_report(0, 0, buffer, 64)) {
+        xSemaphoreGive(_usb_mutex);
+        return false;
+    }
+
+    /* Host IN completion (1 ms poll typical). Soft wait — do not re-submit. */
+    (void)hid_wait_ready(t0 + budget_ms);
+
+    xSemaphoreGive(_usb_mutex);
+    return true;
+}
+
+#else /* ARDUINO_USB_MODE == 1: USB Serial/JTAG CDC — lab fallback */
+
+Stream &USBLog = Serial;
+
+void usb_device_init(void)
+{
+    Serial.begin(115200);
+    Serial.setTxTimeoutMs(0);
+    uint32_t t0 = (uint32_t)millis();
+    while ((uint32_t)millis() - t0 < 1200) {
+        if (Serial)
+            break;
+        delay(10);
+        yield();
+    }
+    delay(50);
+    CLOG_I("USB", "Serial/JTAG CDC (MODE=1 lab) — no FIDO HID");
+    CLOG_I("USB", "Product path: build esp32-s3-n16r8 (MODE=0)");
+    CryptickLog.flush();
+}
+
+bool usb_device_mounted(void)
+{
+    return (bool)Serial;
+}
+
+void usb_device_enter_bootloader(void)
+{
+    CLOG_I("USB", "MODE=1 — restart (use esptool --before usb_reset)");
+    CryptickLog.flush();
+    delay(30);
+    esp_restart();
+}
+
+void usb_device_poll_bootloader(void)
+{
 }
 
 bool usb_hid_read_report(uint8_t buffer[64])
 {
-    if (_rx_head != _rx_tail) {
-        memcpy(buffer, _rx_queue[_rx_tail], 64);
-        _rx_tail = (uint8_t)((_rx_tail + 1) % HID_RX_QUEUE_SIZE);
-        return true;
-    }
+    (void)buffer;
     return false;
 }
-
-static SemaphoreHandle_t _usb_mutex = NULL;
 
 bool usb_hid_send_report(const uint8_t buffer[64])
 {
-    if (!_usb_mutex)
-        _usb_mutex = xSemaphoreCreateMutex();
-
-    uint32_t timeout = (uint32_t)millis() + 50;
-    while ((uint32_t)millis() < timeout) {
-        if (_usb_hid.ready()) {
-            if (xSemaphoreTake(_usb_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                bool success = _usb_hid.sendReport(0, buffer, 64);
-                xSemaphoreGive(_usb_mutex);
-                if (success)
-                    return true;
-            }
-        }
-        yield();
-    }
+    (void)buffer;
     return false;
 }
+
+bool usb_hid_try_send_report(const uint8_t buffer[64])
+{
+    (void)buffer;
+    return false;
+}
+
+#endif /* ARDUINO_USB_MODE */
+
+#else /* !CRYPTICK_USB_STACK */
+
+Stream &USBLog = Serial;
+
+void usb_device_init(void)
+{
+    Serial.begin(115200);
+    Serial.setTxTimeoutMs(0);
+    delay(200);
+}
+
+bool usb_device_mounted(void) { return false; }
+
+void usb_device_enter_bootloader(void)
+{
+    CLOG_I("USB", "stack off — flash with esptool + hard_reset");
+    CryptickLog.flush();
+}
+
+void usb_device_poll_bootloader(void) {}
+
+bool usb_hid_read_report(uint8_t buffer[64])
+{
+    (void)buffer;
+    return false;
+}
+
+bool usb_hid_send_report(const uint8_t buffer[64])
+{
+    (void)buffer;
+    return false;
+}
+
+bool usb_hid_try_send_report(const uint8_t buffer[64])
+{
+    (void)buffer;
+    return false;
+}
+
+#endif /* CRYPTICK_USB_STACK */

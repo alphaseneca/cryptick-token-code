@@ -67,7 +67,9 @@ void set_logging_mask(uint32_t mask);
 
 #define dump_hex1(tag,data,len) LOG_HEX(tag,data,len)
 
-uint32_t timestamp();
+/** Solo timing helper — never #define as timestamp() (clashes with RTClib). */
+uint32_t solo_timestamp_ms(void);
+#define solo_timestamp() solo_timestamp_ms()
 
 #else
 
@@ -76,7 +78,7 @@ uint32_t timestamp();
 #define printf2(tag,fmt, ...)
 #define printf3(tag,fmt, ...)
 #define dump_hex1(tag,data,len)
-#define timestamp()
+#define solo_timestamp() ((uint32_t)0)
 
 #endif
 

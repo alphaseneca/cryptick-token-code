@@ -3,13 +3,15 @@
  * Transport is CTAPHID_CRYPTICK_OATH (0xE3), not CCID OATH class.
  */
 #include "cryptick_oath_hid.h"
+#include "oath_ops.h"
+#include "credential_store.h"
 #include "totp_storage.h"
 #include "totp.h"
 #include "device.h"
-#include <RTClib.h>
 #include <string.h>
 #include <vector>
 #include <Arduino.h>
+#include <cryptick_log.h>
 
 /* YKOATH instruction set (subset) + Cryptick extensions */
 #define OATH_INS_PUT          0x01
@@ -33,10 +35,6 @@
 #define SW_INS_NOT_SUPPORTED  0x6D00
 #define SW_CONDITIONS         0x6985
 #define SW_NO_SPACE           0x6A84
-
-#define OATH_MAX_NAME 64
-#define OATH_MAX_SECRET 64
-#define OATH_MAX_CREDS 32
 
 static void write_sw(uint8_t *resp, uint16_t *rlen, uint16_t sw)
 {
@@ -74,111 +72,7 @@ static const uint8_t *tlv_find(const uint8_t *data, uint16_t len, uint8_t tag,
     return NULL;
 }
 
-static int find_by_name(const std::vector<TOTPCredential> &creds, const char *name)
-{
-    for (size_t i = 0; i < creds.size(); i++) {
-        String display = creds[i].issuer.length()
-            ? (creds[i].issuer + ":" + creds[i].label)
-            : creds[i].label;
-        if (display == name || creds[i].label == name)
-            return (int)i;
-    }
-    return -1;
-}
-
-static String url_decode(const String &s)
-{
-    String out;
-    for (int i = 0; i < (int)s.length(); i++) {
-        char c = s[i];
-        if (c == '+')
-            out += ' ';
-        else if (c == '%' && i + 2 < (int)s.length()) {
-            auto hex = [](char ch) -> int {
-                if (ch >= '0' && ch <= '9') return ch - '0';
-                if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
-                if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
-                return 0;
-            };
-            out += (char)((hex(s[i + 1]) << 4) | hex(s[i + 2]));
-            i += 2;
-        } else
-            out += c;
-    }
-    return out;
-}
-
-static bool parse_otpauth(const char *uri, size_t uri_len, TOTPCredential &out)
-{
-    String u;
-    for (size_t i = 0; i < uri_len; i++)
-        u += uri[i];
-    u.trim();
-    if (u.startsWith("otp://"))
-        u = "otpauth://" + u.substring(6);
-    if (!u.startsWith("otpauth://totp/"))
-        return false;
-    int pathStart = 14;
-    int q = u.indexOf('?');
-    String path = (q >= 0) ? u.substring(pathStart, q) : u.substring(pathStart);
-    String query = (q >= 0) ? u.substring(q + 1) : "";
-    path = url_decode(path);
-    int colon = path.indexOf(':');
-    if (colon >= 0) {
-        out.issuer = path.substring(0, colon);
-        out.label = path.substring(colon + 1);
-    } else {
-        out.issuer = "";
-        out.label = path;
-    }
-    out.secret = "";
-    out.digits = 6;
-    out.period = 30;
-    out.algorithm = "SHA1";
-    for (int i = 0; i < (int)query.length();) {
-        int amp = query.indexOf('&', i);
-        String pair = (amp >= 0) ? query.substring(i, amp) : query.substring(i);
-        i = (amp >= 0) ? amp + 1 : query.length();
-        int eq = pair.indexOf('=');
-        if (eq < 0) continue;
-        String key = pair.substring(0, eq);
-        String val = url_decode(pair.substring(eq + 1));
-        if (key == "secret") out.secret = val;
-        else if (key == "issuer" && val.length()) out.issuer = val;
-        else if (key == "digits") out.digits = val.toInt() ? val.toInt() : 6;
-        else if (key == "period") out.period = val.toInt() ? val.toInt() : 30;
-        else if (key == "algorithm" && val.length()) out.algorithm = val;
-    }
-    out.algorithm.toUpperCase();
-    if (out.algorithm != "SHA1")
-        return false;
-    if (out.digits != 6 || out.period != 30)
-        return false;
-    uint8_t tmp[64];
-    return totp_base32_decode(out.secret.c_str(), tmp, sizeof(tmp)) > 0;
-}
-
-/** Binary secret → base32 for storage (uppercase, no padding). */
-static String secret_to_base32(const uint8_t *sec, uint8_t seclen)
-{
-    static const char *alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
-    String out;
-    int buffer = 0, bitsLeft = 0;
-    for (uint8_t i = 0; i < seclen; i++) {
-        buffer = (buffer << 8) | sec[i];
-        bitsLeft += 8;
-        while (bitsLeft >= 5) {
-            out += alphabet[(buffer >> (bitsLeft - 5)) & 0x1F];
-            bitsLeft -= 5;
-        }
-    }
-    if (bitsLeft > 0)
-        out += alphabet[(buffer << (5 - bitsLeft)) & 0x1F];
-    return out;
-}
-
 extern std::vector<TOTPCredential> credentials;
-extern RTC_DS3231 rtc;
 
 int cryptick_oath_hid_handle(const uint8_t *req, uint16_t req_len,
                              uint8_t *resp, uint16_t *resp_len)
@@ -194,10 +88,12 @@ int cryptick_oath_hid_handle(const uint8_t *req, uint16_t req_len,
 
     uint8_t cla = req[0];
     uint8_t ins = req[1];
-    /* P1, P2 reserved; MVP ignores values if zero-ish */
     (void)req[2];
     (void)req[3];
+    CLOG_D("OATH", "APDU CLA=%02X INS=%02X Lc=%u req_len=%u",
+           cla, ins, (unsigned)(req_len >= 5 ? req[4] : 0), (unsigned)req_len);
     if (cla != 0x00) {
+        CLOG_W("OATH", "bad CLA → SW 6D00");
         write_sw(resp, resp_len, SW_INS_NOT_SUPPORTED);
         return 0;
     }
@@ -214,6 +110,24 @@ int cryptick_oath_hid_handle(const uint8_t *req, uint16_t req_len,
     }
     const uint8_t *tlv = req + data_off;
 
+    const bool need_uv =
+        (ins == OATH_INS_PUT || ins == OATH_INS_DELETE ||
+         ins == OATH_INS_PUT_OTPAUTH || ins == OATH_INS_CALCULATE);
+    if (need_uv) {
+        const char *prompt =
+            (ins == OATH_INS_CALCULATE) ? "Code" : "Manage";
+        if (!oath_ensure_uv(prompt)) {
+            write_sw(resp, resp_len, SW_CONDITIONS); /* 6985 */
+            return 0;
+        }
+    }
+
+    /*
+     * Taken after UV so the 25 s place-finger wait does not block the render
+     * path on the other core; released when the handler returns.
+     */
+    CredentialLock guard;
+
     switch (ins) {
     case OATH_INS_PUT: {
         uint8_t nlen = 0, klen = 0;
@@ -223,7 +137,6 @@ int cryptick_oath_hid_handle(const uint8_t *req, uint16_t req_len,
             write_sw(resp, resp_len, SW_WRONG_DATA);
             return 0;
         }
-        /* key: type|algo (0x21 = TOTP|SHA1), digits, secret… */
         uint8_t type_algo = key[0];
         uint8_t digits = key[1];
         if ((type_algo & 0x0F) != 0x01 || (type_algo & 0xF0) != 0x20) {
@@ -247,8 +160,7 @@ int cryptick_oath_hid_handle(const uint8_t *req, uint16_t req_len,
         cred.algorithm = "SHA1";
         cred.digits = 6;
         cred.period = 30;
-        cred.secret = secret_to_base32(key + 2, seclen);
-        /* Name may be "issuer:label" */
+        cred.secret = oath_secret_to_base32(key + 2, seclen);
         const char *colon = strchr(namebuf, ':');
         if (colon) {
             cred.issuer = String(namebuf).substring(0, (int)(colon - namebuf));
@@ -258,17 +170,11 @@ int cryptick_oath_hid_handle(const uint8_t *req, uint16_t req_len,
             cred.label = namebuf;
         }
 
-        int idx = find_by_name(credentials, namebuf);
-        if (idx >= 0)
-            credentials[idx] = cred;
-        else {
-            if (credentials.size() >= OATH_MAX_CREDS) {
-                write_sw(resp, resp_len, SW_NO_SPACE);
-                return 0;
-            }
-            credentials.push_back(cred);
+        if (!oath_put_credential(credentials, cred, nullptr)) {
+            write_sw(resp, resp_len, SW_NO_SPACE);
+            return 0;
         }
-        saveConfiguration(credentials);
+        CLOG_I("OATH", "PUT ok name=%s creds=%u", namebuf, (unsigned)credentials.size());
         write_sw(resp, resp_len, SW_OK);
         return 0;
     }
@@ -283,13 +189,11 @@ int cryptick_oath_hid_handle(const uint8_t *req, uint16_t req_len,
         char namebuf[OATH_MAX_NAME + 1];
         memcpy(namebuf, name, nlen);
         namebuf[nlen] = 0;
-        int idx = find_by_name(credentials, namebuf);
-        if (idx < 0) {
+        if (!oath_delete_credential(credentials, namebuf)) {
             write_sw(resp, resp_len, SW_NOT_FOUND);
             return 0;
         }
-        credentials.erase(credentials.begin() + idx);
-        saveConfiguration(credentials);
+        CLOG_I("OATH", "DELETE ok name=%s remaining=%u", namebuf, (unsigned)credentials.size());
         write_sw(resp, resp_len, SW_OK);
         return 0;
     }
@@ -297,9 +201,7 @@ int cryptick_oath_hid_handle(const uint8_t *req, uint16_t req_len,
     case OATH_INS_LIST: {
         uint16_t off = 0;
         for (size_t i = 0; i < credentials.size(); i++) {
-            String display = credentials[i].issuer.length()
-                ? (credentials[i].issuer + ":" + credentials[i].label)
-                : credentials[i].label;
+            String display = oath_display_name(credentials[i]);
             uint8_t nlen = (uint8_t)constrain((int)display.length(), 0, OATH_MAX_NAME);
             if (off + 3 + nlen + 2 > max_resp)
                 break;
@@ -311,6 +213,7 @@ int cryptick_oath_hid_handle(const uint8_t *req, uint16_t req_len,
         }
         *resp_len = off;
         append_sw(resp, resp_len, SW_OK, max_resp);
+        CLOG_D("OATH", "LIST ok n=%u bytes=%u", (unsigned)credentials.size(), (unsigned)*resp_len);
         return 0;
     }
 
@@ -325,12 +228,11 @@ int cryptick_oath_hid_handle(const uint8_t *req, uint16_t req_len,
         char namebuf[OATH_MAX_NAME + 1];
         memcpy(namebuf, name, nlen);
         namebuf[nlen] = 0;
-        int idx = find_by_name(credentials, namebuf);
+        int idx = oath_find_by_name(credentials, namebuf);
         if (idx < 0) {
             write_sw(resp, resp_len, SW_NOT_FOUND);
             return 0;
         }
-        /* Challenge is time counter BE; convert to unix-ish via * period for our gen */
         uint64_t counter = 0;
         for (int i = 0; i < 8; i++)
             counter = (counter << 8) | chal[i];
@@ -340,8 +242,6 @@ int cryptick_oath_hid_handle(const uint8_t *req, uint16_t req_len,
             write_sw(resp, resp_len, SW_CONDITIONS);
             return 0;
         }
-        /* Response TLV: digits + 4-byte truncated code (or ASCII); YKOATH uses
-         * 0x75 len digits | fullcode. Use digits + uint32 BE. */
         uint32_t code_n = (uint32_t)code.toInt();
         resp[0] = OATH_TAG_RESPONSE;
         resp[1] = 5;
@@ -352,6 +252,7 @@ int cryptick_oath_hid_handle(const uint8_t *req, uint16_t req_len,
         resp[6] = (uint8_t)(code_n);
         *resp_len = 7;
         append_sw(resp, resp_len, SW_OK, max_resp);
+        CLOG_I("OATH", "CALCULATE ok name=%s counter=%llu", namebuf, (unsigned long long)counter);
         return 0;
     }
 
@@ -366,8 +267,8 @@ int cryptick_oath_hid_handle(const uint8_t *req, uint16_t req_len,
             write_sw(resp, resp_len, SW_WRONG_DATA);
             return 0;
         }
-        DateTime dt(ts);
-        rtc.adjust(dt);
+        device_set_time_utc(ts);
+        CLOG_I("OATH", "SET_TIME utc=%lu", (unsigned long)ts);
         write_sw(resp, resp_len, SW_OK);
         return 0;
     }
@@ -378,27 +279,22 @@ int cryptick_oath_hid_handle(const uint8_t *req, uint16_t req_len,
             return 0;
         }
         TOTPCredential cred;
-        if (!parse_otpauth((const char *)tlv, data_len, cred)) {
+        if (!oath_parse_otpauth((const char *)tlv, data_len, cred)) {
             write_sw(resp, resp_len, SW_WRONG_DATA);
             return 0;
         }
-        String display = cred.issuer.length() ? (cred.issuer + ":" + cred.label) : cred.label;
-        int idx = find_by_name(credentials, display.c_str());
-        if (idx >= 0)
-            credentials[idx] = cred;
-        else {
-            if (credentials.size() >= OATH_MAX_CREDS) {
-                write_sw(resp, resp_len, SW_NO_SPACE);
-                return 0;
-            }
-            credentials.push_back(cred);
+        String display = oath_display_name(cred);
+        if (!oath_put_credential(credentials, cred, nullptr)) {
+            write_sw(resp, resp_len, SW_NO_SPACE);
+            return 0;
         }
-        saveConfiguration(credentials);
+        CLOG_I("OATH", "PUT_OTPAUTH ok name=%s creds=%u", display.c_str(), (unsigned)credentials.size());
         write_sw(resp, resp_len, SW_OK);
         return 0;
     }
 
     default:
+        CLOG_W("OATH", "unsupported INS=0x%02X", ins);
         write_sw(resp, resp_len, SW_INS_NOT_SUPPORTED);
         return 0;
     }

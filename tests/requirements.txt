@@ -1,4 +1,11 @@
-# Host unit tests (L0) — no board required
-pytest>=7.0
-# L2 hardware (optional): pip install -e ".[hw]" style extra not required;
-# install hidapi manually when running scripts/tests against a device.
+# Full bench install: L0 + L2 device tests + L3 acceptance scripts.
+# CI uses requirements-host.txt instead (no USB hardware there).
+-r requirements-host.txt
+
+# L2 device tests (hardware bench only).
+# Without these, `pytest tests/device` skips instead of failing.
+pyserial>=3.5        # CDC console discovery + open
+hidapi>=0.14         # CTAPHID / FIDO HID transport
+
+# L3 acceptance scripts (scripts/tests/webauthn_ctap2_smoke.py)
+fido2>=1.1.0

@@ -5,6 +5,7 @@
 // http://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 #include <stdlib.h>
+#include <string.h>
 #include "u2f.h"
 #include "ctap.h"
 #include "ctaphid.h"
@@ -17,6 +18,12 @@
 #include "extensions.h"
 #endif
 #include APP_CONFIG
+#include <board_config.h>
+
+/* Browser MSG/U2F path used 750ms — too short for fingerprint UV. */
+#ifndef CRYPTICK_FIDO_UP_TIMEOUT_MS
+#define CRYPTICK_FIDO_UP_TIMEOUT_MS 29000
+#endif
 
 // void u2f_response_writeback(uint8_t * buf, uint8_t len);
 #ifdef ENABLE_U2F
@@ -30,11 +37,32 @@ void make_auth_tag(uint8_t * rpIdHash, uint8_t * nonce, uint32_t count, uint8_t 
 
 static CTAP_RESPONSE * _u2f_resp = NULL;
 
+static int _u2f_presence_probe = 0;
+
+static int u2f_payload_is_chrome_gettouch(const uint8_t *payload, uint32_t len)
+{
+    /* Chromium kBogusChallenge = 0x42…, kBogusAppParam = 0x41… (chal || app). */
+    uint32_t i;
+    if (!payload || len < 64)
+        return 0;
+    for (i = 0; i < 32; i++) {
+        if (payload[i] != 0x42 || payload[32 + i] != 0x41)
+            return 0;
+    }
+    return 1;
+}
+
+int u2f_last_was_presence_probe(void)
+{
+    return _u2f_presence_probe;
+}
+
 void u2f_request_ex(APDU_HEADER *req, uint8_t *payload, uint32_t len, CTAP_RESPONSE * resp)
 {
     uint16_t rcode = 0;
     uint8_t byte;
 
+    _u2f_presence_probe = 0;
     ctap_response_init(resp);
     u2f_set_writeback_buffer(resp);
 
@@ -60,18 +88,21 @@ void u2f_request_ex(APDU_HEADER *req, uint8_t *payload, uint32_t len, CTAP_RESPO
                 }
                 else
                 {
+                    _u2f_presence_probe = u2f_payload_is_chrome_gettouch(payload, len);
+                    if (_u2f_presence_probe)
+                        printf1(TAG_U2F, "Chrome GetTouch (bogus app/chal) — no success toast\n");
 
-                    timestamp();
+                    solo_timestamp();
                     rcode = u2f_register((struct u2f_register_request*)payload);
-                    printf1(TAG_TIME,"u2f_register time: %d ms\n", timestamp());
+                    printf1(TAG_TIME,"u2f_register time: %d ms\n", solo_timestamp());
 
                 }
                 break;
             case U2F_AUTHENTICATE:
                 printf1(TAG_U2F, "U2F_AUTHENTICATE\n");
-                timestamp();
+                solo_timestamp();
                 rcode = u2f_authenticate((struct u2f_authenticate_request*)payload, req->p1);
-                printf1(TAG_TIME,"u2f_authenticate time: %d ms\n", timestamp());
+                printf1(TAG_TIME,"u2f_authenticate time: %d ms\n", solo_timestamp());
                 break;
             case U2F_VERSION:
                 printf1(TAG_U2F, "U2F_VERSION\n");
@@ -97,7 +128,12 @@ void u2f_request_ex(APDU_HEADER *req, uint8_t *payload, uint32_t len, CTAP_RESPO
 #endif
     }
 
-    device_set_status(CTAPHID_STATUS_IDLE);
+    /*
+     * Do NOT set IDLE here — CTAPHID multi-frame writeback (U2F_REGISTER ~670B)
+     * still runs after we return. Early IDLE unlatches processing so the 750ms
+     * CID timer can fire mid-stream and corrupt Chrome create.
+     * device_ctap_finished() after writeback clears UI/processing.
+     */
 
 end:
     if (rcode != U2F_SW_NO_ERROR)
@@ -124,19 +160,50 @@ void u2f_request_nfc(uint8_t * header, uint8_t * data, int datalen, CTAP_RESPONS
     device_disable_up(false); // enable presence test
 }
 
-void u2f_request(struct u2f_request_apdu* req, CTAP_RESPONSE * resp)
+void u2f_request(uint8_t *pkt, uint32_t len, CTAP_RESPONSE * resp)
 {
-    uint32_t len = ((req->LC3) | ((uint32_t)req->LC2 << 8) | ((uint32_t)req->LC1 << 16));
+    APDU_STRUCT apdu;
+    APDU_HEADER hdr;
+    uint16_t sw;
+    uint8_t byte;
 
-	u2f_request_ex((APDU_HEADER *)req, req->payload, len, resp);
+    _u2f_presence_probe = 0;
+    ctap_response_init(resp);
+    u2f_set_writeback_buffer(resp);
+
+    if (!pkt || len < 4) {
+        sw = U2F_SW_WRONG_LENGTH;
+        goto sw_only;
+    }
+
+    sw = apdu_decode(pkt, (size_t)len, &apdu);
+    if (sw != 0)
+        goto sw_only;
+
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.cla = apdu.cla;
+    hdr.ins = apdu.ins;
+    hdr.p1 = apdu.p1;
+    hdr.p2 = apdu.p2;
+    u2f_request_ex(&hdr, apdu.data, (uint32_t)apdu.lc, resp);
+    return;
+
+sw_only:
+    printf1(TAG_U2F, "U2F APDU decode error %04x len=%u\n", sw, (unsigned)len);
+    byte = (uint8_t)((sw & 0xff00) >> 8);
+    u2f_response_writeback(&byte, 1);
+    byte = (uint8_t)(sw & 0xff);
+    u2f_response_writeback(&byte, 1);
 }
 
 int8_t u2f_response_writeback(const uint8_t * buf, uint16_t len)
 {
     if ((_u2f_resp->length + len) > _u2f_resp->data_size)
     {
+        /* Truncate rather than abort: the host sees a short/invalid response
+         * and retries, instead of the token resetting under it. */
         printf2(TAG_ERR, "Not enough space for U2F response, writeback\n");
-        exit(1);
+        return -1;
     }
     memmove(_u2f_resp->data + _u2f_resp->length, buf, len);
     _u2f_resp->length += len;
@@ -159,6 +226,7 @@ static void dump_signature_der(uint8_t * sig)
     uint8_t sigder[72];
     int len;
     len = ctap_encode_der_sig(sig, sigder);
+    printf1(TAG_U2F, "DER sig len=%d\n", len);
     u2f_response_writeback(sigder, len);
 }
 static int8_t u2f_load_key(struct u2f_key_handle * kh, uint8_t khl, uint8_t * appid)
@@ -232,7 +300,8 @@ static int16_t u2f_authenticate(struct u2f_authenticate_request * req, uint8_t c
     uint8_t up = 1;
     uint32_t count;
     uint8_t hash[32];
-    uint8_t * sig = (uint8_t*)req;
+    /* Separate from req: signing in-place overwrote challenge while building the reply. */
+    uint8_t sig[64];
 
     if (control == U2F_AUTHENTICATE_CHECK)
     {
@@ -262,7 +331,7 @@ static int16_t u2f_authenticate(struct u2f_authenticate_request * req, uint8_t c
 
 	if(up)
 	{
-		if (ctap_user_presence_test(750) == 0)
+		if (ctap_user_presence_test(CRYPTICK_FIDO_UP_TIMEOUT_MS) <= 0)
 		{
 			return U2F_SW_CONDITIONS_NOT_SATISFIED;
 		}
@@ -303,7 +372,7 @@ static int16_t u2f_register(struct u2f_register_request * req)
     struct u2f_key_handle key_handle;
     uint8_t pubkey[64];
     uint8_t hash[32];
-    uint8_t * sig = (uint8_t*)req;
+    uint8_t sig[64];
 
 
     const uint16_t attest_size = device_attestation_cert_der_get_size();
@@ -313,10 +382,12 @@ static int16_t u2f_register(struct u2f_register_request * req)
         return U2F_SW_INSUFFICIENT_MEMORY;
     }
 
-	if ( ! ctap_user_presence_test(750))
+	if (ctap_user_presence_test(CRYPTICK_FIDO_UP_TIMEOUT_MS) <= 0)
 	{
 		return U2F_SW_CONDITIONS_NOT_SATISFIED;
 	}
+    if (_u2f_presence_probe)
+        ctap_uv_cache_arm_gettouch();
 
     if ( u2f_new_keypair(&key_handle, req->app, pubkey) == -1)
     {
@@ -347,6 +418,8 @@ static int16_t u2f_register(struct u2f_register_request * req)
     u2f_response_writeback((uint8_t*)&key_handle,U2F_KEY_HANDLE_SIZE);
 
     device_attestation_read_cert_der(cert);
+    printf1(TAG_U2F, "attest_cert_der=%u kh=%u\n",
+            (unsigned)attest_size, (unsigned)U2F_KEY_HANDLE_SIZE);
     u2f_response_writeback(cert,attest_size);
 
     dump_signature_der(sig);

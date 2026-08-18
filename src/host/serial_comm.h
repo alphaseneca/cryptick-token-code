@@ -6,12 +6,14 @@
 #include "totp.h"
 
 /**
- * USB CDC handler — product path is logs + reflash only.
+ * USB CDC handler — logs, recovery, and TOTP/OATH CLI (same LittleFS as HID OATH).
  *
- * Always: BOOTLOADER / DFU / DOWNLOAD → ROM USB download; HELP
- * Optional (CRYPTICK_SERIAL_DEBUG_CMDS): DATE/SETTIME, TOTP_*, FINGER_*, FIDO_RESET
+ * Always: BOOTLOADER / REBOOT / HELP / LOGLEVEL / ATTEST /
+ *         TOTP_LIST|ADD|DEL, OATH LIST|PUT|DELETE|SET_TIME, DATE|SETTIME
+ * Optional (CRYPTICK_SERIAL_DEBUG_CMDS): FINGER_*, FIDO_RESET
  *
- * Product TOTP secret manage / clock set over HID: docs/HID_HOST.md
+ * Put/delete UV matches HID when CRYPTICK_OATH_REQUIRE_FP (bootstrap if no FP templates).
+ * HID OATH: docs/HID_HOST.md
  */
 void processSerialCommands(Stream &serial, std::vector<TOTPCredential> &credentials,
     void *finger = nullptr, bool fingerprintReady = false);

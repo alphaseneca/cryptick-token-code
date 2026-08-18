@@ -1,41 +1,52 @@
 #!/usr/bin/env python3
-"""Smoke-check product firmware over UART (CH340) or TinyUSB CDC after upload.
+"""Pass/fail smoke check of the product firmware right after upload.
 
 Usage:
-  python scripts/post_flash_check.py
-  python scripts/post_flash_check.py COM10
+  python3 scripts/post_flash_check.py                        # auto-detect
+  python3 scripts/post_flash_check.py /dev/cu.usbmodemXXXX   # force a port
+
+Exit code 0 means the board booted far enough to print the button map.
+
+Port discovery and DTR handling live in tests/support/cryptick_usb.py, shared
+with serial_smoke.py and the L2 pytest suite.
 """
 from __future__ import annotations
 
-import re
 import sys
 import time
+from pathlib import Path
 
-try:
-    import serial
-    from serial.tools import list_ports
-except ImportError:
-    print("pip install pyserial")
-    sys.exit(2)
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
 
-# Prefer product CDC, then CH340 UART (bring-up adapter)
-PREFERRED = (
-    ("1209", "BEEE"),  # Cryptick TinyUSB
-    ("1A86", "7523"),  # CH340
-    ("303A", "1001"),  # USB Serial/JTAG (MODE=1 tests / ROM)
+from support.cryptick_usb import (  # noqa: E402
+    find_product_cdc,
+    list_serial_ports,
+    open_cdc,
+    pyserial_available,
 )
 
 EXPECTED_MAP = "RIGHT=5 DOWN=4 UP=7 LEFT=6 CENTER=15"
+
+# Fallbacks when the product CDC is not up: a still-cabled CH340, or the
+# ROM/Serial-JTAG device that means the board never left download mode.
+FALLBACK_VID_PID = (
+    (0x1A86, 0x7523),  # CH340 bring-up adapter
+    (0x303A, 0x1001),  # Espressif ROM / Serial-JTAG
+)
 
 
 def pick_port(forced: str | None) -> str:
     if forced:
         return forced
-    ports = list(list_ports.comports())
-    for vid, pid in PREFERRED:
+    port = find_product_cdc()
+    if port:
+        return port
+    ports = list_serial_ports()
+    for vid, pid in FALLBACK_VID_PID:
         for p in ports:
-            h = (p.hwid or "").upper()
-            if f"VID:PID={vid}:{pid}" in h.replace(" ", ""):
+            if p.vid == vid and p.pid == pid:
+                print(f"[check] WARN product CDC absent — falling back to {p.device} "
+                      f"({vid:04X}:{pid:04X})")
                 return p.device
     if not ports:
         raise SystemExit("No serial ports found")
@@ -43,17 +54,18 @@ def pick_port(forced: str | None) -> str:
 
 
 def main() -> int:
+    if not pyserial_available():
+        print("pip install -r tests/requirements.txt")
+        return 2
+
     forced = sys.argv[1] if len(sys.argv) > 1 else None
     dev = pick_port(forced)
-    print(f"[check] open {dev} @115200")
-    ser = serial.Serial(dev, 115200, timeout=0.2)
-    time.sleep(0.4)
-    ser.reset_input_buffer()
+    print(f"[check] open {dev} @115200 (DTR=on for TinyUSB DATA)")
+    ser = open_cdc(dev)
 
-    # Wake / dump banner
     ser.write(b"\r\nHELP\r\n")
     ser.flush()
-    deadline = time.time() + 8.0
+    deadline = time.time() + 12.0
     buf = ""
     while time.time() < deadline:
         chunk = ser.read(4096)
@@ -63,37 +75,33 @@ def main() -> int:
                 break
         time.sleep(0.05)
 
+    if "[BOOT] Ready" not in buf:
+        time.sleep(1.0)
+        extra = ser.read(8192)
+        if extra:
+            buf += extra.decode("utf-8", errors="replace")
+
     print("--- capture ---")
     print(buf[-4000:] if len(buf) > 4000 else buf)
     print("--- end ---")
 
     ok = True
-    if EXPECTED_MAP not in buf and f"RIGHT=5" not in buf:
-        # Try provoke map reprint (input re-init is only on boot)
+    if EXPECTED_MAP not in buf and "RIGHT=5" not in buf:
         print(f"[check] FAIL: expected button map containing {EXPECTED_MAP}")
+        print("[check] open the Cryptick CDC (1209:BEEE), not CH340, after unplugging the adapter")
         ok = False
     else:
         print(f"[check] OK button map: {EXPECTED_MAP}")
 
-    for needle in ("[DISP]", "[FP]", "[BOOT] Ready", "Cryptick"):
-        if needle.lower() in buf.lower() or needle in buf:
-            print(f"[check] saw {needle!r}")
-        else:
-            print(f"[check] missing {needle!r} (may need power-cycle + reconnect UART TX/RX)")
+    for needle in ("[DISP]", "[FP]", "[BOOT] Ready", "Cryptick", "[USB]"):
+        print(f"[check] {'saw' if needle.lower() in buf.lower() else 'missing'} {needle!r}")
 
-    # Soft enroll start (non-blocking) — only checks command accepted
-    ser.write(b"FINGER_ENROLL\r\n")
+    ser.write(b"HELP\r\n")
     ser.flush()
-    time.sleep(1.5)
+    time.sleep(0.3)
     more = ser.read(4096).decode("utf-8", errors="replace")
-    print(more)
-    if "enroll" in more.lower() or "FINGER" in more or "place" in more.lower():
-        print("[check] FINGER_ENROLL got a response")
-        ser.write(b"FINGER_ABORT\r\n")
-        ser.flush()
-        time.sleep(0.3)
-    else:
-        print("[check] WARN: no enroll serial response (sensor / baud / wiring?)")
+    if more.strip():
+        print(more[-500:])
 
     ser.close()
     return 0 if ok else 1

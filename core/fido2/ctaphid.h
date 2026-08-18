@@ -64,6 +64,11 @@ extern "C" {
 #define CAPABILITY_CBOR             0x04
 #define CAPABILITY_NMSG             0x08
 
+/*
+ * CBOR + WINK. Do NOT set NMSG: macOS Chrome still sends CTAPHID_MSG (U2F) as a
+ * presence probe / create path after GetInfo and ignores NMSG — rejecting MSG
+ * left no finger UI and no CTAP2 MakeCredential.
+ */
 #define CTAP_CAPABILITIES           (CAPABILITY_WINK | CAPABILITY_CBOR)
 
 #define HID_MESSAGE_SIZE        64

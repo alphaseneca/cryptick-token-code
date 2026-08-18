@@ -12,4 +12,10 @@ void display_system_set_credentials(const std::vector<TOTPCredential> *creds);
 void display_system_set_user(const char *name);
 void display_system_force_redraw(void);
 
+/**
+ * Opening animation, ~BOOT_ANIM_MS long and fully synchronous. Call once from
+ * setup() after display_system_init(); the panel retry path never runs it.
+ */
+void display_system_boot_animation(void);
+
 #endif
