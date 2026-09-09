@@ -275,6 +275,18 @@ void nav_system_set_fido_ui(int8_t req)
         }
         return;
     }
+    if (req == 4) {
+        /*
+         * BLE pairing passkey. Deliberately NOT UI_FIDO_PROMPT: that screen
+         * says "Place finger" and starts MATCH_FIDO, which would tell the user
+         * to do the wrong thing — the passkey is typed on the host, and no
+         * fingerprint is involved in pairing.
+         */
+        _lastFidoReq = 4;
+        cmd_fp(CMD_FP_MATCH_STOP);
+        set_state(UI_BLE_PAIRING);
+        return;
+    }
     if (req == 3) {
         /* Explicit success after CTAP status 0x00 writeback */
         _lastFidoReq = 3;
@@ -295,7 +307,8 @@ void nav_system_set_fido_ui(int8_t req)
          * Idle/error clear — NOT success. (Previously any processing→0
          * flashed OK even when the host got CTAP errors.)
          */
-        if (_state == UI_FIDO_PROCESSING || _state == UI_FIDO_PROMPT || prev == 2 || prev == 1) {
+        if (_state == UI_FIDO_PROCESSING || _state == UI_FIDO_PROMPT ||
+            _state == UI_BLE_PAIRING || prev == 2 || prev == 1 || prev == 4) {
             set_state(UI_CLOCK);
         }
     }

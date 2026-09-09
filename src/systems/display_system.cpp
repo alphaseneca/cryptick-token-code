@@ -402,6 +402,10 @@ static void render(void)
     case UI_FIDO_PROMPT:
         draw_message(nav_system_fido_label(), "Place finger");
         break;
+    case UI_BLE_PAIRING:
+        /* Caption carries the 6 digits; the host prompts for them. */
+        draw_message(nav_system_fido_label(), "Type on host");
+        break;
     case UI_FIDO_PROCESSING:
         draw_message("Working…", "Wait");
         break;
@@ -703,7 +707,8 @@ void display_system_tick(unsigned long nowMs)
     _charge = battery_system_state();
 
     bool urgent = (st == UI_FIDO_PROMPT || st == UI_FIDO_PROCESSING || st == UI_FP_ENROLL ||
-                   st == UI_AUTH_PROMPT || _charge == CHARGE_CHARGING);
+                   st == UI_AUTH_PROMPT || st == UI_BLE_PAIRING ||
+                   _charge == CHARGE_CHARGING);
     unsigned long interval = urgent ? 350UL : (unsigned long)DISPLAY_UPDATE_INTERVAL;
     if (st == UI_TOTP || st == UI_CLOCK)
         interval = (_charge == CHARGE_CHARGING) ? 350UL : 1000UL;
