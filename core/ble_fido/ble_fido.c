@@ -93,6 +93,19 @@ int ble_fido_send_response(uint8_t cmd, const uint8_t *data, uint16_t len)
     if (cp < BLE_FIDO_MIN_CP_LEN || cp > BLE_FIDO_MAX_CP_LEN)
         return 0;
 
+    /*
+     * A CANCEL is intercepted on its first fragment and the rest discarded, so
+     * a multi-fragment one is something this encoder could build and no
+     * reassembler could ever accept — ours or the daemon's. Refuse to emit it
+     * rather than putting unreadable bytes on the wire.
+     *
+     * Nothing here sends CANCEL today (it is a host-to-device command), so this
+     * is a guard on the API rather than a live path. Anything we emit, we must
+     * be able to read back.
+     */
+    if (cmd == BLE_FIDO_CMD_CANCEL && len != 0)
+        return 0;
+
     /* Init fragment: CMD ‖ HLEN(2, big-endian) ‖ data */
     frag[0] = cmd;
     frag[1] = (uint8_t)(len >> 8);

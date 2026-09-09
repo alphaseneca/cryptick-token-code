@@ -44,18 +44,34 @@ H2D, D2H, BOTH = "host_to_device", "device_to_host", "both"
 cases: list[dict] = []
 
 
-def case(name, *, fragments, expect, size=20, direction=BOTH, why="", max_len=None):
-    cases.append(
-        {
-            "name": name,
-            "direction": direction,
-            "fragment_size": size,
-            "max_message_len": MAX_MSG if max_len is None else max_len,
-            "fragments": [f.hex() for f in fragments],
-            "expect": expect,
-            "why": why,
-        }
-    )
+def case(name, *, fragments, expect=None, deliveries=None, size=20,
+         direction=BOTH, why="", max_len=None):
+    """One vector.
+
+    `expect` is the **last** delivery. `deliveries` is the ordered list of
+    every delivery, checked exhaustively; the two are mutually exclusive and
+    `deliveries` wins if both are given.
+
+    "Last" alone cannot express the divergence that matters: two
+    implementations reaching the same final state by different routes — one
+    delivering a CANCEL and then a message, the other only the message — both
+    pass. That is the bug class, so the schema has to be able to say it.
+    """
+    assert (expect is None) != (deliveries is None), \
+        f"{name}: give exactly one of expect / deliveries"
+    entry = {
+        "name": name,
+        "direction": direction,
+        "fragment_size": size,
+        "max_message_len": MAX_MSG if max_len is None else max_len,
+        "fragments": [f.hex() for f in fragments],
+        "why": why,
+    }
+    if deliveries is not None:
+        entry["deliveries"] = deliveries
+    else:
+        entry["expect"] = expect
+    cases.append(entry)
 
 
 def init(cmd: int, declared: int, data: bytes = b"") -> bytes:
@@ -299,10 +315,17 @@ case(
     "declared length is ignored and the payload discarded.",
 )
 
-# Recovery after a cancel would deliver twice (the cancel, then the next
-# message). Every vector here delivers at most once, and the daemon's replayer
-# was written against that; keeping the shared contract simple is worth more
-# than one vector, so that case lives in tests/host/test_ble_fido_framing.py.
+case(
+    "cancel_recovers_to_idle",
+    fragments=[init(CMD_MSG, 100, bytes(17)), init(CMD_CANCEL, 0),
+               init(CMD_MSG, 2, b"\x01\x02")],
+    deliveries=[message(CMD_CANCEL, b""), message(CMD_MSG, b"\x01\x02")],
+    why="Silence must not mean stuck: after a cancel the reassembler is idle "
+    "and the next message goes straight through. The first vector to need "
+    "`deliveries` — under a last-delivery-only rule an implementation that "
+    "swallowed the CANCEL entirely would pass, and swallowing it is exactly "
+    "the failure worth catching.",
+)
 
 case(
     "recovers_after_an_error",
@@ -338,6 +361,11 @@ def main() -> None:
         "version": 1,
         "spec": "CTAP2 §11.2 FIDO BLE transport",
         "generated_by": "tests/conformance/generate.py",
+        "expectations": {
+            "expect": "the LAST message delivered",
+            "deliveries": "every delivery, in order, checked exhaustively",
+            "exclusive": "give one or the other; deliveries wins if both",
+        },
         "note": (
             "Hand-authored expectations, not captured output. Replayed by "
             "tests/host/test_ble_fido_conformance.py (firmware C) and intended "

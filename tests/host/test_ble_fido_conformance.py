@@ -106,12 +106,26 @@ def test_conformance_vector(transport, vector):
     assert t.cp_len == vector["fragment_size"], "fragment size not established"
 
     fragments = [bytes.fromhex(f) for f in vector["fragments"]]
-    expect = vector["expect"]
+    expect = vector.get("expect")
     why = vector.get("why", "")
+    assert ("expect" in vector) != ("deliveries" in vector), (
+        f"{vector['name']}: exactly one of expect / deliveries"
+    )
 
     last = None
     for frag in fragments:
         last = t.rx(frag)
+
+    # `deliveries` checks every delivery in order; `expect` checks only the
+    # last. Under a last-only rule an implementation that swallowed an
+    # intermediate delivery would pass, which is the divergence worth catching.
+    if "deliveries" in vector:
+        want = [
+            (d["command"], bytes.fromhex(d["payload"])) for d in vector["deliveries"]
+        ]
+        assert t.delivered == want, why
+        assert not t.receiving, f"reassembler should be idle. {why}"
+        return
 
     if expect["kind"] == "message":
         want = (expect["command"], bytes.fromhex(expect["payload"]))
@@ -127,7 +141,8 @@ def test_conformance_vector(transport, vector):
                 rebuilt += frag[1:]
             assert rebuilt == want[1], why
         else:
-            assert t.delivered == [want], why
+            assert t.delivered, f"nothing was delivered. {why}"
+            assert t.delivered[-1] == want, why
         assert not t.receiving, f"reassembler should be idle. {why}"
 
     elif expect["kind"] == "error":

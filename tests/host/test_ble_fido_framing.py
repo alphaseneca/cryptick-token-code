@@ -465,7 +465,53 @@ def test_response_round_trips_through_the_receiver(t):
     assert t.delivered == [(CMD_MSG, body)]
 
 
+# KEEPALIVE and ERROR are deliberately absent: they are device-to-host only, so
+# this side emits them and never reassembles them. The round trip for those is
+# the daemon's to assert, and the corpus pins the refusal as host_to_device.
+@pytest.mark.parametrize("cmd", [CMD_PING, CMD_MSG, CMD_CANCEL])
+@pytest.mark.parametrize("size", [0, 1, 16, 17, 18, 300])
+def test_anything_we_emit_we_can_read_back(t, cmd, size):
+    """The encoder must never produce bytes this decoder rejects.
+
+    Found on the daemon side first: if CANCEL is intercepted on its first
+    fragment and the rest discarded, a multi-fragment CANCEL is something the
+    fragmenter can build and the reassembler can never accept. Asserting the
+    round trip catches that shape once rather than per-command.
+    """
+    t.set_mtu(23)
+    body = bytes((i * 3) & 0xFF for i in range(size))
+
+    ok = t.send_response(cmd, body)
+    fragments = list(t.notified)
+    t.notified.clear()
+    t.delivered.clear()
+
+    if not ok:
+        # Refusing to build it is a valid answer, and the only one for a
+        # payload-carrying CANCEL. What is not allowed is emitting it anyway.
+        assert fragments == [], "refused the send but emitted fragments regardless"
+        return
+
+    for frag in fragments:
+        assert t.rx(frag) == ERR_NONE, (
+            f"emitted a {cmd:#x} fragment our own receiver rejects: {frag.hex()}"
+        )
+    assert t.errors == [], f"round trip produced an error for {cmd:#x}"
+
+
 def test_send_reports_failure_when_the_link_drops_mid_response(t):
     t.set_mtu(23)
     t.notify_ok = False
     assert t.send_response(CMD_MSG, bytes(300)) == 0
+
+
+def test_sender_refuses_a_cancel_it_could_not_read_back(t):
+    """Explicitly, not just as a property: a CANCEL carrying a payload is
+    unreadable by construction, because CANCEL is acted on at its first
+    fragment and the continuations are discarded."""
+    t.set_mtu(23)
+    assert t.send_response(CMD_CANCEL, b"") == 1, "an empty CANCEL is legal"
+    t.notified.clear()
+    for size in (1, 17, 18, 300):
+        assert t.send_response(CMD_CANCEL, bytes(size)) == 0, size
+        assert t.notified == [], f"emitted an unreadable CANCEL of {size} bytes"
