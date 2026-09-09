@@ -90,6 +90,9 @@ extern "C" {
 /** Uncompressed P-256 point: 0x04 ‖ X(32) ‖ Y(32). */
 #define PIV_PUBKEY_LEN 65
 
+/** PIV GUID, as carried in the CHUID's 0x34 field. */
+#define PIV_GUID_LEN 16
+
 /* --- Platform hooks ------------------------------------------------------ */
 
 typedef struct {
@@ -123,6 +126,16 @@ typedef struct {
      * a PIV card with no certificate cannot log anyone in.
      */
     int (*public_key)(uint8_t slot, uint8_t *out65);
+
+    /**
+     * Write the device's 16-byte PIV GUID.
+     *
+     * Must be stable for the life of the device and distinct between devices:
+     * hosts key their record of the card on it, so a shared GUID would make
+     * two tokens look like the same card. Returns 1 on success; without it the
+     * synthesised CHUID cannot be built and GET DATA reports the object absent.
+     */
+    int (*device_guid)(uint8_t *out16);
 
     /**
      * Roll the slot's key. Returns 1 on success.

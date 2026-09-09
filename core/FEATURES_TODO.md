@@ -25,7 +25,7 @@
 - [x] PIV PIN change + key generation (`CHANGE REFERENCE DATA`, `GENERATE`)
 - [x] CCID bulk protocol layer (`drivers/ccid_proto.c`, host-tested against the applet)
 - [ ] CCID USB descriptors + endpoints — the last gap before Mac/Linux login
-- [ ] CCC + CHUID objects synthesised at first boot (else `GET DATA` answers 6A82)
+- [x] CCC + CHUID synthesised on demand from a derived per-device GUID
 - [ ] Host tooling to issue a certificate against a `GENERATE` public key
 - [ ] PIV over BLE via a host-side virtual reader
 - [ ] PIV provisioning: publish slot public keys so a cert can be issued

@@ -59,6 +59,7 @@ SIGN = ctypes.CFUNCTYPE(
 PIN_CHECK = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t)
 PIN_SET = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t)
 PUBKEY = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_uint8, ctypes.POINTER(ctypes.c_uint8))
+GUID = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.POINTER(ctypes.c_uint8))
 KEYGEN = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_uint8)
 RETRIES_GET = ctypes.CFUNCTYPE(ctypes.c_int)
 RETRIES_SET = ctypes.CFUNCTYPE(None, ctypes.c_int)
@@ -73,6 +74,7 @@ class PivHal(ctypes.Structure):
         ("pin_check", PIN_CHECK),
         ("pin_set", PIN_SET),
         ("public_key", PUBKEY),
+        ("device_guid", GUID),
         ("key_generate", KEYGEN),
         ("pin_retries_get", RETRIES_GET),
         ("pin_retries_set", RETRIES_SET),
@@ -89,6 +91,7 @@ class Card:
         self.retries = 3
         self.pin = CORRECT_PIN
         self.generation: dict[int, int] = {}
+        self.guid = bytes(range(0x10, 0x20))
         self.presence_ok = presence
         self.sign_calls: list[tuple[int, bytes]] = []
         self.presence_calls: list[int] = []
@@ -135,6 +138,13 @@ class Card:
                 out65[i] = b
             return 1
 
+        def _guid(out16):
+            if not self.guid:
+                return 0
+            for i, b in enumerate(self.guid):
+                out16[i] = b
+            return 1
+
         def _keygen(slot):
             self.generation[int(slot)] = self.generation.get(int(slot), 0) + 1
             return 1
@@ -151,7 +161,7 @@ class Card:
 
         self._cbs = [
             GET_OBJ(_get), SET_OBJ(_set), SIGN(_sign), PIN_CHECK(_pin),
-            PIN_SET(_pin_set), PUBKEY(_pubkey), KEYGEN(_keygen),
+            PIN_SET(_pin_set), PUBKEY(_pubkey), GUID(_guid), KEYGEN(_keygen),
             RETRIES_GET(_rget), RETRIES_SET(_rset),
             PRESENCE(_presence) if with_presence_hook else ctypes.cast(None, PRESENCE),
         ]
@@ -644,3 +654,103 @@ def test_generated_key_is_immediately_usable_for_signing(card):
     assert card.generate()[0] == SW_OK
     sw, body = card.sign()
     assert sw == SW_OK and body[0] == 0x7C
+
+
+# --- CCC and CHUID --------------------------------------------------------
+
+OBJ_CHUID = 0x5FC102
+OBJ_CCC = 0x5FC107
+
+
+def tlv_parse(buf: bytes) -> dict[int, bytes]:
+    """Flat one-byte-length TLV walk, the way a host reads these objects."""
+    out, i = {}, 0
+    while i + 1 < len(buf):
+        tag, n = buf[i], buf[i + 1]
+        assert i + 2 + n <= len(buf), f"TLV overruns at {i}: {buf.hex()}"
+        out[tag] = buf[i + 2 : i + 2 + n]
+        i += 2 + n
+    assert i == len(buf), f"trailing bytes in TLV: {buf.hex()}"
+    return out
+
+
+def test_chuid_is_synthesised_when_absent(card):
+    """A host that finds no CHUID concludes there is no card worth talking to,
+    so login never starts however good the rest of the applet is."""
+    sw, body = card.get_data(OBJ_CHUID)
+    assert sw == SW_OK
+    assert body[0] == 0x53, "must be wrapped in a 0x53 container"
+    assert body[1] == len(body) - 2, "container length disagrees with its body"
+
+    f = tlv_parse(body[2:])
+    assert len(f[0x30]) == 25, "FASC-N must be 25 bytes"
+    assert f[0x34] == card.guid, "GUID must be the device's"
+    assert len(f[0x35]) == 8 and f[0x35].isdigit(), "expiry is 8 ASCII digits"
+    assert 0x3E in f, "issuer signature field must be present, even if empty"
+    assert 0xFE in f, "error detection code field must be present"
+
+
+def test_ccc_is_synthesised_when_absent(card):
+    sw, body = card.get_data(OBJ_CCC)
+    assert sw == SW_OK
+    assert body[0] == 0x53
+    assert body[1] == len(body) - 2
+
+    f = tlv_parse(body[2:])
+    assert len(f[0xF0]) == 21, "card identifier must be 21 bytes"
+    assert f[0xF0][:5] == bytes([0xA0, 0x00, 0x00, 0x01, 0x16]), "GSC-RID"
+    assert f[0xF1] == b"\x21" and f[0xF2] == b"\x21", "version bytes"
+    for tag in (0xF6, 0xF7, 0xFA, 0xFB, 0xFC, 0xFD, 0xFE):
+        assert tag in f, f"container {tag:#x} must be present even when empty"
+
+
+def test_ccc_and_chuid_agree_on_identity(card):
+    """Two objects describing the same card must not disagree about which
+    card it is."""
+    _, chuid = card.get_data(OBJ_CHUID)
+    _, ccc = card.get_data(OBJ_CCC)
+    guid = tlv_parse(chuid[2:])[0x34]
+    card_id = tlv_parse(ccc[2:])[0xF0]
+    assert card_id[6:] == guid[: len(card_id) - 6]
+
+
+def test_identity_objects_are_stable_across_reads(card):
+    """A card whose identity changes between reads is not a card."""
+    assert card.get_data(OBJ_CHUID)[1] == card.get_data(OBJ_CHUID)[1]
+    assert card.get_data(OBJ_CCC)[1] == card.get_data(OBJ_CCC)[1]
+
+
+def test_two_devices_get_different_identities(card):
+    """Hosts key their record of a card on the GUID, so two tokens sharing one
+    would look like the same card.
+
+    (The applet holds a single global HAL, so this swaps the GUID under one
+    card rather than building two — an earlier version of this test built two
+    Cards and silently read the same GUID twice.)
+    """
+    _, first = card.get_data(OBJ_CHUID)
+    card.guid = bytes(range(0x80, 0x90))
+    _, second = card.get_data(OBJ_CHUID)
+    assert first != second, "distinct GUIDs must yield distinct CHUIDs"
+    assert tlv_parse(second[2:])[0x34] == card.guid
+
+
+def test_a_stored_object_overrides_the_synthesised_one(card):
+    """Provisioning a real CHUID must win over the placeholder."""
+    real = b"\x53\x03\x01\x02\x03"
+    card.objects[OBJ_CHUID] = real
+    assert card.get_data(OBJ_CHUID)[1] == real
+
+
+def test_synthesis_needs_a_guid(lib):
+    card = Card(lib)
+    card.guid = b""  # HAL reports no identity
+    assert card.get_data(OBJ_CHUID)[0] == SW_NOT_FOUND
+    assert card.get_data(OBJ_CCC)[0] == SW_NOT_FOUND
+
+
+def test_only_ccc_and_chuid_are_synthesised(card):
+    """Certificates must never be invented — an empty one would look like a
+    provisioned card that simply cannot authenticate."""
+    for tag in (OBJ_CERT_9A, 0x5FC10A, 0x5FC101):
+        assert card.get_data(tag)[0] == SW_NOT_FOUND, f"{tag:#x} was synthesised"

@@ -286,6 +286,151 @@ static int general_authenticate(uint8_t alg, uint8_t slot,
     return respond(_scratch, n, le, out, out_max);
 }
 
+/* --- Synthesised identity objects ----------------------------------------- */
+
+/*
+ * CCC and CHUID are the two objects a card is expected to carry from the
+ * factory. A host that finds neither concludes there is no card worth talking
+ * to: OpenSC reads the CCC during discovery and CryptoTokenKit wants a CHUID
+ * before it will surface a token. Leaving them absent means GET DATA answers
+ * 6A82 and login never starts, however good the rest of the applet is.
+ *
+ * They are synthesised on demand rather than written at first boot. Nothing is
+ * spent in flash unless someone provisions a real one, and PUT DATA still
+ * overrides — the stored object wins whenever it exists.
+ */
+
+/** Append tag ‖ one-byte length ‖ value. Returns 0 if it would not fit. */
+static size_t tlv_append(uint8_t *buf, size_t off, size_t cap, uint8_t tag,
+                         const uint8_t *val, size_t len)
+{
+    if (off + 2 + len > cap || len > 0x7F)
+        return 0;
+    buf[off++] = tag;
+    buf[off++] = (uint8_t)len;
+    if (len)
+        memcpy(buf + off, val, len);
+    return off + len;
+}
+
+/*
+ * FASC-N placeholder for a non-federal issuer.
+ *
+ * A real FASC-N is a BCD-encoded federal credential number with parity bits.
+ * This device issues no such credential, and the conventional answer for a
+ * non-federal PIV-compatible token is a fixed placeholder — hosts key on the
+ * GUID and the certificate, not on this. It is here because the field is
+ * mandatory, not because it identifies anything.
+ */
+static const uint8_t kFascnPlaceholder[25] = {
+    0xD4, 0xE7, 0x39, 0xDA, 0x50, 0x1C, 0xA0, 0x5C, 0x17, 0x94, 0x58, 0x21,
+    0x08, 0x42, 0x10, 0xC3, 0xF5, 0x34, 0x10, 0xC3, 0xF5, 0x34, 0x10, 0xC3,
+    0xF5,
+};
+
+/*
+ * CHUID expiry. The field is mandatory and some hosts refuse an expired card,
+ * but this device has no issuance lifecycle to express, so it is a fixed far
+ * future date rather than a computed one — an expiry that quietly arrives
+ * would take login down with it.
+ */
+static const uint8_t kChuidExpiry[8] = {'2', '0', '5', '0', '0', '1', '0', '1'};
+
+/** Build the CHUID (SP 800-73-4 part 1, table 9) into `out`. */
+static size_t build_chuid(uint8_t *out, size_t cap)
+{
+    uint8_t guid[PIV_GUID_LEN];
+    uint8_t body[80];
+    size_t n = 0;
+
+    if (!_hal || !_hal->device_guid || !_hal->device_guid(guid))
+        return 0;
+
+    n = tlv_append(body, n, sizeof(body), 0x30, kFascnPlaceholder,
+                   sizeof(kFascnPlaceholder));
+    if (n) n = tlv_append(body, n, sizeof(body), 0x34, guid, sizeof(guid));
+    if (n) n = tlv_append(body, n, sizeof(body), 0x35, kChuidExpiry,
+                          sizeof(kChuidExpiry));
+    /* Issuer signature: empty. This card is not part of a federal PKI, and an
+     * empty 0x3E says so honestly rather than forging one. */
+    if (n) n = tlv_append(body, n, sizeof(body), 0x3E, NULL, 0);
+    if (n) n = tlv_append(body, n, sizeof(body), 0xFE, NULL, 0);
+    if (!n)
+        return 0;
+
+    if (cap < n + 2)
+        return 0;
+    out[0] = 0x53;
+    out[1] = (uint8_t)n;
+    memcpy(out + 2, body, n);
+    return n + 2;
+}
+
+/** Build the CCC (SP 800-73-4 part 1, table 8) into `out`. */
+static size_t build_ccc(uint8_t *out, size_t cap)
+{
+    uint8_t guid[PIV_GUID_LEN];
+    uint8_t body[80];
+    uint8_t card_id[21];
+    size_t n = 0;
+
+    if (!_hal || !_hal->device_guid || !_hal->device_guid(guid))
+        return 0;
+
+    /* Card identifier: the GSC-RID, a 0xFF issuer byte, then device-unique
+     * bytes taken from the GUID so the two objects agree on identity. */
+    static const uint8_t kGscRid[] = {0xA0, 0x00, 0x00, 0x01, 0x16, 0xFF};
+    memcpy(card_id, kGscRid, sizeof(kGscRid));
+    memcpy(card_id + sizeof(kGscRid), guid, sizeof(card_id) - sizeof(kGscRid));
+
+    n = tlv_append(body, n, sizeof(body), 0xF0, card_id, sizeof(card_id));
+    {
+        static const uint8_t v21 = 0x21;   /* container + grammar version */
+        static const uint8_t pkcs15 = 0x00; /* no PKCS#15 */
+        static const uint8_t model = 0x10;  /* registered data model */
+        if (n) n = tlv_append(body, n, sizeof(body), 0xF1, &v21, 1);
+        if (n) n = tlv_append(body, n, sizeof(body), 0xF2, &v21, 1);
+        if (n) n = tlv_append(body, n, sizeof(body), 0xF3, NULL, 0);
+        if (n) n = tlv_append(body, n, sizeof(body), 0xF4, &pkcs15, 1);
+        if (n) n = tlv_append(body, n, sizeof(body), 0xF5, &model, 1);
+    }
+    /* The remaining containers are defined but unused on this card. They are
+     * emitted empty rather than omitted: a host walking the table expects to
+     * find them, and an absent tag is not the same as an empty one. */
+    for (uint8_t tag = 0; n && tag < 8; tag++) {
+        static const uint8_t kEmpty[] = {0xF6, 0xF7, 0xFA, 0xFB,
+                                         0xFC, 0xFD, 0xFE, 0x00};
+        if (kEmpty[tag] == 0x00)
+            break;
+        n = tlv_append(body, n, sizeof(body), kEmpty[tag], NULL, 0);
+    }
+    if (!n)
+        return 0;
+
+    if (cap < n + 2)
+        return 0;
+    out[0] = 0x53;
+    out[1] = (uint8_t)n;
+    memcpy(out + 2, body, n);
+    return n + 2;
+}
+
+/**
+ * Build a synthesised object into `_scratch`, or 0 if this tag has none.
+ * A stored object always wins; this is only reached when none exists.
+ */
+static size_t synthesize_object(uint32_t tag)
+{
+    switch (tag) {
+    case PIV_OBJ_CHUID:
+        return build_chuid(_scratch, sizeof(_scratch));
+    case PIV_OBJ_CCC:
+        return build_ccc(_scratch, sizeof(_scratch));
+    default:
+        return 0;
+    }
+}
+
 /* --- GENERATE ASYMMETRIC KEY PAIR ----------------------------------------- */
 
 /**
@@ -621,11 +766,18 @@ int piv_handle_apdu(const uint8_t *cmd, size_t cmd_len, uint8_t *out, size_t out
             return put_sw(out, out_max, PIV_SW_WRONG_P1P2);
         if (!data || !parse_object_tag(data, lc, &tag))
             return put_sw(out, out_max, PIV_SW_WRONG_DATA);
-        if (!_hal || !_hal->get_object)
-            return put_sw(out, out_max, PIV_SW_NOT_FOUND);
-        if (!_hal->get_object(tag, &obj, &obj_len) || !obj)
-            return put_sw(out, out_max, PIV_SW_NOT_FOUND);
-        return respond(obj, obj_len, le, out, out_max);
+        if (_hal && _hal->get_object && _hal->get_object(tag, &obj, &obj_len) &&
+            obj && obj_len)
+            return respond(obj, obj_len, le, out, out_max);
+
+        /* Nothing stored: CCC and CHUID are synthesised, everything else is
+         * genuinely absent. */
+        {
+            size_t n = synthesize_object(tag);
+            if (n)
+                return respond(_scratch, n, le, out, out_max);
+        }
+        return put_sw(out, out_max, PIV_SW_NOT_FOUND);
     }
 
     case PIV_INS_PUT_DATA: {

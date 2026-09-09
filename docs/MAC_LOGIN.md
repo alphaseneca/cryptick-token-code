@@ -8,16 +8,37 @@
 | PIV applet | **Done** — SELECT/GET DATA/PUT DATA/VERIFY/CHANGE REFERENCE/GENERATE/GENERAL AUTHENTICATE, response chaining. 81 host tests |
 | CCID **protocol layer** | **Done** — `drivers/ccid_proto.c`, 25 host tests, drives the applet end to end |
 | CCID **USB interface** | **Not done** — no descriptors, no endpoints, `usb_ccid_enabled()` is false |
-| CCC / CHUID objects | **Not done** — absent, so `GET DATA` answers `6A82` |
+| CCC / CHUID objects | **Done** — synthesised on demand from a derived per-device GUID |
 | Certificate provisioning | Device side done (`GENERATE` publishes the public key); **no host tooling** |
 | Mac `sc_auth` pair / unlock | **Not done** — do not claim finished Mac login |
 | Fingerprint gate for PIV | **Done** — routed through the shared presence gate, not a second flag |
 | Hardware verification | **None.** Nothing here has run on a device |
 
 **What still blocks a login,** in the order it bites: the CCID interface does
-not enumerate, so nothing can reach the applet; CCC and CHUID are missing, so a
-host that enumerated would find no card identity; and no certificate exists,
+not enumerate, so nothing can reach the applet; and no certificate exists,
 because nothing yet turns a `GENERATE` public key into an issued cert.
+
+### Card identity
+
+CCC and CHUID are **synthesised on demand** rather than written at first boot,
+so nothing is spent in flash unless a real one is provisioned, and `PUT DATA`
+still overrides — a stored object always wins.
+
+The GUID they share is derived from the master secret: per-device because the
+secret is, stable across reboots and reflashes, and costing no storage. It is
+deliberately **not** the AAGUID, which identifies the model — every Cryptick
+would otherwise present as the same card and a host could not tell two apart.
+It is shaped as an RFC 4122 v4 UUID because hosts display and log it.
+
+The FASC-N is a fixed non-federal placeholder. A real one is a BCD-encoded
+federal credential number and this device issues no such credential; hosts key
+on the GUID and the certificate instead. The CHUID's issuer signature (`0x3E`)
+is emitted **empty** rather than forged — this card is not part of a federal
+PKI, and saying so is the honest answer.
+
+Certificates are never synthesised. An invented empty one would look like a
+provisioned card that simply cannot authenticate, which is harder to diagnose
+than an absent object.
 
 Apple login / screensaver unlock with a hardware token is **PIV**, consumed by
 CryptoTokenKit — **not** FIDO. That is about the applet, not the wire: the

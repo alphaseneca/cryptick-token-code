@@ -166,6 +166,36 @@ int piv_key_generate(uint8_t slot)
     return slot_generation_bump(slot);
 }
 
+/**
+ * The device's PIV GUID.
+ *
+ * Derived from the master secret rather than generated and stored: it is
+ * per-device because the secret is, stable across reboots and reflashes, and
+ * costs no flash. A stored GUID would need first-boot generation and would be
+ * one more thing to lose.
+ *
+ * Not the AAGUID — that identifies the model, so every Cryptick would present
+ * as the same card and a host could not tell two of them apart.
+ */
+int piv_device_guid(uint8_t *out16)
+{
+    if (!out16)
+        return 0;
+    uint8_t h[32];
+    crypto_sha256_init();
+    crypto_sha256_update((uint8_t *)"cryptick-piv-guid", 17);
+    crypto_sha256_update_secret();
+    crypto_sha256_final(h);
+    memcpy(out16, h, PIV_GUID_LEN);
+
+    /* Shape it as an RFC 4122 v4 UUID. Hosts display and log this; a value
+     * that does not parse as a UUID gets rendered as raw hex or rejected. */
+    out16[6] = (uint8_t)((out16[6] & 0x0F) | 0x40); /* version 4 */
+    out16[8] = (uint8_t)((out16[8] & 0x3F) | 0x80); /* variant 1 */
+    memset(h, 0, sizeof(h));
+    return 1;
+}
+
 int piv_sign_p256(uint8_t slot, const uint8_t *hash32,
                   uint8_t *der_out, size_t *der_len)
 {
@@ -314,6 +344,7 @@ const piv_hal_t kPivHal = {
     piv_pin_check,
     piv_pin_set,
     piv_public_key,
+    piv_device_guid,
     piv_key_generate,
     piv_pin_retries_get,
     piv_pin_retries_set,
