@@ -23,6 +23,19 @@ static int _pin_verified;
  * copy — they are up to a couple of KB) or into `_scratch` for responses we
  * generate ourselves.
  */
+/*
+ * ISO 7816-4 command chaining (CLA bit 0x10).
+ *
+ * Without it a certificate cannot be written at all: 700 bytes of DER needs a
+ * 716-byte PUT DATA body and Lc stops at 255. The applet rejected the chaining
+ * class outright, which made provisioning -- and therefore login -- unreachable
+ * however complete the rest of it was.
+ */
+static uint8_t _chain[PIV_MAX_CHAIN];
+static size_t  _chain_len;
+static int     _chain_active;
+static uint8_t _chain_ins, _chain_p1, _chain_p2;
+
 static const uint8_t *_pending;
 static size_t         _pending_len;
 static size_t         _pending_off;
@@ -661,10 +674,18 @@ void piv_init(const piv_hal_t *hal)
     piv_reset();
 }
 
+static void chain_clear(void)
+{
+    _chain_len = 0;
+    _chain_active = 0;
+    _chain_ins = _chain_p1 = _chain_p2 = 0;
+}
+
 void piv_reset(void)
 {
     _pin_verified = 0;
     pending_clear();
+    chain_clear();
 }
 
 int piv_pin_is_verified(void) { return _pin_verified; }
@@ -682,12 +703,12 @@ int piv_handle_apdu(const uint8_t *cmd, size_t cmd_len, uint8_t *out, size_t out
     uint8_t p2 = cmd[3];
 
     /*
-     * PIV uses class 0x00: no command chaining (bit 0x10), no secure
-     * messaging (0x0C), logical channel 0 (0x03). Masking those bits off and
-     * carrying on would misread the APDU rather than refuse it — a chained
-     * command's body is not a whole body.
+     * Class 0x00, or 0x10 for a command chain. Secure messaging (0x0C) and
+     * logical channels (0x03) are not implemented, and masking those bits off
+     * would misread the APDU rather than refuse it — a chained command's
+     * body is not a whole body.
      */
-    if (cla != 0x00)
+    if (cla != 0x00 && cla != 0x10)
         return put_sw(out, out_max, PIV_SW_CLA_UNSUPPORTED);
 
     /*
@@ -728,6 +749,57 @@ int piv_handle_apdu(const uint8_t *cmd, size_t cmd_len, uint8_t *out, size_t out
      */
     if (ins != PIV_INS_GET_RESPONSE && _pending)
         pending_clear();
+
+    /*
+     * Command chaining. CLA bit 0x10 means "more blocks follow": accumulate
+     * the body and answer 9000 without acting. The final block arrives with
+     * CLA 0x00 and is processed as one whole command.
+     *
+     * A chain that changes INS/P1/P2 mid-way is abandoned rather than
+     * stitched together — the blocks would not be one command, and silently
+     * concatenating them would hand the applet a body its sender never wrote.
+     */
+    if (_chain_active &&
+        (ins != _chain_ins || p1 != _chain_p1 || p2 != _chain_p2)) {
+        chain_clear();
+        return put_sw(out, out_max, PIV_SW_WRONG_DATA);
+    }
+
+    if (cla == 0x10) {
+        if (lc == 0 || !data) {
+            chain_clear();
+            return put_sw(out, out_max, PIV_SW_WRONG_LENGTH);
+        }
+        if (_chain_len + lc > sizeof(_chain)) {
+            chain_clear();
+            return put_sw(out, out_max, PIV_SW_WRONG_LENGTH);
+        }
+        if (!_chain_active) {
+            _chain_active = 1;
+            _chain_ins = ins;
+            _chain_p1 = p1;
+            _chain_p2 = p2;
+        }
+        memcpy(_chain + _chain_len, data, lc);
+        _chain_len += lc;
+        return put_sw(out, out_max, PIV_SW_OK);
+    }
+
+    if (_chain_active) {
+        /* Final block: append it and process the assembled command. */
+        if (lc) {
+            if (!data || _chain_len + lc > sizeof(_chain)) {
+                chain_clear();
+                return put_sw(out, out_max, PIV_SW_WRONG_LENGTH);
+            }
+            memcpy(_chain + _chain_len, data, lc);
+            _chain_len += lc;
+        }
+        data = _chain;
+        lc = _chain_len;
+        _chain_active = 0;
+        _chain_len = 0;
+    }
 
     switch (ins) {
     case PIV_INS_SELECT: {
@@ -792,18 +864,30 @@ int piv_handle_apdu(const uint8_t *cmd, size_t cmd_len, uint8_t *out, size_t out
         if (!_hal || !_hal->set_object)
             return put_sw(out, out_max, PIV_SW_INS_UNSUPPORTED);
         {
-            /* Value follows the 0x5C tag list as a 0x53 wrapper. */
+            /*
+             * Store the whole 0x53 container, wrapper included.
+             *
+             * GET DATA returns a stored object verbatim, and SP 800-73 defines
+             * the response as the data object *with* its 0x53 tag -- which is
+             * what the synthesised CCC and CHUID emit. Storing only the inner
+             * value made a provisioned certificate come back as a bare 0x70
+             * where a host expects 0x53 0x70, so provisioned and synthesised
+             * objects disagreed on shape and only the certificate -- the one
+             * object login needs -- was wrong.
+             */
             size_t off = 1, tl;
             if (!tlv_get_len(data, lc, &off, &tl))
                 return put_sw(out, out_max, PIV_SW_WRONG_DATA);
             off += tl;
             if (off + 1 >= lc || data[off] != 0x53)
                 return put_sw(out, out_max, PIV_SW_WRONG_DATA);
+            size_t container = off;
             off++;
             size_t vlen;
             if (!tlv_get_len(data, lc, &off, &vlen) || off + vlen > lc)
                 return put_sw(out, out_max, PIV_SW_WRONG_DATA);
-            if (!_hal->set_object(tag, data + off, vlen))
+            if (!_hal->set_object(tag, data + container,
+                                  (off + vlen) - container))
                 return put_sw(out, out_max, PIV_SW_WRONG_DATA);
         }
         return put_sw(out, out_max, PIV_SW_OK);

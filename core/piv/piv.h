@@ -82,6 +82,15 @@ extern "C" {
 #define PIV_PIN_MAX_RETRIES 3
 
 /**
+ * Largest command APDU body assembled from a chain.
+ *
+ * A PIV certificate is 500-900 bytes and Lc caps at 255, so PUT DATA of a
+ * certificate is only expressible as a chain of short APDUs. This bounds the
+ * largest object that can be provisioned.
+ */
+#define PIV_MAX_CHAIN 2048
+
+/**
  * Largest generated response. The biggest is the GENERATE reply: a 65-byte
  * uncompressed point inside 0x86 inside 0x7F49.
  */

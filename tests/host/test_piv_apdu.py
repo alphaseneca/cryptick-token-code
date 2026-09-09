@@ -489,11 +489,56 @@ def test_put_data_requires_a_pin(card):
 
 
 def test_put_data_stores_the_object(card):
+    """The stored object keeps its 0x53 container. SP 800-73 defines GET DATA
+    as returning the object *with* that tag, which is what the synthesised CCC
+    and CHUID emit — storing only the inner value made a provisioned
+    certificate come back a different shape from a synthesised object."""
+    card.verify()
+    container = b"\x53\x03ABC"
+    body = b"\x5c\x03\x5f\xc1\x05" + container
+    assert card.apdu(bytes([0x00, 0xDB, 0x3F, 0xFF, len(body)]) + body)[0] == SW_OK
+    assert card.objects[OBJ_CERT_9A] == container
+    assert card.get_data()[1] == container
+
+
+def ber_len(n: int) -> bytes:
+    """BER length. A single byte only encodes 0..127; 0x80 and above is the
+    long form, so a naive one-byte length silently makes a 200-byte object
+    malformed."""
+    if n < 0x80:
+        return bytes([n])
+    if n <= 0xFF:
+        return bytes([0x81, n])
+    return bytes([0x82, n >> 8, n & 0xFF])
+
+
+@pytest.mark.parametrize("payload", [b"A", b"ABC", bytes(range(64)),
+                                     bytes(127), bytes(128), bytes(200)])
+def test_put_data_get_data_round_trip(card, payload):
+    """Anything we store, we must read back byte for byte — the property that
+    caught the container bug. The 127/128 pair straddles the BER long-form
+    boundary, which is where length encoding goes wrong."""
+    card.verify()
+    container = bytes([0x53]) + ber_len(len(payload)) + payload
+    body = b"\x5c\x03\x5f\xc1\x05" + container
+    assert card.apdu(bytes([0x00, 0xDB, 0x3F, 0xFF, len(body)]) + body)[0] == SW_OK
+    sw, got = card.get_data()
+    assert sw == SW_OK
+    assert got == container
+
+
+def test_provisioned_and_synthesised_objects_have_the_same_shape(card):
+    """Both must open with 0x53 and a length that matches the body, or a host
+    parses one of them wrong."""
     card.verify()
     body = b"\x5c\x03\x5f\xc1\x05\x53\x03ABC"
-    assert card.apdu(bytes([0x00, 0xDB, 0x3F, 0xFF, len(body)]) + body)[0] == SW_OK
-    assert card.objects[OBJ_CERT_9A] == b"ABC"
-    assert card.get_data()[1] == b"ABC"
+    card.apdu(bytes([0x00, 0xDB, 0x3F, 0xFF, len(body)]) + body)
+
+    for tag in (OBJ_CERT_9A, OBJ_CHUID, OBJ_CCC):
+        sw, obj = card.get_data(tag)
+        assert sw == SW_OK, f"{tag:#x}"
+        assert obj[0] == 0x53, f"{tag:#x} is not a 0x53 container"
+        assert obj[1] == len(obj) - 2, f"{tag:#x} length disagrees with its body"
 
 
 # --- Framing --------------------------------------------------------------
@@ -511,10 +556,11 @@ def test_unknown_instruction(card):
     assert card.apdu(bytes([0x00, 0xFF, 0x00, 0x00]))[0] == SW_INS_UNSUPPORTED
 
 
-@pytest.mark.parametrize("cla", [0x10, 0x80, 0xFF])
+@pytest.mark.parametrize("cla", [0x80, 0xFF, 0x0C, 0x01])
 def test_unsupported_class_is_rejected(card, cla):
-    """Chaining and secure messaging are not implemented; ignoring those bits
-    would misread the APDU rather than refuse it."""
+    """Secure messaging and logical channels are not implemented; ignoring
+    those bits would misread the APDU rather than refuse it. 0x10 is valid —
+    it is command chaining, which certificate provisioning requires."""
     assert card.apdu(bytes([cla, 0xA4, 0x04, 0x00]))[0] == SW_CLA_UNSUPPORTED
 
 
@@ -754,3 +800,91 @@ def test_only_ccc_and_chuid_are_synthesised(card):
     provisioned card that simply cannot authenticate."""
     for tag in (OBJ_CERT_9A, 0x5FC10A, 0x5FC101):
         assert card.get_data(tag)[0] == SW_NOT_FOUND, f"{tag:#x} was synthesised"
+
+
+# --- Command chaining -----------------------------------------------------
+
+
+def chained_put(card, tag: int, container: bytes, block: int = 200):
+    """PUT DATA split across a command chain, the way a real client writes a
+    certificate too large for one short APDU."""
+    tl = bytes([(tag >> 16) & 0xFF, (tag >> 8) & 0xFF, tag & 0xFF])
+    body = bytes([0x5C, len(tl)]) + tl + container
+    sws = []
+    for i in range(0, len(body), block):
+        chunk = body[i : i + block]
+        last = i + block >= len(body)
+        cla = 0x00 if last else 0x10
+        sws.append(card.apdu(bytes([cla, 0xDB, 0x3F, 0xFF, len(chunk)]) + chunk)[0])
+    return sws
+
+
+def test_certificate_sized_object_needs_chaining(card):
+    """The blocker this exists for: a 700-byte certificate needs a 716-byte
+    PUT DATA body, and Lc stops at 255. Without chaining a certificate cannot
+    be written at all, so the applet could never be provisioned."""
+    cert = bytes((i * 7) & 0xFF for i in range(700))
+    inner = bytes([0x70]) + ber_len(len(cert)) + cert + b"\x71\x01\x00\xfe\x00"
+    container = bytes([0x53]) + ber_len(len(inner)) + inner
+    assert len(container) > 255, "test data no longer exercises chaining"
+
+    card.verify()
+    sws = chained_put(card, OBJ_CERT_9A, container)
+    assert all(sw == SW_OK for sw in sws), sws
+    assert len(sws) > 1, "expected a multi-block chain"
+
+    sw, got = card.get_data(OBJ_CERT_9A)
+    assert sw == SW_OK
+    assert got == container, "chained write did not round trip"
+
+
+def test_chain_blocks_are_acknowledged_without_acting(card):
+    card.verify()
+    body = b"\x5c\x03\x5f\xc1\x05\x53\x03AB"
+    assert card.apdu(bytes([0x10, 0xDB, 0x3F, 0xFF, len(body)]) + body)[0] == SW_OK
+    assert card.objects == {}, "a non-final block must not be acted on"
+    assert card.apdu(bytes([0x00, 0xDB, 0x3F, 0xFF, 0x01]) + b"C")[0] == SW_OK
+    assert card.objects[OBJ_CERT_9A] == b"\x53\x03ABC"
+
+
+def test_a_chain_that_changes_command_is_abandoned(card):
+    """Blocks that are not one command must not be stitched together."""
+    card.verify()
+    body = b"\x5c\x03\x5f\xc1\x05\x53\x03AB"
+    assert card.apdu(bytes([0x10, 0xDB, 0x3F, 0xFF, len(body)]) + body)[0] == SW_OK
+    # different INS mid-chain
+    assert card.apdu(bytes([0x00, 0xCB, 0x3F, 0xFF, 0x01]) + b"C")[0] == SW_WRONG_DATA
+    assert card.objects == {}
+    # and the chain is gone, not merely paused
+    assert card.apdu(bytes([0x00, 0xCB, 0x3F, 0xFF, 0x05,
+                            0x5C, 0x03, 0x5F, 0xC1, 0x05]))[0] == SW_NOT_FOUND
+
+
+def test_an_oversize_chain_is_refused(card):
+    card.verify()
+    blk = bytes(255)
+    sw = SW_OK
+    for _ in range(12):  # 12 * 255 > PIV_MAX_CHAIN (2048)
+        sw = card.apdu(bytes([0x10, 0xDB, 0x3F, 0xFF, 0xFF]) + blk)[0]
+        if sw != SW_OK:
+            break
+    assert sw == SW_WRONG_LENGTH, "chain buffer must be bounded"
+
+
+def test_any_other_command_mid_chain_is_refused_then_recovers(card):
+    """Interrupting a chain is refused and abandons it — the same fail-closed
+    shape as an init fragment mid-transaction on the BLE side. It does not
+    wedge: the interrupting command works on its second attempt."""
+    card.verify()
+    body = b"\x5c\x03\x5f\xc1\x05\x53\x03AB"
+    assert card.apdu(bytes([0x10, 0xDB, 0x3F, 0xFF, len(body)]) + body)[0] == SW_OK
+
+    # SELECT arrives mid-chain: refused, chain abandoned.
+    assert card.select()[0] == SW_WRONG_DATA
+    # Retry succeeds, and the reset it performs clears the PIN.
+    assert card.select()[0] == SW_OK
+    assert not card.lib.piv_pin_is_verified()
+
+    # The abandoned block is gone rather than waiting to be completed.
+    assert card.apdu(bytes([0x00, 0xDB, 0x3F, 0xFF, 0x01]) + b"C")[0] == SW_SECURITY
+    assert card.objects == {}
