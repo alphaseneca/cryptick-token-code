@@ -131,6 +131,11 @@ int slot_generation_bump(uint8_t slot)
 /** Length of the PIV key-derivation input. See the assertions below. */
 constexpr size_t kSlotLabelLen = 16;
 
+/** Domain prefix of that input. Shared with the assertions so they check the
+ *  value actually used, not a transcription of it. */
+constexpr uint8_t kPivPrefix[11] = {'c', 'r', 'y', 'p', 't', 'i', 'c', 'k',
+                                    'P', 'I', 'V'};
+
 /*
  * PIV and FIDO keys must be distinct material (daemon PROJECT.md §15.9).
  *
@@ -148,6 +153,27 @@ constexpr size_t kSlotLabelLen = 16;
  * the label, or let some future FIDO path take a 16-byte credential, and a
  * chosen credential id would derive a PIV signing key with nothing to stop it.
  *
+ * Which of those three actually protects us is worth being precise about,
+ * because it decides what a fix has to change.
+ *
+ * The CTAP2 and U2F paths verify an HMAC tag over the credential *before*
+ * deriving (ctap.c `memcmp(desc->credential.id.tag, ...)`, and
+ * u2f_authenticate_credential), so forging one needs the master secret. They
+ * are not the risk.
+ *
+ * The wallet/custom path is. `is_extension_request()` gates it on a **static**
+ * 4-byte tag and a minimum length -- no MAC -- so the derivation input there is
+ * attacker-chosen. The single thing standing between a chosen credential and a
+ * PIV signing key is that WALLET_MIN_LENGTH is 24 and this label is 16.
+ *
+ * So the length assertion below is load-bearing, not belt-and-braces. Prefixing
+ * the PIV input with a domain tag would *not* replace it: "piv" + 16 is 19,
+ * still short, still separated by the same arithmetic. Genuine construction-
+ * level separation would need the FIDO side prefixed too, which is vendored
+ * Solo code and would invalidate every credential already registered on every
+ * device -- a user-facing regression traded for a property these assertions
+ * already enforce.
+ *
  * These assertions make the accident an invariant, so the build breaks instead.
  */
 static_assert(kSlotLabelLen != sizeof(CredentialId),
@@ -157,12 +183,30 @@ static_assert(kSlotLabelLen != U2F_KEY_HANDLE_SIZE,
 static_assert(kSlotLabelLen < WALLET_MIN_LENGTH,
               "PIV label is long enough to be reachable as a custom credential");
 
+/*
+ * Second barrier, for the day someone lengthens the label past
+ * WALLET_MIN_LENGTH and the assertion above stops applying: the label must not
+ * open with WALLET_TAG, which is what is_extension_request() matches on.
+ * Together the two mean "either too short to reach that path, or tagged so it
+ * cannot be mistaken for it".
+ */
+constexpr bool piv_label_shares_wallet_tag()
+{
+    /* Single return: this file builds as C++11, where a constexpr body may
+     * not contain a loop. WALLET_TAG is 4 bytes, so compare all four. */
+    return kPivPrefix[0] == (uint8_t)WALLET_TAG[0] &&
+           kPivPrefix[1] == (uint8_t)WALLET_TAG[1] &&
+           kPivPrefix[2] == (uint8_t)WALLET_TAG[2] &&
+           kPivPrefix[3] == (uint8_t)WALLET_TAG[3];
+}
+static_assert(!piv_label_shares_wallet_tag(),
+              "PIV label opens with WALLET_TAG and could be taken for a "
+              "custom credential");
+
 void slot_label(uint8_t slot, uint8_t out[kSlotLabelLen])
 {
     uint32_t gen = slot_generation(slot);
-    const uint8_t prefix[] = {'c', 'r', 'y', 'p', 't', 'i', 'c', 'k',
-                              'P', 'I', 'V'};
-    memcpy(out, prefix, sizeof(prefix));
+    memcpy(out, kPivPrefix, sizeof(kPivPrefix));
     out[11] = slot;
     out[12] = (uint8_t)(gen >> 24);
     out[13] = (uint8_t)(gen >> 16);
