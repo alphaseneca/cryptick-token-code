@@ -50,6 +50,48 @@ void authenticator_write_state(AuthenticatorState * s);
 /** Update CTAPHID UI/keepalive status (IDLE / PROCESSING / UPNEEDED). */
 void device_set_status(uint32_t status);
 
+/**
+ * Which transport opened the transaction being processed.
+ *
+ * The keepalive emitted while waiting on the fingerprint has to leave by the
+ * same door the request came in. It used to call ctaphid_update_status()
+ * directly from the presence loop, which hardwired every keepalive onto USB
+ * regardless of origin. A producer sets this before handing work to the FIDO
+ * task; the presence loop only asks the HAL to send, and knows no transport.
+ */
+typedef enum {
+    FIDO_TRANSPORT_NONE = 0,
+    FIDO_TRANSPORT_USB  = 1,
+    FIDO_TRANSPORT_BLE  = 2,
+} fido_transport_t;
+
+/** Set by the producer before the FIDO task dispatches the request. */
+void fido_transport_set_active(fido_transport_t t);
+fido_transport_t fido_transport_active(void);
+
+/** Emit a keepalive on whichever transport owns the current transaction. */
+void fido_send_keepalive(int8_t status);
+
+/**
+ * Show / clear the BLE pairing passkey on the OLED.
+ *
+ * The NimBLE host task must not call nav_system_* or display_system_* (see
+ * docs/ARCHITECTURE.md#threading-model). These park the caption and the UI
+ * request for the Arduino loop to drain, exactly like the presence prompt.
+ */
+void device_show_pairing_passkey(const char *label);
+void device_clear_pairing_passkey(void);
+
+/**
+ * Post a fully reassembled BLE request to the FIDO task.
+ *
+ * Called from the NimBLE host task. Returns 0 if the CTAP core is busy, in
+ * which case the caller answers the peer with BLE_FIDO_ERR_OTHER rather than
+ * queueing a transaction that would demand its own fingerprint later.
+ * CMD_CANCEL is handled inline and always returns 1.
+ */
+int fido_ble_submit_request(uint8_t cmd, const uint8_t *msg, uint16_t len);
+
 /** After full CTAPHID writeback. allow_success_ui: only for MakeCredential/GetAssertion. */
 void device_ctap_finished(uint8_t ctap_status, int allow_success_ui);
 

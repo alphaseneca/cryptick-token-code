@@ -141,6 +141,32 @@
 #endif
 
 /*
+ * FIDO BLE transport (GATT service 0xFFFD). USB works natively on every OS
+ * with no host software; BLE is the second product transport. Both are live at
+ * once, so the arbitration in docs/ARCHITECTURE.md#threading-model is
+ * mandatory, not optional.
+ */
+#ifndef CRYPTICK_BLE_FIDO
+#define CRYPTICK_BLE_FIDO 0
+#endif
+
+/* Advertised name. Keep it short: it shares the advertisement with the
+ * mandatory 16-bit FIDO Service UUID. */
+#ifndef CRYPTICK_BLE_DEVICE_NAME
+#define CRYPTICK_BLE_DEVICE_NAME "Cryptick Token"
+#endif
+
+/*
+ * CTAP keepalive cadence while blocked waiting for the fingerprint. The host
+ * must keep hearing from the authenticator or it gives up on the transaction.
+ * 100 ms suits every transport: it is the CTAPHID convention on USB, and it is
+ * inside what the FIDO BLE transport expects from a KEEPALIVE notification.
+ */
+#ifndef CRYPTICK_FIDO_KEEPALIVE_MS
+#define CRYPTICK_FIDO_KEEPALIVE_MS 100
+#endif
+
+/*
  * Hold the OLED awake after FIDO HID/UV so idle sleep cannot blank the token
  * under a still-open WebAuthn prompt (GetTouch → MakeCredential).
  */

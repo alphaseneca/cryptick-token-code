@@ -49,10 +49,22 @@ Rules that follow from this:
 | HID RX ring indices | spinlock | `drivers/usb_device.cpp` |
 | HID IN submission | mutex | `drivers/usb_device.cpp` |
 | I2C bus (OLED + RTC) | mutex | `i2c_lock()` / `i2c_unlock()` |
+| User-presence ceremony | mutex (try-take) | `core/fido2/hal_esp32.cpp` |
 
   `volatile` alone is **not** sufficient for a multi-field ring buffer: it
   prevents caching but not interleaving. Prefer `portENTER_CRITICAL` for the
   short index updates and a FreeRTOS mutex where the section can block.
+
+- **Only one user-presence ceremony may be in flight.** `_user_confirmed` is a
+  single global that every `ctap_user_presence_test_ex()` caller polls, and both
+  cores can reach it: the FIDO task during a WebAuthn ceremony, and the Arduino
+  loop during a CDC `OATH PUT` / `TOTP_DEL` (`oath_ensure_uv`). Unserialized,
+  one fingerprint touch returned success to **both** — the user approves the
+  prompt on the OLED and silently authorises the other operation. The ceremony
+  mutex is taken with a zero timeout, so a second ceremony is refused (returns
+  `0`, the caller reports a UV failure) rather than parked behind a 29s finger
+  wait. Any future transport must feed this same gate rather than adding a
+  second presence flag.
 
 - The `credentials` lock is recursive because the OATH handlers hold it across
   helpers in `oath_ops` that lock again. Use the `CredentialLock` RAII guard so
