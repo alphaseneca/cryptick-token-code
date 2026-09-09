@@ -1,58 +1,677 @@
 #include "piv.h"
 #include <string.h>
 
-/* PIV Application AID (NIST) */
+/* PIV Application AID (NIST SP 800-73-4) */
 static const uint8_t PIV_AID[PIV_AID_LEN] = {
     0xA0, 0x00, 0x00, 0x03, 0x08, 0x00, 0x00, 0x10, 0x00, 0x01, 0x00
 };
 
-static void put_sw(uint8_t *out, size_t *len, uint16_t sw)
+static const piv_hal_t *_hal;
+
+/* PIN verification is per-session: it dies with the card reset / deselect. */
+static int _pin_verified;
+
+/*
+ * Pending response for GET RESPONSE chaining.
+ *
+ * A PIV certificate is comfortably larger than the 256 bytes a short APDU can
+ * return, so every real client reads one across several GET RESPONSEs. Without
+ * this, GET DATA for a certificate simply cannot answer and login never gets
+ * off the ground.
+ *
+ * `data` points either into HAL-owned storage (certificates, which we must not
+ * copy — they are up to a couple of KB) or into `_scratch` for responses we
+ * generate ourselves.
+ */
+static const uint8_t *_pending;
+static size_t         _pending_len;
+static size_t         _pending_off;
+static uint8_t        _scratch[PIV_SCRATCH_LEN];
+
+/* --- Small helpers -------------------------------------------------------- */
+
+static int put_sw(uint8_t *out, size_t out_max, uint16_t sw)
 {
+    if (out_max < 2)
+        return -1;
     out[0] = (uint8_t)(sw >> 8);
     out[1] = (uint8_t)(sw & 0xFF);
-    *len = 2;
+    return 2;
+}
+
+static void pending_clear(void)
+{
+    _pending = NULL;
+    _pending_len = 0;
+    _pending_off = 0;
 }
 
 /**
- * Minimal PIV APDU stub:
- * - SELECT by AID → 9000 if PIV AID matches
- * - everything else → 6D00 / 6A82 until full applet lands
- *
- * Slots 9a/9d, GENERATE, VERIFY, GENERAL AUTHENTICATE: not implemented.
+ * Emit up to `le` bytes of the pending response, leaving the rest for GET
+ * RESPONSE. SW is 9000 when nothing remains, else 61xx with the count still
+ * outstanding (0x61 0x00 conventionally meaning "256 or more").
  */
+static int emit_pending(uint8_t *out, size_t out_max, size_t le)
+{
+    size_t remaining = _pending_len - _pending_off;
+    size_t chunk = remaining < le ? remaining : le;
+
+    if (out_max < chunk + 2)
+        return put_sw(out, out_max, PIV_SW_WRONG_LENGTH);
+
+    if (chunk)
+        memcpy(out, _pending + _pending_off, chunk);
+    _pending_off += chunk;
+
+    remaining = _pending_len - _pending_off;
+    if (remaining == 0) {
+        pending_clear();
+        return (int)chunk + put_sw(out + chunk, out_max - chunk, PIV_SW_OK);
+    }
+    return (int)chunk + put_sw(out + chunk, out_max - chunk,
+                               (uint16_t)(0x6100 | (remaining > 255 ? 0 : remaining)));
+}
+
+/** Start a chained response from a buffer the caller guarantees stays valid. */
+static int respond(const uint8_t *data, size_t len, size_t le,
+                   uint8_t *out, size_t out_max)
+{
+    _pending = data;
+    _pending_len = len;
+    _pending_off = 0;
+    if (le == 0)
+        le = 256;
+    return emit_pending(out, out_max, le);
+}
+
+/* --- BER-TLV -------------------------------------------------------------- */
+
+/** Write a BER length. Returns bytes written, or 0 if it does not fit. */
+static size_t tlv_put_len(uint8_t *out, size_t out_max, size_t len)
+{
+    if (len < 0x80) {
+        if (out_max < 1) return 0;
+        out[0] = (uint8_t)len;
+        return 1;
+    }
+    if (len <= 0xFF) {
+        if (out_max < 2) return 0;
+        out[0] = 0x81;
+        out[1] = (uint8_t)len;
+        return 2;
+    }
+    if (out_max < 3) return 0;
+    out[0] = 0x82;
+    out[1] = (uint8_t)(len >> 8);
+    out[2] = (uint8_t)(len & 0xFF);
+    return 3;
+}
+
+/**
+ * Read a BER length. Advances *off past it. Returns 1 on success.
+ * Rejects indefinite length and anything wider than two bytes: neither occurs
+ * in PIV, and accepting them only widens the parser's attack surface.
+ */
+static int tlv_get_len(const uint8_t *buf, size_t buf_len, size_t *off, size_t *len)
+{
+    if (*off >= buf_len)
+        return 0;
+    uint8_t b = buf[(*off)++];
+    if (b < 0x80) {
+        *len = b;
+        return 1;
+    }
+    if (b == 0x81) {
+        if (*off + 1 > buf_len) return 0;
+        *len = buf[(*off)++];
+        return 1;
+    }
+    if (b == 0x82) {
+        if (*off + 2 > buf_len) return 0;
+        *len = (size_t)(buf[*off] << 8) | buf[*off + 1];
+        *off += 2;
+        return 1;
+    }
+    return 0;
+}
+
+/* --- SELECT --------------------------------------------------------------- */
+
+/**
+ * The application property template (tag 0x61) a conformant SELECT returns.
+ * A bare 9000 is enough for OpenSC but CryptoTokenKit reads the AID back, so
+ * the stub's old answer would have selected and then stalled.
+ */
+static int select_response(size_t le, uint8_t *out, size_t out_max)
+{
+    size_t n = 0;
+    uint8_t *p = _scratch;
+
+    p[n++] = 0x61;             /* application property template */
+    size_t len_at = n++;       /* one-byte length, patched below */
+
+    p[n++] = 0x4F;             /* application identifier */
+    p[n++] = 0x09;
+    memcpy(p + n, PIV_AID, 9); /* RID + PIX, without the version bytes */
+    n += 9;
+
+    p[n++] = 0x79;             /* coexistent tag allocation authority */
+    p[n++] = 0x07;
+    p[n++] = 0x4F;
+    p[n++] = 0x05;
+    memcpy(p + n, PIV_AID, 5); /* NIST RID */
+    n += 5;
+
+    p[len_at] = (uint8_t)(n - len_at - 1);
+    return respond(_scratch, n, le, out, out_max);
+}
+
+/* --- GET DATA ------------------------------------------------------------- */
+
+/**
+ * GET DATA carries the object id in a 0x5C tag-list. PIV object ids are three
+ * bytes (0x5FC1xx); the two one-byte ids are the discovery objects.
+ */
+static int parse_object_tag(const uint8_t *data, size_t len, uint32_t *tag)
+{
+    size_t off = 0;
+    size_t tl;
+
+    if (len < 2 || data[0] != 0x5C)
+        return 0;
+    off = 1;
+    if (!tlv_get_len(data, len, &off, &tl))
+        return 0;
+    if (tl == 0 || tl > 3 || off + tl > len)
+        return 0;
+
+    *tag = 0;
+    for (size_t i = 0; i < tl; i++)
+        *tag = (*tag << 8) | data[off + i];
+    return 1;
+}
+
+/* --- GENERAL AUTHENTICATE ------------------------------------------------- */
+
+/**
+ * The dynamic authentication template (0x7C) carries a challenge in 0x81; the
+ * response goes back in 0x82. For ECDSA the "challenge" is already the hash to
+ * sign, so the applet never hashes anything itself.
+ */
+static int general_authenticate(uint8_t alg, uint8_t slot,
+                                const uint8_t *data, size_t len,
+                                size_t le, uint8_t *out, size_t out_max)
+{
+    size_t off = 0, tmpl_len = 0;
+    const uint8_t *challenge = NULL;
+    size_t challenge_len = 0;
+
+    /* P-256 only: the device has one curve and advertises nothing else. */
+    if (alg != 0x11)
+        return put_sw(out, out_max, PIV_SW_WRONG_P1P2);
+
+    switch (slot) {
+    case PIV_SLOT_AUTHENTICATION:
+    case PIV_SLOT_SIGNATURE:
+    case PIV_SLOT_KEY_MANAGEMENT:
+    case PIV_SLOT_CARD_AUTH:
+        break;
+    default:
+        return put_sw(out, out_max, PIV_SW_WRONG_P1P2);
+    }
+
+    if (len < 2 || data[0] != 0x7C)
+        return put_sw(out, out_max, PIV_SW_WRONG_DATA);
+    off = 1;
+    if (!tlv_get_len(data, len, &off, &tmpl_len) || off + tmpl_len > len)
+        return put_sw(out, out_max, PIV_SW_WRONG_DATA);
+
+    /* Walk the template for the 0x81 challenge. */
+    size_t end = off + tmpl_len;
+    while (off + 1 < end) {
+        uint8_t t = data[off++];
+        size_t l;
+        if (!tlv_get_len(data, end, &off, &l) || off + l > end)
+            return put_sw(out, out_max, PIV_SW_WRONG_DATA);
+        if (t == 0x81) {
+            challenge = data + off;
+            challenge_len = l;
+        }
+        off += l;
+    }
+
+    if (!challenge || challenge_len != 32)
+        return put_sw(out, out_max, PIV_SW_WRONG_DATA);
+
+    /*
+     * Card Authentication (9E) is the one slot defined to work without a PIN —
+     * it exists for contactless building access. Every other slot is a login
+     * credential and must not sign for an unauthenticated caller.
+     */
+    if (slot != PIV_SLOT_CARD_AUTH && !_pin_verified)
+        return put_sw(out, out_max, PIV_SW_SECURITY_NOT_SATISFIED);
+
+    if (!_hal || !_hal->sign_p256)
+        return put_sw(out, out_max, PIV_SW_INS_UNSUPPORTED);
+
+    /*
+     * Touch policy. The PIN proves who is asking; presence proves someone is
+     * physically here, which is what stops silent signing by malware that has
+     * watched the PIN go past.
+     */
+    if (_hal->user_presence && !_hal->user_presence(slot))
+        return put_sw(out, out_max, PIV_SW_SECURITY_NOT_SATISFIED);
+
+    uint8_t der[80];
+    size_t der_len = sizeof(der);
+    if (!_hal->sign_p256(slot, challenge, der, &der_len) || der_len == 0 ||
+        der_len > sizeof(der))
+        return put_sw(out, out_max, PIV_SW_WRONG_DATA);
+
+    /* Wrap as 7C L 82 L <sig>. */
+    size_t n = 0;
+    _scratch[n++] = 0x7C;
+    size_t inner = 1 + (der_len < 0x80 ? 1 : 2) + der_len;
+    size_t w = tlv_put_len(_scratch + n, sizeof(_scratch) - n, inner);
+    if (!w) return put_sw(out, out_max, PIV_SW_WRONG_LENGTH);
+    n += w;
+    _scratch[n++] = 0x82;
+    w = tlv_put_len(_scratch + n, sizeof(_scratch) - n, der_len);
+    if (!w || n + w + der_len > sizeof(_scratch))
+        return put_sw(out, out_max, PIV_SW_WRONG_LENGTH);
+    n += w;
+    memcpy(_scratch + n, der, der_len);
+    n += der_len;
+
+    return respond(_scratch, n, le, out, out_max);
+}
+
+/* --- GENERATE ASYMMETRIC KEY PAIR ----------------------------------------- */
+
+/**
+ * Roll a slot key and hand back the public half, so a certificate can be
+ * issued against it.
+ *
+ * Real PIV gates this behind the card management key (9B) via a mutual
+ * authenticate. This device has no 9B key, so the gate is a verified PIN plus
+ * a fingerprint instead. That is a deliberate substitution, not an oversight:
+ * the operation destroys the usability of any certificate already issued for
+ * the slot, so it must not be reachable by an unauthenticated caller.
+ */
+static int generate_keypair(uint8_t p1, uint8_t slot,
+                            const uint8_t *data, size_t len,
+                            size_t le, uint8_t *out, size_t out_max)
+{
+    if (p1 != 0x00)
+        return put_sw(out, out_max, PIV_SW_WRONG_P1P2);
+
+    switch (slot) {
+    case PIV_SLOT_AUTHENTICATION:
+    case PIV_SLOT_SIGNATURE:
+    case PIV_SLOT_KEY_MANAGEMENT:
+    case PIV_SLOT_CARD_AUTH:
+        break;
+    default:
+        return put_sw(out, out_max, PIV_SW_WRONG_P1P2);
+    }
+
+    /* Control reference template: AC L 80 01 <alg>. P-256 only. */
+    if (!data || len < 5 || data[0] != 0xAC)
+        return put_sw(out, out_max, PIV_SW_WRONG_DATA);
+    {
+        size_t off = 1, tl;
+        if (!tlv_get_len(data, len, &off, &tl) || off + tl > len)
+            return put_sw(out, out_max, PIV_SW_WRONG_DATA);
+        size_t end = off + tl;
+        int alg_seen = 0;
+        while (off + 1 < end) {
+            uint8_t t = data[off++];
+            size_t l;
+            if (!tlv_get_len(data, end, &off, &l) || off + l > end)
+                return put_sw(out, out_max, PIV_SW_WRONG_DATA);
+            if (t == 0x80) {
+                if (l != 1 || data[off] != 0x11)
+                    return put_sw(out, out_max, PIV_SW_WRONG_P1P2);
+                alg_seen = 1;
+            }
+            off += l;
+        }
+        if (!alg_seen)
+            return put_sw(out, out_max, PIV_SW_WRONG_DATA);
+    }
+
+    if (!_pin_verified)
+        return put_sw(out, out_max, PIV_SW_SECURITY_NOT_SATISFIED);
+    if (!_hal || !_hal->key_generate || !_hal->public_key)
+        return put_sw(out, out_max, PIV_SW_INS_UNSUPPORTED);
+    if (_hal->user_presence && !_hal->user_presence(slot))
+        return put_sw(out, out_max, PIV_SW_SECURITY_NOT_SATISFIED);
+
+    if (!_hal->key_generate(slot))
+        return put_sw(out, out_max, PIV_SW_WRONG_DATA);
+
+    uint8_t pub[PIV_PUBKEY_LEN];
+    if (!_hal->public_key(slot, pub))
+        return put_sw(out, out_max, PIV_SW_WRONG_DATA);
+
+    /* 7F49 L 86 L <point> */
+    size_t n = 0;
+    _scratch[n++] = 0x7F;
+    _scratch[n++] = 0x49;
+    size_t inner = 2 + PIV_PUBKEY_LEN; /* 86 + one length byte + point */
+    size_t w = tlv_put_len(_scratch + n, sizeof(_scratch) - n, inner);
+    if (!w) return put_sw(out, out_max, PIV_SW_WRONG_LENGTH);
+    n += w;
+    _scratch[n++] = 0x86;
+    _scratch[n++] = PIV_PUBKEY_LEN;
+    if (n + PIV_PUBKEY_LEN > sizeof(_scratch))
+        return put_sw(out, out_max, PIV_SW_WRONG_LENGTH);
+    memcpy(_scratch + n, pub, PIV_PUBKEY_LEN);
+    n += PIV_PUBKEY_LEN;
+
+    return respond(_scratch, n, le, out, out_max);
+}
+
+/* --- VERIFY --------------------------------------------------------------- */
+
+/** Strip 0xFF padding from an 8-byte PIN block; 0 if it is not well formed. */
+static size_t pin_block_len(const uint8_t *block)
+{
+    size_t n = 0;
+    while (n < PIV_PIN_BLOCK_LEN && block[n] != 0xFF)
+        n++;
+    for (size_t i = n; i < PIV_PIN_BLOCK_LEN; i++) {
+        if (block[i] != 0xFF)
+            return 0; /* padding before the end of the digits */
+    }
+    return (n >= PIV_PIN_MIN_LEN && n <= PIV_PIN_MAX_LEN) ? n : 0;
+}
+
+
+static int verify(uint8_t p1, uint8_t p2, const uint8_t *data, size_t lc,
+                  uint8_t *out, size_t out_max)
+{
+    /* 0x80 is the application PIN; 0x00/0x81 (global, PUK) are not supported. */
+    if (p2 != 0x80)
+        return put_sw(out, out_max, PIV_SW_WRONG_P1P2);
+
+    if (!_hal || !_hal->pin_check || !_hal->pin_retries_get)
+        return put_sw(out, out_max, PIV_SW_INS_UNSUPPORTED);
+
+    int retries = _hal->pin_retries_get();
+
+    /* P1=0xFF resets the verification state without presenting a PIN. */
+    if (p1 == 0xFF) {
+        if (lc != 0)
+            return put_sw(out, out_max, PIV_SW_WRONG_LENGTH);
+        _pin_verified = 0;
+        return put_sw(out, out_max, PIV_SW_OK);
+    }
+    if (p1 != 0x00)
+        return put_sw(out, out_max, PIV_SW_WRONG_P1P2);
+
+    /*
+     * Empty body is the standard way to ask "how many tries do I have left"
+     * without spending one. Clients do this before prompting the user.
+     */
+    if (lc == 0) {
+        if (retries <= 0)
+            return put_sw(out, out_max, PIV_SW_AUTH_BLOCKED);
+        if (_pin_verified)
+            return put_sw(out, out_max, PIV_SW_OK);
+        return put_sw(out, out_max, PIV_SW_VERIFY_FAILED(retries));
+    }
+
+    if (retries <= 0)
+        return put_sw(out, out_max, PIV_SW_AUTH_BLOCKED);
+
+    if (lc != PIV_PIN_BLOCK_LEN)
+        return put_sw(out, out_max, PIV_SW_WRONG_LENGTH);
+
+    size_t pin_len = pin_block_len(data);
+    if (pin_len == 0)
+        return put_sw(out, out_max, PIV_SW_WRONG_DATA);
+
+    if (_hal->pin_check(data, pin_len)) {
+        _pin_verified = 1;
+        if (_hal->pin_retries_set)
+            _hal->pin_retries_set(PIV_PIN_MAX_RETRIES);
+        return put_sw(out, out_max, PIV_SW_OK);
+    }
+
+    /*
+     * A wrong PIN clears any earlier verification. Otherwise a caller who
+     * authenticated once could keep signing while guessing, and the counter
+     * would be the only thing moving.
+     */
+    _pin_verified = 0;
+    retries--;
+    if (_hal->pin_retries_set)
+        _hal->pin_retries_set(retries);
+    if (retries <= 0)
+        return put_sw(out, out_max, PIV_SW_AUTH_BLOCKED);
+    return put_sw(out, out_max, PIV_SW_VERIFY_FAILED(retries));
+}
+
+/* --- CHANGE REFERENCE DATA ------------------------------------------------ */
+
+/**
+ * Change the application PIN.
+ *
+ * Without this the device ships on the SP 800-73 default and there is no way
+ * off it, which makes the PIN decorative. The old PIN is presented alongside
+ * the new one, so a wrong attempt spends a retry exactly like VERIFY.
+ */
+static int change_reference(uint8_t p1, uint8_t p2,
+                            const uint8_t *data, size_t lc,
+                            uint8_t *out, size_t out_max)
+{
+    if (p1 != 0x00 || p2 != 0x80)
+        return put_sw(out, out_max, PIV_SW_WRONG_P1P2);
+    if (!_hal || !_hal->pin_check || !_hal->pin_set || !_hal->pin_retries_get)
+        return put_sw(out, out_max, PIV_SW_INS_UNSUPPORTED);
+
+    int retries = _hal->pin_retries_get();
+    if (retries <= 0)
+        return put_sw(out, out_max, PIV_SW_AUTH_BLOCKED);
+
+    /* Old block ‖ new block, 8 bytes each. */
+    if (!data || lc != 2 * PIV_PIN_BLOCK_LEN)
+        return put_sw(out, out_max, PIV_SW_WRONG_LENGTH);
+
+    size_t old_len = pin_block_len(data);
+    size_t new_len = pin_block_len(data + PIV_PIN_BLOCK_LEN);
+    if (old_len == 0 || new_len == 0)
+        return put_sw(out, out_max, PIV_SW_WRONG_DATA);
+
+    if (!_hal->pin_check(data, old_len)) {
+        /*
+         * A wrong current PIN costs a retry and drops the session, the same as
+         * VERIFY — otherwise this instruction is a counter-free oracle for
+         * guessing the PIN.
+         */
+        _pin_verified = 0;
+        retries--;
+        if (_hal->pin_retries_set)
+            _hal->pin_retries_set(retries);
+        if (retries <= 0)
+            return put_sw(out, out_max, PIV_SW_AUTH_BLOCKED);
+        return put_sw(out, out_max, PIV_SW_VERIFY_FAILED(retries));
+    }
+
+    if (!_hal->pin_set(data + PIV_PIN_BLOCK_LEN, new_len))
+        return put_sw(out, out_max, PIV_SW_WRONG_DATA);
+
+    _pin_verified = 1;
+    if (_hal->pin_retries_set)
+        _hal->pin_retries_set(PIV_PIN_MAX_RETRIES);
+    return put_sw(out, out_max, PIV_SW_OK);
+}
+
+/* --- Entry point ---------------------------------------------------------- */
+
+void piv_init(const piv_hal_t *hal)
+{
+    _hal = hal;
+    piv_reset();
+}
+
+void piv_reset(void)
+{
+    _pin_verified = 0;
+    pending_clear();
+}
+
+int piv_pin_is_verified(void) { return _pin_verified; }
+
 int piv_handle_apdu(const uint8_t *cmd, size_t cmd_len, uint8_t *out, size_t out_max)
 {
-    size_t len = 0;
     if (!cmd || !out || out_max < 2)
         return -1;
-    if (cmd_len < 4) {
-        put_sw(out, &len, 0x6700);
-        return (int)len;
-    }
+    if (cmd_len < 4)
+        return put_sw(out, out_max, PIV_SW_WRONG_LENGTH);
 
     uint8_t cla = cmd[0];
     uint8_t ins = cmd[1];
     uint8_t p1 = cmd[2];
     uint8_t p2 = cmd[3];
-    (void)cla;
 
-    if (ins == 0xA4) {
-        /* SELECT */
-        size_t lc = (cmd_len > 4) ? cmd[4] : 0;
-        if (cmd_len < 5 + lc) {
-            put_sw(out, &len, 0x6700);
-            return (int)len;
-        }
-        if (p1 == 0x04 && lc == PIV_AID_LEN &&
-            memcmp(cmd + 5, PIV_AID, PIV_AID_LEN) == 0) {
-            put_sw(out, &len, 0x9000);
-            return (int)len;
-        }
-        put_sw(out, &len, 0x6A82);
-        return (int)len;
+    /*
+     * PIV uses class 0x00: no command chaining (bit 0x10), no secure
+     * messaging (0x0C), logical channel 0 (0x03). Masking those bits off and
+     * carrying on would misread the APDU rather than refuse it — a chained
+     * command's body is not a whole body.
+     */
+    if (cla != 0x00)
+        return put_sw(out, out_max, PIV_SW_CLA_UNSUPPORTED);
+
+    /*
+     * ISO 7816-4 short APDU cases. The ambiguity that matters is case 2: in a
+     * 5-byte APDU the fifth byte is **Le**, not Lc. Reading it as Lc makes
+     * every `00 C0 00 00 xx` GET RESPONSE look like a body truncated to
+     * nothing, which breaks certificate chaining and therefore login.
+     *
+     *   4              case 1  no body, no response expected
+     *   5              case 2  Le only        (0 means 256)
+     *   5 + Lc         case 3  body, no Le
+     *   5 + Lc + 1     case 4  body and Le    (0 means 256)
+     */
+    size_t lc = 0, le = 0;
+    const uint8_t *data = NULL;
+
+    if (cmd_len == 4) {
+        le = 0;
+    } else if (cmd_len == 5) {
+        le = cmd[4] == 0 ? 256 : cmd[4];
+    } else {
+        lc = cmd[4];
+        if (lc == 0 || cmd_len < 5 + lc)
+            return put_sw(out, out_max, PIV_SW_WRONG_LENGTH);
+        data = cmd + 5;
+        if (cmd_len == 5 + lc)
+            le = 256;
+        else if (cmd_len == 5 + lc + 1)
+            le = cmd[5 + lc] == 0 ? 256 : cmd[5 + lc];
+        else
+            return put_sw(out, out_max, PIV_SW_WRONG_LENGTH);
     }
 
-    (void)p2;
-    put_sw(out, &len, 0x6D00); /* INS not supported in stub */
-    return (int)len;
+    /*
+     * Any command other than GET RESPONSE abandons a chained response. A
+     * client that interleaves other commands has lost its place, and handing
+     * it the tail of a stale certificate would be worse than an error.
+     */
+    if (ins != PIV_INS_GET_RESPONSE && _pending)
+        pending_clear();
+
+    switch (ins) {
+    case PIV_INS_SELECT: {
+        if (p1 != 0x04 || p2 != 0x00)
+            return put_sw(out, out_max, PIV_SW_WRONG_P1P2);
+        /*
+         * Prefix match, not exact match. The trailing 01 00 is the PIV
+         * application version, not part of the identity: real clients select
+         * with the right-truncated 9-byte AID (SP 800-73), and P1=0x04 is
+         * defined as a DF-name prefix match. Requiring all 11 bytes answered
+         * 6A82 to those clients, which is invisible to the applet but fatal to
+         * both the pam_pkcs11 and the CryptoTokenKit login paths.
+         */
+        if (lc < PIV_AID_MIN_LEN || lc > PIV_AID_LEN || !data ||
+            memcmp(data, PIV_AID, lc) != 0)
+            return put_sw(out, out_max, PIV_SW_NOT_FOUND);
+        /* Selecting the application resets PIN state, as a card reset would. */
+        piv_reset();
+        return select_response(le, out, out_max);
+    }
+
+    case PIV_INS_GET_RESPONSE: {
+        if (!_pending)
+            return put_sw(out, out_max, PIV_SW_INS_UNSUPPORTED);
+        if (p1 != 0x00 || p2 != 0x00)
+            return put_sw(out, out_max, PIV_SW_WRONG_P1P2);
+        return emit_pending(out, out_max, le ? le : 256);
+    }
+
+    case PIV_INS_GET_DATA: {
+        uint32_t tag;
+        const uint8_t *obj;
+        size_t obj_len;
+
+        if (p1 != 0x3F || p2 != 0xFF)
+            return put_sw(out, out_max, PIV_SW_WRONG_P1P2);
+        if (!data || !parse_object_tag(data, lc, &tag))
+            return put_sw(out, out_max, PIV_SW_WRONG_DATA);
+        if (!_hal || !_hal->get_object)
+            return put_sw(out, out_max, PIV_SW_NOT_FOUND);
+        if (!_hal->get_object(tag, &obj, &obj_len) || !obj)
+            return put_sw(out, out_max, PIV_SW_NOT_FOUND);
+        return respond(obj, obj_len, le, out, out_max);
+    }
+
+    case PIV_INS_PUT_DATA: {
+        uint32_t tag;
+        if (p1 != 0x3F || p2 != 0xFF)
+            return put_sw(out, out_max, PIV_SW_WRONG_P1P2);
+        /* Provisioning writes a credential, so it needs the PIN. */
+        if (!_pin_verified)
+            return put_sw(out, out_max, PIV_SW_SECURITY_NOT_SATISFIED);
+        if (!data || !parse_object_tag(data, lc, &tag))
+            return put_sw(out, out_max, PIV_SW_WRONG_DATA);
+        if (!_hal || !_hal->set_object)
+            return put_sw(out, out_max, PIV_SW_INS_UNSUPPORTED);
+        {
+            /* Value follows the 0x5C tag list as a 0x53 wrapper. */
+            size_t off = 1, tl;
+            if (!tlv_get_len(data, lc, &off, &tl))
+                return put_sw(out, out_max, PIV_SW_WRONG_DATA);
+            off += tl;
+            if (off + 1 >= lc || data[off] != 0x53)
+                return put_sw(out, out_max, PIV_SW_WRONG_DATA);
+            off++;
+            size_t vlen;
+            if (!tlv_get_len(data, lc, &off, &vlen) || off + vlen > lc)
+                return put_sw(out, out_max, PIV_SW_WRONG_DATA);
+            if (!_hal->set_object(tag, data + off, vlen))
+                return put_sw(out, out_max, PIV_SW_WRONG_DATA);
+        }
+        return put_sw(out, out_max, PIV_SW_OK);
+    }
+
+    case PIV_INS_VERIFY:
+        return verify(p1, p2, data, lc, out, out_max);
+
+    case PIV_INS_CHANGE_REFERENCE:
+        return change_reference(p1, p2, data, lc, out, out_max);
+
+    case PIV_INS_GENERATE_KEYPAIR:
+        return generate_keypair(p1, p2, data, lc, le, out, out_max);
+
+    case PIV_INS_GENERAL_AUTHENTICATE:
+        if (!data)
+            return put_sw(out, out_max, PIV_SW_WRONG_DATA);
+        return general_authenticate(p1, p2, data, lc, le, out, out_max);
+
+    default:
+        return put_sw(out, out_max, PIV_SW_INS_UNSUPPORTED);
+    }
 }
