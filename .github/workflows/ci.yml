@@ -27,6 +27,26 @@ jobs:
           pip install -r tests/requirements-host.txt
           pytest tests/host -q
 
+      # core/piv and drivers/usb_ccid are in no build_src_filter, so nothing
+      # else in CI ever compiles them. Syntax-only: no flash budget cost.
+      - name: Scaffold syntax check
+        run: ./scripts/syntax_check_scaffolds.sh
+
+      # The BLE reassembler is where hostile input lands; ASan + UBSan over
+      # randomised fragment streams. libFuzzer is not available on every dev
+      # machine, so the portable driver is what gates the PR.
+      - name: BLE reassembly fuzz (ASan/UBSan)
+        run: pytest tests/host/test_ble_fido_fuzz.py -q
+
+      # Longer libFuzzer run; Linux only, where the runtime ships.
+      - name: BLE reassembly libFuzzer smoke
+        run: |
+          clang -std=c11 -g -DBLE_FUZZ_LIBFUZZER \
+            -fsanitize=fuzzer,address,undefined \
+            -I core/ble_fido \
+            -o /tmp/ble_fuzz tests/fuzz/ble_fuzz_driver.c core/ble_fido/ble_fido.c
+          /tmp/ble_fuzz -max_total_time=60 -max_len=4096
+
       - name: Install PlatformIO
         run: pip install -U platformio
 

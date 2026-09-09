@@ -19,6 +19,14 @@ python3 -m pip install -q -r tests/requirements-host.txt
 python3 -m pytest tests/host -q
 
 echo
+echo "=== Scaffold syntax check (sources outside build_src_filter) ==="
+./scripts/syntax_check_scaffolds.sh
+
+echo
+echo "=== BLE reassembly fuzz (ASan/UBSan over random fragment streams) ==="
+python3 -m pytest tests/host/test_ble_fido_fuzz.py -q
+
+echo
 echo "=== L1 Unity (compile only, no upload) ==="
 if command -v pio >/dev/null 2>&1; then
   for e in "${UNITY_ENVS[@]}"; do
