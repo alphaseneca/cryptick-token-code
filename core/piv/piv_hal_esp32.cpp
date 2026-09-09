@@ -16,6 +16,9 @@
 
 extern "C" {
 #include "crypto.h"
+#include "ctap.h"
+#include "u2f.h"
+#include "extensions/wallet.h"
 int ctap_encode_der_sig(uint8_t const *const in_sigbuf, uint8_t *const out_sigder);
 int ctap_user_presence_test(uint32_t delay_ms);
 void device_set_ui_label(const char *label);
@@ -125,7 +128,36 @@ int slot_generation_bump(uint8_t slot)
  * the master secret survives — which matters, because a PIV certificate is
  * issued against it.
  */
-void slot_label(uint8_t slot, uint8_t out[16])
+/** Length of the PIV key-derivation input. See the assertions below. */
+constexpr size_t kSlotLabelLen = 16;
+
+/*
+ * PIV and FIDO keys must be distinct material (daemon PROJECT.md §15.9).
+ *
+ * Both derive through generate_private_key(), which is HMAC(master_secret,
+ * input) -- so "distinct" means the two can never be handed the same input.
+ * FIDO's inputs are all attacker-reachable in length and partly in content:
+ *
+ *   CTAP2 credential   sizeof(CredentialId)  = 70 bytes
+ *   U2F key handle     U2F_KEY_HANDLE_SIZE   = 48 bytes
+ *   custom credential  >= WALLET_MIN_LENGTH  = 24 bytes, and must open with
+ *                                              WALLET_TAG
+ *
+ * The PIV label is 16 bytes, shorter than all of them, so no FIDO request can
+ * produce one. That is an arithmetic accident rather than a construction: cut
+ * the label, or let some future FIDO path take a 16-byte credential, and a
+ * chosen credential id would derive a PIV signing key with nothing to stop it.
+ *
+ * These assertions make the accident an invariant, so the build breaks instead.
+ */
+static_assert(kSlotLabelLen != sizeof(CredentialId),
+              "PIV label length collides with a CTAP2 credential id");
+static_assert(kSlotLabelLen != U2F_KEY_HANDLE_SIZE,
+              "PIV label length collides with a U2F key handle");
+static_assert(kSlotLabelLen < WALLET_MIN_LENGTH,
+              "PIV label is long enough to be reachable as a custom credential");
+
+void slot_label(uint8_t slot, uint8_t out[kSlotLabelLen])
 {
     uint32_t gen = slot_generation(slot);
     const uint8_t prefix[] = {'c', 'r', 'y', 'p', 't', 'i', 'c', 'k',
@@ -140,7 +172,7 @@ void slot_label(uint8_t slot, uint8_t out[16])
 
 void load_slot_key(uint8_t slot)
 {
-    uint8_t label[16];
+    uint8_t label[kSlotLabelLen];
     slot_label(slot, label);
     crypto_ecc256_load_key(label, sizeof(label), NULL, 0);
 }
@@ -149,7 +181,7 @@ int piv_public_key(uint8_t slot, uint8_t *out65)
 {
     if (!out65)
         return 0;
-    uint8_t label[16];
+    uint8_t label[kSlotLabelLen];
     slot_label(slot, label);
 
     uint8_t priv[32];
