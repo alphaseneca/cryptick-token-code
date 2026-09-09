@@ -20,8 +20,18 @@
 - [ ] Manual browser WebAuthn demo site sign-off (human / OS UI; see docs/WEBAUTHN_L3.md)
 - [ ] U2F polish / broader CTAP1 host coverage
 - [ ] PIN policy polish / resident-key UX
-- [ ] USB CCID + PIV 9a/9d for Mac login (`docs/MAC_LOGIN.md` — stub only)
+- [x] PIV applet: SELECT/GET DATA/PUT DATA/VERIFY/GENERAL AUTHENTICATE, response
+      chaining, PIN retry counter, keys derived per slot (`core/piv/`)
+- [x] PIV PIN change + key generation (`CHANGE REFERENCE DATA`, `GENERATE`)
+- [x] CCID bulk protocol layer (`drivers/ccid_proto.c`, host-tested against the applet)
+- [ ] CCID USB descriptors + endpoints — the last gap before Mac/Linux login
+- [ ] CCC + CHUID objects synthesised at first boot (else `GET DATA` answers 6A82)
+- [ ] Host tooling to issue a certificate against a `GENERATE` public key
+- [ ] PIV over BLE via a host-side virtual reader
+- [ ] PIV provisioning: publish slot public keys so a cert can be issued
 - [ ] eFuse-backed wrap key + flash encryption (`docs/SECURITY_ROADMAP.md`)
+- [x] FIDO2 over BLE (GATT `0xFFFD`, LESC+MITM passkey on the OLED — `docs/BLE_FIDO.md`)
+- [ ] BLE bench sign-off: pair from Windows/Chrome native BLE stack and `libfido2`
+- [ ] PIV over BLE via a host-side virtual reader (`docs/MAC_LOGIN.md`)
 
-Explicitly out of scope: BLE transport (the no-op `core/ble_fido/` scaffold was
-removed), ESP8266 / Super Mini ports.
+Explicitly out of scope: ESP8266 / Super Mini ports.

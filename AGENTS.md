@@ -70,7 +70,7 @@ Brand: VID `0x1209`, PID `0xBEEE`, product **Cryptick Token**.
 ## Architecture (layers)
 
 ```text
-board_config → drivers (USB gated, R558-S) → core (TOTP, Solo FIDO) → systems + host → main
+board_config → drivers (USB gated, R558-S) → core (TOTP, Solo FIDO, BLE FIDO) → systems + host → main
   host: serial (CDC logs + console), totp_storage, cryptick_oath_hid
 ```
 
@@ -80,7 +80,11 @@ board_config → drivers (USB gated, R558-S) → core (TOTP, Solo FIDO) → syst
 - Only `display_system` draws the OLED.
 - Only `nav_system` changes `UiState`; `event_bus.h`'s enum is append-only.
 - Cross-system communication: `event_bus` (or FIDO `_fido_ui_request` / `ctaphid_confirm_*`).
-- No BLE, SSD1306 stubs, Super Mini, or ESP8266 envs.
+- BLE is a **product transport**, not a scaffold: `core/ble_fido/` implements the
+  FIDO BLE wire format (GATT `0xFFFD`), which is *not* CTAPHID tunnelled over BLE.
+  It is a second producer feeding the one FIDO task — never a second caller of
+  `ctap_request()`. See [docs/BLE_FIDO.md](docs/BLE_FIDO.md).
+- No SSD1306 stubs, Super Mini, or ESP8266 envs.
 
 **Sleep.** `UI_SLEEP` powers the OLED down, stops the fingerprint matcher and
 drops the unlock session after `UI_SLEEP_TIMEOUT_SEC`. The MCU and USB stay up —
@@ -251,7 +255,6 @@ Work these in order unless the user prioritizes otherwise:
 
 ### Do not do by default
 
-- BLE (stubs removed; not in product MVP)
 - ESP8266 / Super Mini ports
 - Soft key remapping tables; change GPIO numbers only
 
@@ -287,20 +290,24 @@ Work these in order unless the user prioritizes otherwise:
 | `include/cryptick_log.h` | `CLOG_*` levels and macros |
 | `drivers/fingerprint_r558s.*` | R558-S UART protocol |
 | `drivers/usb_device.*` | CDC + FIDO HID + bootloader entry |
-| `drivers/usb_ccid.*` | CCID scaffold for Mac login (not compiled yet) |
+| `drivers/usb_ccid.*` | TinyUSB descriptors for CCID — **not written**; the last gap before login |
 | `src/systems/*` | App systems, all owned by the Arduino loop |
 | `src/host/*` | Console, storage, OATH-over-HID, credential lock |
 | `core/secret_crypto.*` | AES-GCM wrap key + secret blobs |
 | `core/cryptick_log.cpp` | Unified CDC log sink (mutex-guarded) |
 | `core/totp.*` | TOTP + strict base32 decode |
 | `core/fido2/*` | Vendored Solo CTAP stack + `hal_esp32.cpp` |
-| `core/piv/*` | PIV APDU stub (not compiled yet) |
+| `core/ble_fido/*` | FIDO BLE transport: framing (host-testable) + NimBLE GATT |
+| `core/piv/*` | PIV applet (SP 800-73-4) + ESP32 hooks |
+| `drivers/ccid_proto.*` | CCID bulk protocol; host-tested, no USB interface yet |
 | `test/test_*/test_main.cpp` | L1 Unity suites |
 | `tests/{host,device,support}` | L0/L2 pytest and shared transport helpers |
+| `scripts/syntax_check_scaffolds.sh` | Compile-checks sources outside `build_src_filter` |
 | `docs/datasheets/` | R558-S + R557 manuals, PCB schematic |
 
-**Removed:** Super Mini / ESP8266 envs, `display_ssd1306`, `ble` and the
-`core/ble_fido` no-op scaffold, empty `usb_hid` stubs, `fido_bridge`,
+**Removed:** Super Mini / ESP8266 envs, `display_ssd1306`, the original
+`core/ble_fido` no-op scaffold (replaced by the real transport, not deleted),
+empty `usb_hid` stubs, `fido_bridge`,
 `EspSoftwareSerial`, and the `hal/device_hal.h` shim (its declarations live in
 `core/fido2/device.h`).
 

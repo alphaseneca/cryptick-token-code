@@ -22,6 +22,10 @@
 #include "systems/display_system.h"
 
 #include "usb_device.h"
+#if CRYPTICK_BLE_FIDO
+#include "ble_fido.h"
+#endif
+#include "piv.h"
 #include "ctaphid.h"
 #include "crypto.h"
 
@@ -152,6 +156,15 @@ void setup()
     device_hal_init();
     CLOG_D("BOOT", "FIDO HAL");
 
+#if CRYPTICK_BLE_FIDO
+    /*
+     * After device_hal_init(): the GATT write callback posts to the FIDO
+     * task's queue, which that call creates.
+     */
+    ble_fido_gatt_init();
+    CLOG_D("BOOT", "FIDO BLE");
+#endif
+
     loadConfiguration(credentials);
     display_system_set_credentials(&credentials);
     display_system_set_user("User");
@@ -160,6 +173,9 @@ void setup()
     auth_system_set_fingerprint_enabled(fp_system_ready());
 
     crypto_ecc256_init();
+
+    /* After crypto: slot keys are derived from the master secret. */
+    piv_hal_init();
 
     CLOG_I("BOOT", "Ready — type HELP");
     g_setup_finished = true;
