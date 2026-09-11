@@ -108,6 +108,65 @@ typedef void (*ble_fido_deliver_fn)(uint8_t cmd, const uint8_t *msg, uint16_t le
 void ble_fido_set_notify(ble_fido_notify_fn fn);
 void ble_fido_set_deliver(ble_fido_deliver_fn fn);
 
+/* --- Contexts ------------------------------------------------------------ */
+
+/*
+ * One context per GATT service.
+ *
+ * The framing above is not specific to FIDO: PIV over BLE reuses it byte for
+ * byte on its own service, so the state it keeps has to be per-service rather
+ * than per-image. A second service sharing one reassembler would let a
+ * fragment written to one interleave with a message being assembled on the
+ * other, and neither peer would have any way to tell.
+ *
+ * The message buffer is supplied by the caller because the two services cap
+ * messages very differently -- CTAP needs 1200 bytes, PIV 261 -- and a fixed
+ * buffer per context would spend most of the second one on nothing.
+ *
+ * Treat the fields as private; they are exposed only so a context can be a
+ * plain object with no allocator behind it.
+ */
+
+/** PING is a FIDO command. A service that does not offer it refuses it. */
+#define BLE_FIDO_CTX_NO_PING 0x01u
+
+typedef struct {
+    uint8_t  *msg;       /* caller-owned reassembly buffer */
+    uint16_t  msg_cap;   /* its size, and the largest HLEN accepted */
+    uint16_t  declared;  /* HLEN from the init fragment */
+    uint16_t  received;  /* bytes delivered so far */
+    uint8_t   cmd;       /* command from the init fragment */
+    uint8_t   seq;       /* SEQ of the last continuation */
+    int       active;    /* mid-reassembly */
+    uint16_t  cp_len;    /* published control point length */
+    uint32_t  flags;
+    ble_fido_notify_fn  notify;
+    ble_fido_deliver_fn deliver;
+} ble_fido_ctx_t;
+
+/**
+ * Prepare a context around a caller-owned buffer.
+ *
+ * `cap` is both the buffer size and the reassembly ceiling: an init fragment
+ * declaring more is refused before anything is copied.
+ */
+void ble_fido_ctx_init(ble_fido_ctx_t *ctx, uint8_t *buf, uint16_t cap,
+                       uint32_t flags);
+
+void ble_fido_ctx_set_notify(ble_fido_ctx_t *ctx, ble_fido_notify_fn fn);
+void ble_fido_ctx_set_deliver(ble_fido_ctx_t *ctx, ble_fido_deliver_fn fn);
+void ble_fido_ctx_reset(ble_fido_ctx_t *ctx);
+uint8_t ble_fido_ctx_rx_fragment(ble_fido_ctx_t *ctx, const uint8_t *frag, uint16_t len);
+void ble_fido_ctx_set_mtu(ble_fido_ctx_t *ctx, uint16_t att_mtu);
+uint16_t ble_fido_ctx_control_point_length(const ble_fido_ctx_t *ctx);
+int ble_fido_ctx_send_response(ble_fido_ctx_t *ctx, uint8_t cmd, const uint8_t *data, uint16_t len);
+int ble_fido_ctx_send_keepalive(ble_fido_ctx_t *ctx, uint8_t status);
+int ble_fido_ctx_send_error(ble_fido_ctx_t *ctx, uint8_t err);
+int ble_fido_ctx_is_receiving(const ble_fido_ctx_t *ctx);
+
+/** The context behind the no-argument calls below: the FIDO service on 0xFFFD. */
+ble_fido_ctx_t *ble_fido_default_ctx(void);
+
 /* --- Transport ----------------------------------------------------------- */
 
 /*
