@@ -23,6 +23,7 @@
 
 #include "usb_device.h"
 #include "usb_ccid.h"
+#include "ble_piv.h"
 #if CRYPTICK_BLE_FIDO
 #include "ble_fido.h"
 #endif
@@ -177,6 +178,11 @@ void setup()
 
     /* After crypto: slot keys are derived from the master secret. */
     piv_hal_init();
+#if defined(CRYPTICK_BLE_PIV) && CRYPTICK_BLE_PIV
+    /* After piv_hal_init() and after ble_fido_gatt_init(), which owns the
+     * NimBLE server this service is added to. */
+    ble_piv_gatt_init();
+#endif
 #if defined(CRYPTICK_USB_CCID) && CRYPTICK_USB_CCID
     /* After piv_hal_init(): the first CCID message can arrive as soon as the
      * host powers the card, and it lands in the applet. */

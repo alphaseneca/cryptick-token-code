@@ -18,6 +18,9 @@
 
 #include "ble_fido.h"
 #include "device.h"
+#if defined(CRYPTICK_BLE_PIV) && CRYPTICK_BLE_PIV
+#include "ble_piv.h"
+#endif
 #include <NimBLEDevice.h>
 #if __has_include("nimble/nimble/host/include/host/ble_att.h")
 #include "nimble/nimble/host/include/host/ble_att.h"
@@ -118,6 +121,11 @@ class ServerCallbacks : public NimBLEServerCallbacks {
         g_connected = false;
         /* Drop any half-received request; the next peer starts clean. */
         ble_fido_reset();
+#if defined(CRYPTICK_BLE_PIV) && CRYPTICK_BLE_PIV
+        /* The PIV service rides the same link, so it loses its half-assembled
+         * message at the same moment this one does. */
+        ble_piv_reset();
+#endif
         /* A peer that disconnects mid-pairing must not leave a stale passkey
          * on the OLED — it would be meaningless and looks like a live prompt. */
         device_clear_pairing_passkey();
@@ -130,6 +138,10 @@ class ServerCallbacks : public NimBLEServerCallbacks {
         (void)info;
         ble_fido_set_mtu(mtu);
         publish_control_point_length();
+#if defined(CRYPTICK_BLE_PIV) && CRYPTICK_BLE_PIV
+        /* One link, one MTU: both services publish it to their own peers. */
+        ble_piv_set_mtu(mtu);
+#endif
         CLOG_I("BLE", "ATT MTU=%u → fidoControlPointLength=%u",
                (unsigned)mtu, (unsigned)ble_fido_control_point_length());
     }

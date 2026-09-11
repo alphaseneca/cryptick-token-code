@@ -16,6 +16,10 @@
 #endif
 #if CRYPTICK_BLE_FIDO
 #include "ble_fido.h"
+#if defined(CRYPTICK_BLE_PIV) && CRYPTICK_BLE_PIV
+#include "ble_piv.h"
+#include "piv.h"
+#endif
 #include "ctap.h"
 /* The framing layer bounds its reassembly buffer independently so it can be
  * host-compiled; if the CTAP ceiling ever moves, they must move together. */
@@ -133,6 +137,70 @@ int fido_ble_submit_request(uint8_t cmd, const uint8_t *msg, uint16_t len)
     }
     return 1;
 }
+
+#if defined(CRYPTICK_BLE_PIV) && CRYPTICK_BLE_PIV
+/*
+ * PIV over BLE is a third producer for this same single consumer.
+ *
+ * It must not be a second consumer, and not only because piv_handle_apdu() is
+ * unlocked: PIV and FIDO share the device's user-presence gate, so one
+ * fingerprint touch must never be able to satisfy whichever ceremony reads the
+ * flag first. Running both on this task removes that by construction rather
+ * than by a second flag that would have to be kept in step.
+ */
+typedef struct {
+    uint16_t len;
+    uint8_t  data[BLE_PIV_MAX_MSG];
+} piv_ble_request_t;
+
+static piv_ble_request_t      _piv_pool[2];
+static uint8_t                _piv_pool_next;
+static QueueHandle_t volatile _piv_queue = NULL;
+
+int piv_ble_submit_apdu(const uint8_t *apdu, uint16_t len)
+{
+    if (!_piv_queue || !apdu || len == 0 || len > BLE_PIV_MAX_MSG)
+        return 0;
+    /*
+     * One transaction in flight across both transports. Refused rather than
+     * queued, for the reason the CTAP path refuses: a queued APDU would demand
+     * its own fingerprint minutes later, against a host that has given up.
+     */
+    if (_ctap_busy || uxQueueSpacesAvailable(_piv_queue) == 0) {
+        CLOG_W("PIV-BLE", "APDU refused: a transaction is already in flight");
+        return 0;
+    }
+
+    piv_ble_request_t *req = &_piv_pool[_piv_pool_next & 1u];
+    _piv_pool_next++;
+    req->len = len;
+    memcpy(req->data, apdu, len);
+
+    if (xQueueSend((QueueHandle_t)_piv_queue, &req, 0) != pdTRUE) {
+        CLOG_W("PIV-BLE", "APDU refused: queue full");
+        return 0;
+    }
+    return 1;
+}
+
+/** Run one APDU through the applet, on the FIDO task. Never via ctap_request(). */
+static void piv_ble_dispatch(piv_ble_request_t *req)
+{
+    static uint8_t out[BLE_PIV_MAX_MSG];
+
+    CLOG_I("PIV-BLE", "APDU ins=0x%02X len=%u",
+           req->len > 1 ? req->data[1] : 0, (unsigned)req->len);
+    _ctap_busy = true;
+
+    int n = piv_handle_apdu(req->data, req->len, out, sizeof(out));
+    if (n > 0)
+        ble_piv_send_response(out, (uint16_t)n);
+    else
+        ble_piv_send_error(BLE_FIDO_ERR_OTHER);
+
+    _ctap_busy = false;
+}
+#endif /* CRYPTICK_BLE_PIV */
 
 /** Run one reassembled BLE request through the CTAP core, on the FIDO task. */
 static void ble_dispatch(fido_ble_request_t *req)
@@ -614,9 +682,22 @@ void _fido_task_loop(void *pvParameters) {
             ble_dispatch(ble_req);
         }
 #endif
+#if defined(CRYPTICK_BLE_PIV) && CRYPTICK_BLE_PIV
+        /*
+         * Third producer, same consumer. PIV never reaches ctap_request();
+         * it runs here so that it and CTAP cannot both be inside a presence
+         * ceremony at once.
+         */
+        piv_ble_request_t *piv_req = NULL;
+        if (_piv_queue &&
+            xQueueReceive((QueueHandle_t)_piv_queue, &piv_req, 0) == pdTRUE &&
+            piv_req) {
+            piv_ble_dispatch(piv_req);
+        }
+#endif
 #if defined(CRYPTICK_USB_CCID) && CRYPTICK_USB_CCID
         /*
-         * Third producer, same consumer. PIV signing waits on a fingerprint
+         * Fourth producer, same consumer. PIV signing waits on a fingerprint
          * through the same presence gate as CTAP, so it has to run on this
          * task: doing it on the TinyUSB task would stall CDC and HID for the
          * length of the wait, which is indistinguishable from a hung device.
@@ -657,6 +738,12 @@ void device_init_esp32() {
     if (_ble_queue == NULL) {
         _ble_queue = xQueueCreate(1, sizeof(fido_ble_request_t *));
         CLOG_I("BLE", "Request queue initialized.");
+    }
+#endif
+#if defined(CRYPTICK_BLE_PIV) && CRYPTICK_BLE_PIV
+    if (_piv_queue == NULL) {
+        _piv_queue = xQueueCreate(1, sizeof(piv_ble_request_t *));
+        CLOG_I("PIV-BLE", "APDU queue initialized.");
     }
 #endif
 
