@@ -22,6 +22,7 @@
 #include "systems/display_system.h"
 
 #include "usb_device.h"
+#include "usb_ccid.h"
 #if CRYPTICK_BLE_FIDO
 #include "ble_fido.h"
 #endif
@@ -176,6 +177,11 @@ void setup()
 
     /* After crypto: slot keys are derived from the master secret. */
     piv_hal_init();
+#if defined(CRYPTICK_USB_CCID) && CRYPTICK_USB_CCID
+    /* After piv_hal_init(): the first CCID message can arrive as soon as the
+     * host powers the card, and it lands in the applet. */
+    usb_ccid_init();
+#endif
 
     CLOG_I("BOOT", "Ready — type HELP");
     g_setup_finished = true;

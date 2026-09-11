@@ -1,4 +1,5 @@
 #include "usb_device.h"
+#include "usb_ccid.h"
 #include <cryptick_log.h>
 #include <string.h>
 #include <Arduino.h>
@@ -147,6 +148,15 @@ void usb_device_init(void)
      *   HID + CDC instances register → USB.begin() binds OTG stack.
      * CDC_ON_BOOT must be 0 so we own the CDC instance (product console).
      */
+    /*
+     * Before USB.begin() and after the CDC instance exists: CDC reserves its
+     * endpoints at construction, and this reserves from what is left. Returns
+     * false and changes nothing if the interface is latched off or the budget
+     * is gone, so a CCID that cannot be added still leaves a composite that
+     * enumerates and can be reflashed.
+     */
+    usb_ccid_register();
+
     _fido_hid.begin();
     _cdc.onEvent(usb_cdc_event);
     _cdc.begin(115200);
@@ -163,12 +173,18 @@ void usb_device_init(void)
     }
     delay(50);
 
+    /* Reaching the configured state is the only proof the descriptors are
+     * acceptable to a host, so it is what clears the CCID failure latch. */
+    if (tud_inited() && tud_mounted())
+        usb_ccid_mount_ok();
+
     CLOG_I("USB", "TinyUSB product CDC+HID");
     CLOG_I("USB", "VID=0x%04X PID=0x%04X mounted=%d cdc=%d",
                        CRYPTICK_USB_VID, CRYPTICK_USB_PID,
                        (tud_inited() && tud_mounted()) ? 1 : 0,
                        _cdc ? 1 : 0);
-    CLOG_I("USB", "host: 1209:BEEE CDC@115200 + FIDO HID");
+    CLOG_I("USB", "host: 1209:BEEE CDC@115200 + FIDO HID%s",
+                       usb_ccid_enabled() ? " + CCID" : "");
     CLOG_I("USB", "reflash: 1200bps | BOOTLOADER | HID ENTERBOOT");
     CryptickLog.flush();
 }

@@ -11,6 +11,9 @@
 #include <cryptick_log.h>
 #include <RTClib.h>
 #include "usb_device.h"
+#if defined(CRYPTICK_USB_CCID) && CRYPTICK_USB_CCID
+#include "usb_ccid.h"
+#endif
 #if CRYPTICK_BLE_FIDO
 #include "ble_fido.h"
 #include "ctap.h"
@@ -610,6 +613,15 @@ void _fido_task_loop(void *pvParameters) {
             ble_req) {
             ble_dispatch(ble_req);
         }
+#endif
+#if defined(CRYPTICK_USB_CCID) && CRYPTICK_USB_CCID
+        /*
+         * Third producer, same consumer. PIV signing waits on a fingerprint
+         * through the same presence gate as CTAP, so it has to run on this
+         * task: doing it on the TinyUSB task would stall CDC and HID for the
+         * length of the wait, which is indistinguishable from a hung device.
+         */
+        usb_ccid_pump();
 #endif
         ctaphid_check_timeouts();
         
