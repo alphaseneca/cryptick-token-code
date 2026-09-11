@@ -19,9 +19,29 @@
 #include "ble_fido.h"
 #include "device.h"
 #include <NimBLEDevice.h>
+#if __has_include("nimble/nimble/host/include/host/ble_att.h")
+#include "nimble/nimble/host/include/host/ble_att.h"
+#else
+#include "host/ble_att.h"
+#endif
 #include <cryptick_log.h>
 #include <esp_random.h>
 #include <string.h>
+
+/*
+ * NimBLE keeps one global permission mask for every CCCD it auto-creates, and
+ * it defaults to BLE_ATT_F_READ | BLE_ATT_F_WRITE -- no encryption, no
+ * authentication. The NIMBLE_PROPERTY flags on a characteristic do not reach
+ * it: they guard the characteristic *value*, and fidoStatus is notify-only, so
+ * it has no value access to guard. Subscribing is a CCCD write, which is why
+ * READ_ENC | READ_AUTHEN on fidoStatus does not stop an unbonded peer from
+ * subscribing to it.
+ *
+ * Declared here because ble_gatt_priv.h is internal to NimBLE, while the
+ * symbol itself is exported and has no public equivalent. The alternative is
+ * leaving every CCCD on this device world-writable.
+ */
+extern "C" void ble_gatts_set_clt_cfg_perm_flags(uint8_t flags);
 
 namespace {
 
@@ -166,6 +186,15 @@ void ble_fido_gatt_init(void)
     NimBLEDevice::setSecurityAuth(true /* bonding */, true /* MITM */, true /* SC */);
     NimBLEDevice::setSecurityIOCap(BLE_HS_IO_DISPLAY_ONLY);
 
+    /*
+     * Must precede createService(): the mask is read when each CCCD is
+     * registered, not when it is accessed. See the declaration above for why
+     * the characteristic flags do not cover this.
+     */
+    ble_gatts_set_clt_cfg_perm_flags(BLE_ATT_F_READ | BLE_ATT_F_READ_ENC |
+                                     BLE_ATT_F_READ_AUTHEN | BLE_ATT_F_WRITE |
+                                     BLE_ATT_F_WRITE_ENC | BLE_ATT_F_WRITE_AUTHEN);
+
     g_server = NimBLEDevice::createServer();
     g_server->setCallbacks(&g_server_callbacks);
 
@@ -188,15 +217,26 @@ void ble_fido_gatt_init(void)
         NIMBLE_PROPERTY::NOTIFY | NIMBLE_PROPERTY::READ_ENC |
             NIMBLE_PROPERTY::READ_AUTHEN);
 
+    /*
+     * The two descriptive characteristics are readable without a bond, which
+     * is what CTAP's table describes and what lets a host discover the service
+     * before it pairs. Gating them buys nothing -- the length is derived from
+     * the negotiated ATT MTU and the revision says "FIDO2", both of which the
+     * advertised service UUID already implies -- while costing a discovery
+     * path on any stack that reads them before initiating security.
+     *
+     * Writing the revision bitfield is a different matter: it selects the
+     * protocol version this authenticator will speak, and an unbonded peer has
+     * no business changing that. WRITE therefore carries the same gate as the
+     * control point.
+     */
     g_control_point_len = svc->createCharacteristic(
-        BLE_FIDO_UUID_CONTROL_POINT_LEN,
-        NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::READ_ENC |
-            NIMBLE_PROPERTY::READ_AUTHEN);
+        BLE_FIDO_UUID_CONTROL_POINT_LEN, NIMBLE_PROPERTY::READ);
 
     g_revision = svc->createCharacteristic(
         BLE_FIDO_UUID_SERVICE_REVISION,
         NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE |
-            NIMBLE_PROPERTY::READ_ENC | NIMBLE_PROPERTY::READ_AUTHEN);
+            NIMBLE_PROPERTY::WRITE_ENC | NIMBLE_PROPERTY::WRITE_AUTHEN);
     /* FIDO2 only: this authenticator does not offer the U2F 1.1/1.2 profiles. */
     uint8_t revision = BLE_FIDO_REVISION_FIDO2;
     g_revision->setValue(&revision, 1);
