@@ -7,16 +7,22 @@
 | USB HID FIDO + OATH | Product path (see `docs/HID_HOST.md`) |
 | PIV applet | **Done** — SELECT/GET DATA/PUT DATA/VERIFY/CHANGE REFERENCE/GENERATE/GENERAL AUTHENTICATE, response chaining. 81 host tests |
 | CCID **protocol layer** | **Done** — `drivers/ccid_proto.c`, 25 host tests, drives the applet end to end |
-| CCID **USB interface** | **Not done** — no descriptors, no endpoints, `usb_ccid_enabled()` is false |
+| CCID **USB interface** | **Written, unverified on hardware** — descriptors, two bulk endpoints and a TinyUSB class driver. Descriptor bytes asserted off-device; *binding* is not |
 | CCC / CHUID objects | **Done** — synthesised on demand from a derived per-device GUID |
-| Certificate provisioning | Device side done (`GENERATE` publishes the public key); **no host tooling** |
+| Certificate provisioning | Device side done (`GENERATE` publishes the public key, chained `PUT DATA` writes the cert back). Host tooling is the daemon's, and the wire format is pinned by `tests/host/test_piv_provisioning.py` |
+| PIV over BLE | **Written, unverified on hardware** — service `FBF6EB90-…`, framing shared with `0xFFFD`, not advertised |
 | Mac `sc_auth` pair / unlock | **Not done** — do not claim finished Mac login |
 | Fingerprint gate for PIV | **Done** — routed through the shared presence gate, not a second flag |
 | Hardware verification | **None.** Nothing here has run on a device |
 
-**What still blocks a login,** in the order it bites: the CCID interface does
-not enumerate, so nothing can reach the applet; and no certificate exists,
-because nothing yet turns a `GENERATE` public key into an issued cert.
+**What still blocks a login,** in the order it bites: nobody has confirmed the
+CCID interface binds to a host class driver, and no certificate exists, because
+the tool that issues one lives in the daemon and is not written yet.
+
+The first of those is a hardware question and cannot be closed from the test
+suite. If a descriptor field is wrong, the class driver silently does not bind,
+which looks exactly like the device being absent — so treat "PIV did not show
+up" as unexplained until the descriptors have been read off a real host.
 
 ### Card identity
 
@@ -76,7 +82,9 @@ Reference: [Yubico macOS PIV login](https://developers.yubico.com/PIV/Guides/Sma
 | `core/piv/piv.c` | The applet: APDUs in, APDUs out, transport-independent | host, 81 cases |
 | `core/piv/piv_hal_esp32.cpp` | Key derivation, LittleFS objects, PIN in NVS, presence | compiles only |
 | `drivers/ccid_proto.c` | CCID bulk messages (PC/SC, pcscd, CryptoTokenKit speak this) | host, 25 cases |
-| `drivers/usb_ccid.cpp` | TinyUSB descriptors and endpoints | **not written** |
+| `drivers/ccid_descriptors.c` | The descriptor bytes, freestanding so they can be asserted | host, 9 cases |
+| `drivers/usb_ccid.cpp` | TinyUSB class driver, endpoints, hand-off to the FIDO task | compiles only |
+| `core/ble_fido/ble_piv_gatt_esp32.cpp` | PIV over BLE: GATT service and write callback | compiles only |
 
 The split mirrors `core/ble_fido/`: protocol logic is freestanding and host
 tested, and the part that needs a device is kept as small as possible. Every
@@ -103,13 +111,33 @@ DATA` is implemented, so there is now a way off it.
 
 ### What to build next
 
-1. **CCID descriptors** — class `0x0B`, the 54-byte functional descriptor with
-   `dwProtocols` advertising T=1 to match the ATR, and two bulk endpoints.
-   Check the endpoint budget against CDC+HID *first*; that is where adding a
-   third interface to a working composite usually fails.
-2. **Bulk reassembly** — a CCID message can span several 64-byte packets, and
-   `ccid_handle_message()` requires a complete one.
-3. **CCC and CHUID** — small identity objects a card is expected to have from
-   the factory. Synthesise them at first boot from the device identity.
-4. **Provisioning tooling** — read the public key via `GENERATE`, issue a
-   certificate, write it back with `PUT DATA`.
+Everything above is written. What is left needs a device and a host:
+
+1. **Confirm the class driver binds** on macOS, Linux and Windows. The
+   descriptor bytes are asserted in `tests/host/test_ccid_descriptors.py`,
+   including the ones that tie the descriptor to code elsewhere — the declared
+   exchange level against what `piv.c` can parse, `dwProtocols` against the ATR
+   and its checksum, `dwMaxCCIDMessageLength` against the reassembly buffer.
+   None of that proves a host will bind to it.
+2. **Certificate issuance**, in the daemon.
+3. **`sc_auth pair`** against a provisioned 9A, then FileVault via 9D.
+
+#### If the CCID interface does not enumerate
+
+The device has no BOOT pads, so the only reflash paths run over a composite
+that enumerates, and adding an interface is how that stops being true. The
+interface therefore latches itself off after two boots that never reach the
+configured state, and the latch is tied to the firmware image that set it, so a
+new build gets a clean slate — without that, a device latched off would stay
+off across the very reflash meant to recover it.
+
+So a descriptor bug costs two reboots, not the device. If CCID is missing and
+the log says `latched off`, that is this mechanism working; fix the descriptors
+and reflash, and the new image re-arms on its own.
+
+`dwFeatures` declares **short APDU level** (`0x00020000`), not the
+short-and-extended `0x00040000` that comparable devices ship. `piv.c` decodes
+short APDUs only and refuses extended with `6700`, so claiming extended would
+invite a 3-byte `Lc` read as a one-byte zero. If a host stack turns out to
+require `0x00040000` to bind, that is the first field to revisit — and the
+applet has to grow extended decoding in the same change, not after it.
