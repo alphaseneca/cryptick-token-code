@@ -24,14 +24,27 @@
       chaining, PIN retry counter, keys derived per slot (`core/piv/`)
 - [x] PIV PIN change + key generation (`CHANGE REFERENCE DATA`, `GENERATE`)
 - [x] CCID bulk protocol layer (`drivers/ccid_proto.c`, host-tested against the applet)
-- [ ] CCID USB descriptors + endpoints — the last gap before Mac/Linux login
+- [x] CCID USB descriptors + endpoints + TinyUSB class driver (`drivers/usb_ccid.cpp`)
 - [x] CCC + CHUID synthesised on demand from a derived per-device GUID
-- [ ] Host tooling to issue a certificate against a `GENERATE` public key
-- [ ] PIV over BLE via a host-side virtual reader
-- [ ] PIV provisioning: publish slot public keys so a cert can be issued
-- [ ] eFuse-backed wrap key + flash encryption (`docs/SECURITY_ROADMAP.md`)
+- [x] Command chaining, so a certificate can be written at all
+- [x] PIV over BLE (`FBF6EB90-…`, framing shared with `0xFFFD`, not advertised)
 - [x] FIDO2 over BLE (GATT `0xFFFD`, LESC+MITM passkey on the OLED — `docs/BLE_FIDO.md`)
-- [ ] BLE bench sign-off: pair from Windows/Chrome native BLE stack and `libfido2`
-- [ ] PIV over BLE via a host-side virtual reader (`docs/MAC_LOGIN.md`)
+- [ ] eFuse-backed wrap key + flash encryption (`docs/SECURITY_ROADMAP.md`)
+
+Owned by the daemon, not this repo:
+
+- [ ] Certificate issuance tooling. The device generates the key and never
+      releases it; the host builds the certificate and writes it back with
+      chained `PUT DATA`. The wire format is pinned by
+      `tests/host/test_piv_provisioning.py`.
+- [ ] The virtual reader (`vicc`/`vpcd`) that carries PIV over BLE to PC/SC.
+
+Needs hardware and a host, so it cannot be closed from the test suite:
+
+- [ ] Enumerate the CCID interface on macOS, Linux and Windows, and confirm the
+      class driver binds. The descriptors are asserted off-device
+      (`tests/host/test_ccid_descriptors.py`) but binding is not.
+- [ ] Pair from the Windows/Chrome native BLE stack and `libfido2`.
+- [ ] Read `pivControlPointLength` and `pivAtr` over BLE after bonding.
 
 Explicitly out of scope: ESP8266 / Super Mini ports.
