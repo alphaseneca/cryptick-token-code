@@ -1,0 +1,80 @@
+name: Release Firmware
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: tests/requirements-host.txt
+
+      - name: Install Dependencies & PlatformIO
+        run: |
+          pip install -r tests/requirements-host.txt
+          pip install -U platformio
+
+      - name: Cache PlatformIO toolchains
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio/.cache
+            ~/.platformio/packages
+            ~/.platformio/platforms
+          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+          restore-keys: pio-${{ runner.os }}-
+
+      - name: Build Production Firmware
+        run: |
+          pio run -e esp32-s3-n16r8-ship
+          pio run -e esp32-s3-n16r8
+
+      - name: Package Firmware Binaries
+        run: |
+          TAG_NAME="${GITHUB_REF_NAME}"
+          PKG_DIR="cryptick-token-firmware-${TAG_NAME}"
+          mkdir -p "${PKG_DIR}"
+          
+          # Copy ship firmware binaries
+          if [ -d ".pio/build/esp32-s3-n16r8-ship" ]; then
+            cp .pio/build/esp32-s3-n16r8-ship/firmware.bin "${PKG_DIR}/cryptick-firmware-ship.bin" 2>/dev/null || true
+            cp .pio/build/esp32-s3-n16r8-ship/bootloader.bin "${PKG_DIR}/bootloader.bin" 2>/dev/null || true
+            cp .pio/build/esp32-s3-n16r8-ship/partitions.bin "${PKG_DIR}/partitions.bin" 2>/dev/null || true
+          fi
+          
+          # Copy standard firmware binary if available
+          if [ -d ".pio/build/esp32-s3-n16r8" ]; then
+            cp .pio/build/esp32-s3-n16r8/firmware.bin "${PKG_DIR}/cryptick-firmware-dev.bin" 2>/dev/null || true
+          fi
+
+          # Include flash helper scripts
+          cp scripts/flash_product_usb.py "${PKG_DIR}/" 2>/dev/null || true
+          cp scripts/flash_product_usb.sh "${PKG_DIR}/" 2>/dev/null || true
+
+          tar -czvf "cryptick-token-firmware-${TAG_NAME}.tar.gz" "${PKG_DIR}"
+          zip -r "cryptick-token-firmware-${TAG_NAME}.zip" "${PKG_DIR}"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Cryptick Token Firmware ${{ github.ref_name }}
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+          files: |
+            cryptick-token-firmware-*.tar.gz
+            cryptick-token-firmware-*.zip

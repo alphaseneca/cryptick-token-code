@@ -20,6 +20,10 @@ __pycache__/
 # OS
 .DS_Store
 
+# Agent scratch
+.agents/
+ORIGINAL_REQUEST.md
+
 # Scratch (PDF text dumps, capture logs)
 .tmp_*
 *.log
