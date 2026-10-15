@@ -71,8 +71,22 @@ def main() -> int:
         port = ports[0]
         print(f"using port {port}")
 
-    # Product TinyUSB / most CDC apps need 1200 → ROM before esptool
-    try_1200_touch(port)
+    is_jtag_or_rom = False
+    try:
+        from serial.tools import list_ports as lp
+        for p in lp.comports():
+            if p.device == port and p.vid == 0x303A:
+                is_jtag_or_rom = True
+                break
+    except Exception:
+        pass
+
+    if is_jtag_or_rom:
+        print(f"Port {port} is Espressif VID 303A (Serial/JTAG or ROM) — skipping 1200bps touch")
+        env = "esp32-s3-n16r8-install"
+    else:
+        # Product TinyUSB / most CDC apps need 1200 → ROM before esptool
+        try_1200_touch(port)
 
     ports_after = list_ports()
     upload_port = ports_after[0] if ports_after else port

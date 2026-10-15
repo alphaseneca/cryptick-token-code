@@ -21,6 +21,7 @@
 #if defined(CRYPTICK_BLE_PIV) && CRYPTICK_BLE_PIV
 #include "ble_piv.h"
 #endif
+#include "ble_daemon.h"
 #include <NimBLEDevice.h>
 #if __has_include("nimble/nimble/host/include/host/ble_att.h")
 #include "nimble/nimble/host/include/host/ble_att.h"
@@ -29,7 +30,12 @@
 #endif
 #include <cryptick_log.h>
 #include <esp_random.h>
+#include <esp_mac.h>
 #include <string.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+
+extern "C" void ctaphid_cancel_request(void);
 
 /*
  * NimBLE keeps one global permission mask for every CCCD it auto-creates, and
@@ -53,7 +59,7 @@ NimBLECharacteristic *g_control_point = nullptr;
 NimBLECharacteristic *g_status = nullptr;
 NimBLECharacteristic *g_control_point_len = nullptr;
 NimBLECharacteristic *g_revision = nullptr;
-bool                  g_connected = false;
+static volatile bool g_connected = false;
 
 /** fidoControlPointLength is read as 2 bytes, big-endian. */
 void publish_control_point_length()
@@ -70,8 +76,15 @@ int notify_fragment(const uint8_t *frag, uint16_t len)
 {
     if (!g_status || !g_connected)
         return 0;
-    g_status->setValue(frag, len);
-    return g_status->notify() ? 1 : 0;
+    for (int retry = 0; retry < 5; retry++) {
+        if (g_status->notify(frag, len)) {
+            return 1;
+        }
+        if (!g_connected)
+            return 0;
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+    return 0;
 }
 
 /** Hand a reassembled request to the FIDO task; never process it here. */
@@ -84,12 +97,6 @@ void deliver_request(uint8_t cmd, const uint8_t *msg, uint16_t len)
 class ControlPointCallbacks : public NimBLECharacteristicCallbacks {
     void onWrite(NimBLECharacteristic *chr, NimBLEConnInfo &info) override
     {
-        /*
-         * The characteristic requires encryption *and* authentication, so an
-         * unbonded peer cannot reach this at all. Belt and braces: refuse
-         * anything that is not both encrypted and authenticated, since a
-         * downgraded link is exactly what an attacker would want here.
-         */
         if (!info.isEncrypted() || !info.isAuthenticated()) {
             CLOG_W("BLE", "control point write on unauthenticated link");
             ble_fido_send_error(BLE_FIDO_ERR_OTHER);
@@ -111,6 +118,10 @@ class ServerCallbacks : public NimBLEServerCallbacks {
         /* Start from the mandatory minimum until the MTU is negotiated. */
         ble_fido_set_mtu(BLE_ATT_MTU_DFLT);
         publish_control_point_length();
+#if defined(CRYPTICK_BLE_PIV) && CRYPTICK_BLE_PIV
+        ble_piv_set_mtu(BLE_ATT_MTU_DFLT);
+#endif
+        ble_daemon_set_mtu(BLE_ATT_MTU_DFLT);
         CLOG_I("BLE", "connected handle=%u", (unsigned)info.getConnHandle());
     }
 
@@ -119,15 +130,12 @@ class ServerCallbacks : public NimBLEServerCallbacks {
         (void)server;
         (void)info;
         g_connected = false;
-        /* Drop any half-received request; the next peer starts clean. */
+        fido_ble_on_disconnect();
         ble_fido_reset();
 #if defined(CRYPTICK_BLE_PIV) && CRYPTICK_BLE_PIV
-        /* The PIV service rides the same link, so it loses its half-assembled
-         * message at the same moment this one does. */
         ble_piv_reset();
 #endif
-        /* A peer that disconnects mid-pairing must not leave a stale passkey
-         * on the OLED — it would be meaningless and looks like a live prompt. */
+        ble_daemon_reset();
         device_clear_pairing_passkey();
         CLOG_I("BLE", "disconnected reason=%d, advertising again", reason);
         NimBLEDevice::startAdvertising();
@@ -139,42 +147,38 @@ class ServerCallbacks : public NimBLEServerCallbacks {
         ble_fido_set_mtu(mtu);
         publish_control_point_length();
 #if defined(CRYPTICK_BLE_PIV) && CRYPTICK_BLE_PIV
-        /* One link, one MTU: both services publish it to their own peers. */
         ble_piv_set_mtu(mtu);
 #endif
+        ble_daemon_set_mtu(mtu);
         CLOG_I("BLE", "ATT MTU=%u → fidoControlPointLength=%u",
                (unsigned)mtu, (unsigned)ble_fido_control_point_length());
     }
 
-    /*
-     * CTAP requires LE Secure Connections bonding with MITM protection. Just
-     * Works pairing does not provide it, and without a display there is no way
-     * to do better. The OLED is what earns the device Passkey Entry: we show a
-     * fresh 6-digit passkey and the peer types it.
-     */
     uint32_t onPassKeyDisplay() override
     {
         uint32_t passkey = 100000u + (esp_random() % 900000u);
         char label[32];
         snprintf(label, sizeof(label), "%06u", (unsigned)passkey);
-        /*
-         * Raises UI_BLE_PAIRING, which also wakes the panel. Parking only the
-         * caption is not enough: the caption is drawn by whichever screen is
-         * open, and if none of the FIDO screens is open — which is the normal
-         * case during pairing — the passkey is stored and never rendered, on a
-         * panel that is probably asleep anyway.
-         */
         device_show_pairing_passkey(label);
         CLOG_I("BLE", "pairing passkey on OLED (6 digits, typed on the host)");
         return passkey;
+    }
+
+    void onConfirmPassKey(NimBLEConnInfo &info, uint32_t pin) override
+    {
+        char label[32];
+        snprintf(label, sizeof(label), "%06u", (unsigned)pin);
+        device_show_pairing_passkey(label);
+        CLOG_I("BLE", "numeric comparison passkey on OLED: %s", label);
+        NimBLEDevice::injectConfirmPasskey(info, true);
     }
 
     void onAuthenticationComplete(NimBLEConnInfo &info) override
     {
         device_clear_pairing_passkey();
         if (!info.isEncrypted() || !info.isAuthenticated()) {
-            CLOG_W("BLE", "pairing did not reach authenticated LESC — dropping");
-            NimBLEDevice::getServer()->disconnect(info.getConnHandle());
+            CLOG_W("BLE", "auth event: enc=%d auth=%d bonded=%d",
+                   (int)info.isEncrypted(), (int)info.isAuthenticated(), (int)info.isBonded());
             return;
         }
         CLOG_I("BLE", "bonded: encrypted + authenticated (LESC)");
@@ -186,12 +190,58 @@ ServerCallbacks       g_server_callbacks;
 
 } // namespace
 
+extern "C" int ble_fido_is_connected(void)
+{
+    return g_connected ? 1 : 0;
+}
+
+static char g_device_name[32] = CRYPTICK_BLE_DEVICE_NAME;
+
+#include <Preferences.h>
+
+static uint8_t get_ble_epoch(void)
+{
+    Preferences p;
+    p.begin("ble_cfg", true);
+    uint8_t ep = p.getUChar("epoch", 1);
+    p.end();
+    return ep;
+}
+
+static void inc_ble_epoch(void)
+{
+    Preferences p;
+    p.begin("ble_cfg", false);
+    uint8_t ep = p.getUChar("epoch", 1) + 1;
+    if (ep == 0) ep = 1;
+    p.putUChar("epoch", ep);
+    p.end();
+}
+
+extern "C" const char *ble_fido_get_device_name(void)
+{
+    return g_device_name;
+}
+
 void ble_fido_gatt_init(void)
 {
     if (g_server)
         return;
 
-    NimBLEDevice::init(CRYPTICK_BLE_DEVICE_NAME);
+    uint8_t mac[6] = {0};
+    if (esp_read_mac(mac, ESP_MAC_BT) == ESP_OK) {
+        uint8_t ep = get_ble_epoch();
+        mac[5] |= 0xC0;
+        mac[0] ^= ep;
+        mac[1] ^= (ep << 2);
+        snprintf(g_device_name, sizeof(g_device_name), "Cryptick-Token-%02X%02X", mac[1], mac[0]);
+    } else {
+        snprintf(g_device_name, sizeof(g_device_name), "%s", CRYPTICK_BLE_DEVICE_NAME);
+    }
+
+    NimBLEDevice::init(g_device_name);
+    NimBLEDevice::setOwnAddr(mac);
+    NimBLEDevice::setOwnAddrType(BLE_OWN_ADDR_RANDOM);
     NimBLEDevice::setPower(ESP_PWR_LVL_P9);
 
     /* LE Secure Connections + MITM + bonding; passkey shown on the OLED. */
@@ -200,12 +250,19 @@ void ble_fido_gatt_init(void)
 
     /*
      * Must precede createService(): the mask is read when each CCCD is
-     * registered, not when it is accessed. See the declaration above for why
-     * the characteristic flags do not cover this.
+     * registered, not when it is accessed.
+     *
+     * Bluetooth Core Spec Vol 3 Part G Section 3.3.3.3 strictly requires:
+     * "The Client Characteristic Configuration descriptor shall not require
+     * authentication or authorization to read. The read operation shall not
+     * return an Insufficient Authentication error or Insufficient Authorization
+     * error."
+     *
+     * Gating CCCD read behind authentication breaks GATT discovery on macOS,
+     * Windows, and Linux, wedging the connection into an endless retry loop.
+     * CCCD write remains protected, and control point write enforces bonding.
      */
-    ble_gatts_set_clt_cfg_perm_flags(BLE_ATT_F_READ | BLE_ATT_F_READ_ENC |
-                                     BLE_ATT_F_READ_AUTHEN | BLE_ATT_F_WRITE |
-                                     BLE_ATT_F_WRITE_ENC | BLE_ATT_F_WRITE_AUTHEN);
+    ble_gatts_set_clt_cfg_perm_flags(BLE_ATT_F_READ | BLE_ATT_F_WRITE);
 
     g_server = NimBLEDevice::createServer();
     g_server->setCallbacks(&g_server_callbacks);
@@ -225,9 +282,7 @@ void ble_fido_gatt_init(void)
     g_control_point->setCallbacks(&g_cp_callbacks);
 
     g_status = svc->createCharacteristic(
-        BLE_FIDO_UUID_STATUS,
-        NIMBLE_PROPERTY::NOTIFY | NIMBLE_PROPERTY::READ_ENC |
-            NIMBLE_PROPERTY::READ_AUTHEN);
+        BLE_FIDO_UUID_STATUS, NIMBLE_PROPERTY::NOTIFY);
 
     /*
      * The two descriptive characteristics are readable without a bond, which
@@ -259,16 +314,69 @@ void ble_fido_gatt_init(void)
     publish_control_point_length();
 
     svc->start();
+    CLOG_I("BLE", "FIDO service 0xFFFD up (advertising deferred until all services ready)");
+}
 
-    /* The 16-bit FIDO Service UUID must appear in the advertisement. */
+void ble_fido_start_advertising(void)
+{
+    if (g_server) {
+        g_server->start();
+    }
     NimBLEAdvertising *adv = NimBLEDevice::getAdvertising();
-    adv->addServiceUUID(NimBLEUUID((uint16_t)BLE_FIDO_SERVICE_UUID16));
-    adv->setName(CRYPTICK_BLE_DEVICE_NAME);
-    adv->enableScanResponse(true);
-    NimBLEDevice::startAdvertising();
+    if (adv && !adv->isAdvertising()) {
+        adv->setMinInterval(32);
+        adv->setMaxInterval(64);
+        adv->setAppearance(0x03C1); // HID_KEYBOARD
+        adv->addServiceUUID(NimBLEUUID((uint16_t)BLE_FIDO_SERVICE_UUID16));
+        adv->setName(g_device_name);
+        adv->enableScanResponse(true);
+        NimBLEDevice::startAdvertising();
+        CLOG_I("BLE", "All services started, advertising as \"%s\"", g_device_name);
+    }
+}
 
-    CLOG_I("BLE", "FIDO service 0xFFFD up, advertising as \"%s\"",
-           CRYPTICK_BLE_DEVICE_NAME);
+int ble_fido_is_advertising(void)
+{
+    NimBLEAdvertising *adv = NimBLEDevice::getAdvertising();
+    return (adv && adv->isAdvertising()) ? 1 : 0;
+}
+
+void ble_fido_restart_advertising(void)
+{
+    NimBLEAdvertising *adv = NimBLEDevice::getAdvertising();
+    if (adv) {
+        if (adv->isAdvertising()) {
+            NimBLEDevice::stopAdvertising();
+        }
+        adv->setMinInterval(32);
+        adv->setMaxInterval(64);
+        adv->setAppearance(0x03C1); // HID_KEYBOARD
+        adv->addServiceUUID(NimBLEUUID((uint16_t)BLE_FIDO_SERVICE_UUID16));
+        adv->setName(g_device_name);
+        adv->enableScanResponse(true);
+        NimBLEDevice::startAdvertising();
+        CLOG_I("BLE", "Advertising restarted as \"%s\"", g_device_name);
+    }
+}
+
+size_t ble_fido_bond_count(void)
+{
+    return NimBLEDevice::getNumBonds();
+}
+
+void ble_fido_clear_all_bonds(void)
+{
+    CLOG_I("BLE", "Disconnecting peer and clearing all BLE bonding records from NVS...");
+    if (g_server && g_connected) {
+        for (const auto &conn_id : g_server->getPeerDevices()) {
+            g_server->disconnect(conn_id, BLE_ERR_REM_USER_CONN_TERM);
+        }
+    }
+    NimBLEDevice::deleteAllBonds();
+    inc_ble_epoch();
+    CLOG_I("BLE", "All BLE bonds cleared. Restarting device for fresh identity...");
+    vTaskDelay(pdMS_TO_TICKS(100));
+    esp_restart();
 }
 
 #endif /* CRYPTICK_BLE_FIDO */

@@ -123,6 +123,14 @@ typedef struct {
     int (*sign_p256)(uint8_t slot, const uint8_t *hash32,
                      uint8_t *der_out, size_t *der_len);
 
+    /**
+     * Compute ECDH shared secret (P-256) on Slot 9D.
+     * `peer_pub65` is 0x04 || X(32) || Y(32).
+     * `shared32` receives the 32-byte shared secret.
+     * Returns 1 on success, 0 on failure.
+     */
+    int (*ecdh_p256)(uint8_t slot, const uint8_t *peer_pub65, uint8_t *shared32);
+
     /** Check a PIN. Returns 1 if correct. Retry accounting is the applet's. */
     int (*pin_check)(const uint8_t *pin, size_t len);
 

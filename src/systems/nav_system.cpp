@@ -11,21 +11,41 @@
 extern "C" {
 void ctaphid_confirm_user_presence(void);
 void ctaphid_cancel_request(void);
+#if CRYPTICK_BLE_FIDO
+void ble_fido_clear_all_bonds(void);
+void ble_fido_restart_advertising(void);
+bool ble_hid_type_piv_pin(void);
+bool ble_hid_type_current_totp(int account_idx);
+#else
+static inline void ble_fido_clear_all_bonds(void) {}
+static inline void ble_fido_restart_advertising(void) {}
+static inline bool ble_hid_type_piv_pin(void) { return false; }
+static inline bool ble_hid_type_current_totp(int account_idx) { (void)account_idx; return false; }
+#endif
 }
 
-enum MenuItem { MENU_TOTP = 0, MENU_SETTINGS = 1, MENU_COUNT = 2 };
+enum MenuItem { MENU_TOTP = 0, MENU_PIV = 1, MENU_BLE = 2, MENU_SETTINGS = 3, MENU_COUNT = 4 };
 
 enum SettingsItem {
     SET_ENROLL = 0,
     SET_CLEAR,
     SET_SLEEP,
+    SET_TIME,
     SET_INFO,
     SET_ITEM_COUNT
 };
 
+enum BleMenuItem {
+    BLE_ACT_UNPAIR = 0,
+    BLE_ACT_RESTART_ADV,
+    BLE_ITEM_COUNT
+};
+
 static UiState _state = UI_CLOCK;
+static int _homeCard = 0; // 0 = Clock, 1 = Quick PIV, 2 = Quick TOTP
 static int _menuIdx = 0;
 static int _settingsIdx = 0;
+static int _bleMenuIdx = 0;
 static int _accountIdx = 0;
 static int _accountCount = 0;
 static unsigned long _authErrorStart = 0;
@@ -66,6 +86,7 @@ static void set_state(UiState s)
     if (_state == s) return;
     CLOG_D("NAV", "state %u → %u", (unsigned)_state, (unsigned)s);
     _state = s;
+    _enrollMsg[0] = 0;
     publish_ui();
 }
 
@@ -128,6 +149,7 @@ static bool sleep_allowed(void)
     case UI_FIDO_PROCESSING:
     case UI_FIDO_SUCCESS:
     case UI_AUTH_ERROR:
+    case UI_BLE_PAIRING:
     case UI_SLEEP:
         return false;
     default:
@@ -175,12 +197,14 @@ bool nav_system_is_asleep(void) { return _state == UI_SLEEP; }
 void nav_system_init(void)
 {
     _state = UI_CLOCK;
+    _lastFidoReq = 0;
     _menuIdx = 0;
     _settingsIdx = 0;
     _accountIdx = 0;
     _enrollMsg[0] = 0;
     _lastActivityMs = millis();
     _fidoHoldUntilMs = 0;
+    nav_system_set_fido_label("FIDO");
     _sleepTimeoutSec = sleep_timeout_restore();
     CLOG_I("NAV", "sleep timeout %us%s", (unsigned)_sleepTimeoutSec,
            _sleepTimeoutSec ? "" : " (never)");
@@ -195,6 +219,8 @@ void nav_system_set_account_count(int n)
 }
 
 UiState nav_system_state(void) { return _state; }
+int nav_system_home_card(void) { return _homeCard; }
+void nav_system_set_home_card(int card) { _homeCard = card; publish_ui(); }
 int nav_system_menu_index(void) { return _menuIdx; }
 int nav_system_settings_index(void) { return _settingsIdx; }
 int nav_system_settings_count(void) { return SET_ITEM_COUNT; }
@@ -218,8 +244,34 @@ void nav_system_settings_label(int idx, char *out, size_t cap)
         else
             snprintf(out, cap, "Sleep: %us", (unsigned)_sleepTimeoutSec);
         break;
+    case SET_TIME: {
+        extern bool g_rtc_ok __attribute__((weak));
+        bool ok = (&g_rtc_ok != nullptr) ? g_rtc_ok : false;
+        snprintf(out, cap, "Clock: %s", ok ? "RTC OK" : "Soft (Sync!)");
+        break;
+    }
     case SET_INFO:
         snprintf(out, cap, "Device info");
+        break;
+    default:
+        out[0] = 0;
+        break;
+    }
+}
+
+int nav_system_ble_menu_index(void) { return _bleMenuIdx; }
+int nav_system_ble_menu_count(void) { return BLE_ITEM_COUNT; }
+
+void nav_system_ble_menu_label(int idx, char *out, size_t cap)
+{
+    if (!out || cap == 0)
+        return;
+    switch (idx) {
+    case BLE_ACT_UNPAIR:
+        snprintf(out, cap, "Unpair / Wipe Bonds");
+        break;
+    case BLE_ACT_RESTART_ADV:
+        snprintf(out, cap, "Restart Adv");
         break;
     default:
         out[0] = 0;
@@ -235,7 +287,7 @@ const char *nav_system_fido_label(void) { return _fidoLabel; }
 void nav_system_set_fido_label(const char *label)
 {
     if (!label || !label[0]) {
-        strncpy(_fidoLabel, "Confirm", sizeof(_fidoLabel) - 1);
+        strncpy(_fidoLabel, "FIDO", sizeof(_fidoLabel) - 1);
         _fidoLabel[sizeof(_fidoLabel) - 1] = 0;
         return;
     }
@@ -256,8 +308,9 @@ void nav_system_set_fido_ui(int8_t req)
     if (req != 0) {
         nav_system_wake();
         _fidoHoldUntilMs = millis() + (unsigned long)CRYPTICK_FIDO_CEREMONY_HOLD_MS;
-    } else
+    } else {
         _lastActivityMs = millis();
+    }
 
     int8_t prev = _lastFidoReq;
     if (req == 1) {
@@ -311,6 +364,9 @@ void nav_system_set_fido_ui(int8_t req)
             _state == UI_BLE_PAIRING || prev == 2 || prev == 1 || prev == 4) {
             set_state(UI_CLOCK);
         }
+        if (prev == 4 || _state == UI_BLE_PAIRING) {
+            nav_system_set_fido_label("FIDO");
+        }
     }
 }
 
@@ -337,6 +393,13 @@ static void enter_settings(unsigned long now)
 {
     _settingsIdx = 0;
     set_state(UI_SETTINGS);
+    auth_system_record_activity(now);
+}
+
+static void enter_ble(unsigned long now)
+{
+    _bleMenuIdx = 0;
+    set_state(UI_BLE_MENU);
     auth_system_record_activity(now);
 }
 
@@ -482,14 +545,60 @@ void nav_system_on_event(const BusEvent &e)
 
     _lastActivityMs = now;
 
-    if (_state == UI_AUTH_ERROR || _state == UI_FIDO_SUCCESS)
+    if (_state == UI_AUTH_ERROR)
         return;
+
+    if (_state == UI_FIDO_SUCCESS) {
+        if (key == KEY_CENTER || key == KEY_LEFT) {
+            set_state(UI_CLOCK);
+            nav_system_set_fido_label("FIDO");
+        }
+        return;
+    }
 
     switch (_state) {
     case UI_CLOCK:
-        /* CENTER enters menu; LEFT stays idle (back semantics on other screens) */
+        /* Scrolling rotary encoder navigates Quick Cards on Home screen */
         if (key == KEY_CENTER) {
-            enter_menu();
+            if (_homeCard == 0) {
+                enter_menu();
+            } else if (_homeCard == 1) {
+                /* Quick PIV PIN typing */
+                if (ble_hid_type_piv_pin()) {
+                    strncpy(_enrollMsg, "PIN Typed!", sizeof(_enrollMsg) - 1);
+                } else {
+                    strncpy(_enrollMsg, "BLE Offline", sizeof(_enrollMsg) - 1);
+                }
+                _enrollMsgStart = now;
+                publish_ui();
+            } else if (_homeCard == 2) {
+                /* Quick TOTP code typing */
+                if (ble_hid_type_current_totp(_accountIdx)) {
+                    strncpy(_enrollMsg, "Code Typed!", sizeof(_enrollMsg) - 1);
+                } else {
+                    strncpy(_enrollMsg, "BLE Offline", sizeof(_enrollMsg) - 1);
+                }
+                _enrollMsgStart = now;
+                publish_ui();
+            }
+        } else if (key == KEY_DOWN) {
+            _homeCard = (_homeCard + 1) % 3;
+            publish_ui();
+        } else if (key == KEY_UP) {
+            _homeCard = (_homeCard + 2) % 3;
+            publish_ui();
+        } else if (key == KEY_RIGHT) {
+            if (_homeCard == 2 && _accountCount > 0) {
+                _accountIdx = (_accountIdx + 1) % _accountCount;
+            } else {
+                _homeCard = (_homeCard + 1) % 3;
+            }
+            publish_ui();
+        } else if (key == KEY_LEFT) {
+            if (_homeCard != 0) {
+                _homeCard = 0;
+                publish_ui();
+            }
         }
         break;
 
@@ -504,7 +613,37 @@ void nav_system_on_event(const BusEvent &e)
             set_state(UI_CLOCK);
         } else if (key == KEY_CENTER) {
             if (_menuIdx == MENU_TOTP) enter_totp(now);
+            else if (_menuIdx == MENU_PIV) set_state(UI_PIV_PIN);
+            else if (_menuIdx == MENU_BLE) enter_ble(now);
             else if (_menuIdx == MENU_SETTINGS) enter_settings(now);
+        }
+        break;
+
+    case UI_BLE_MENU:
+        auth_system_record_activity(now);
+        if (key == KEY_UP) {
+            _bleMenuIdx = (_bleMenuIdx + BLE_ITEM_COUNT - 1) % BLE_ITEM_COUNT;
+            publish_ui();
+        } else if (key == KEY_DOWN || key == KEY_RIGHT) {
+            _bleMenuIdx = (_bleMenuIdx + 1) % BLE_ITEM_COUNT;
+            publish_ui();
+        } else if (key == KEY_LEFT) {
+            set_state(UI_MENU);
+        } else if (key == KEY_CENTER) {
+            if (_bleMenuIdx == BLE_ACT_UNPAIR) {
+#if CRYPTICK_BLE_FIDO
+                ble_fido_clear_all_bonds();
+                strncpy(_enrollMsg, "Bonds Wiped", sizeof(_enrollMsg) - 1);
+                _enrollMsgStart = now;
+#endif
+            } else if (_bleMenuIdx == BLE_ACT_RESTART_ADV) {
+#if CRYPTICK_BLE_FIDO
+                ble_fido_restart_advertising();
+                strncpy(_enrollMsg, "Adv Restarted", sizeof(_enrollMsg) - 1);
+                _enrollMsgStart = now;
+#endif
+            }
+            publish_ui();
         }
         break;
 
@@ -520,6 +659,14 @@ void nav_system_on_event(const BusEvent &e)
             publish_ui();
         } else if (key == KEY_LEFT) {
             set_state(UI_MENU);
+        } else if (key == KEY_CENTER) {
+            if (ble_hid_type_current_totp(_accountIdx)) {
+                strncpy(_enrollMsg, "Code Typed!", sizeof(_enrollMsg) - 1);
+            } else {
+                strncpy(_enrollMsg, "BLE Offline", sizeof(_enrollMsg) - 1);
+            }
+            _enrollMsgStart = now;
+            publish_ui();
         }
         break;
 
@@ -540,6 +687,8 @@ void nav_system_on_event(const BusEvent &e)
                 start_clear();
             } else if (_settingsIdx == SET_SLEEP) {
                 cycle_sleep_preset();
+            } else if (_settingsIdx == SET_TIME) {
+                set_state(UI_DEVICE_INFO);
             } else if (_settingsIdx == SET_INFO) {
                 set_state(UI_DEVICE_INFO);
             }
@@ -549,6 +698,20 @@ void nav_system_on_event(const BusEvent &e)
     case UI_DEVICE_INFO:
         if (key == KEY_LEFT || key == KEY_CENTER)
             set_state(UI_SETTINGS);
+        break;
+
+    case UI_PIV_PIN:
+        if (key == KEY_LEFT) {
+            set_state(UI_MENU);
+        } else if (key == KEY_CENTER) {
+            if (ble_hid_type_piv_pin()) {
+                strncpy(_enrollMsg, "PIN Typed!", sizeof(_enrollMsg) - 1);
+            } else {
+                strncpy(_enrollMsg, "BLE Offline", sizeof(_enrollMsg) - 1);
+            }
+            _enrollMsgStart = now;
+            publish_ui();
+        }
         break;
 
     case UI_FP_CLEAR_CONFIRM:
@@ -613,8 +776,9 @@ void nav_system_tick(unsigned long nowMs)
         return;
     }
     if (_state == UI_FIDO_SUCCESS) {
-        if (nowMs - _fidoSuccessStart >= 1500UL) {
+        if (nowMs - _fidoSuccessStart >= 2500UL) {
             set_state(UI_CLOCK);
+            nav_system_set_fido_label("FIDO");
         }
         return;
     }
@@ -626,9 +790,8 @@ void nav_system_tick(unsigned long nowMs)
             cmd_fp(CMD_FP_MATCH_FIDO);
         }
     }
-    /* Clear brief enroll status on settings */
-    if (_state == UI_SETTINGS && _enrollMsg[0] &&
-        nowMs - _enrollMsgStart >= 2000UL) {
+    /* Clear brief enroll/alert status */
+    if (_enrollMsg[0] && (nowMs - _enrollMsgStart) >= 2000UL) {
         _enrollMsg[0] = 0;
         publish_ui();
     }

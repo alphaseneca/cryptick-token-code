@@ -114,8 +114,19 @@ int cryptick_oath_hid_handle(const uint8_t *req, uint16_t req_len,
         (ins == OATH_INS_PUT || ins == OATH_INS_DELETE ||
          ins == OATH_INS_PUT_OTPAUTH || ins == OATH_INS_CALCULATE);
     if (need_uv) {
-        const char *prompt =
-            (ins == OATH_INS_CALCULATE) ? "Code" : "Manage";
+        char uv_name[OATH_MAX_NAME + 1];
+        const char *prompt = "Manage";
+        if (ins == OATH_INS_CALCULATE || ins == OATH_INS_PUT || ins == OATH_INS_DELETE) {
+            uint8_t nlen = 0;
+            const uint8_t *name = tlv_find(tlv, data_len, OATH_TAG_NAME, &nlen);
+            if (name && nlen > 0 && nlen <= OATH_MAX_NAME) {
+                memcpy(uv_name, name, nlen);
+                uv_name[nlen] = 0;
+                prompt = uv_name;
+            } else if (ins == OATH_INS_CALCULATE) {
+                prompt = "Code";
+            }
+        }
         if (!oath_ensure_uv(prompt)) {
             write_sw(resp, resp_len, SW_CONDITIONS); /* 6985 */
             return 0;
@@ -253,6 +264,12 @@ int cryptick_oath_hid_handle(const uint8_t *req, uint16_t req_len,
         *resp_len = 7;
         append_sw(resp, resp_len, SW_OK, max_resp);
         CLOG_I("OATH", "CALCULATE ok name=%s counter=%llu", namebuf, (unsigned long long)counter);
+
+        /* Transaction confirmation: show account label and 6-digit TOTP code on OLED */
+        char confirm[64];
+        snprintf(confirm, sizeof(confirm), "%s|%s", namebuf, code.c_str());
+        device_set_ui_label(confirm);
+        device_ctap_finished(0, 1);
         return 0;
     }
 
@@ -261,9 +278,25 @@ int cryptick_oath_hid_handle(const uint8_t *req, uint16_t req_len,
             write_sw(resp, resp_len, SW_WRONG_LENGTH);
             return 0;
         }
-        uint32_t ts = ((uint32_t)tlv[0] << 24) | ((uint32_t)tlv[1] << 16) |
-                      ((uint32_t)tlv[2] << 8) | tlv[3];
-        if (ts == 0) {
+        uint32_t ts = 0;
+        uint8_t tlen = 0;
+        const uint8_t *ch = tlv_find(tlv, data_len, OATH_TAG_CHALLENGE, &tlen);
+        if (ch && tlen >= 4) {
+            if (tlen >= 8) {
+                ts = ((uint32_t)ch[4] << 24) | ((uint32_t)ch[5] << 16) |
+                     ((uint32_t)ch[6] << 8) | ch[7];
+            } else {
+                ts = ((uint32_t)ch[0] << 24) | ((uint32_t)ch[1] << 16) |
+                     ((uint32_t)ch[2] << 8) | ch[3];
+            }
+        } else if (data_len >= 8) {
+            ts = ((uint32_t)tlv[4] << 24) | ((uint32_t)tlv[5] << 16) |
+                 ((uint32_t)tlv[6] << 8) | tlv[7];
+        } else {
+            ts = ((uint32_t)tlv[0] << 24) | ((uint32_t)tlv[1] << 16) |
+                 ((uint32_t)tlv[2] << 8) | tlv[3];
+        }
+        if (ts < 1600000000UL) {
             write_sw(resp, resp_len, SW_WRONG_DATA);
             return 0;
         }

@@ -20,6 +20,7 @@
 #include "ble_piv.h"
 #include "piv.h"
 #endif
+#include "ble_daemon.h"
 #include "ctap.h"
 /* The framing layer bounds its reassembly buffer independently so it can be
  * host-compiled; if the CTAP ceiling ever moves, they must move together. */
@@ -28,6 +29,8 @@ static_assert(BLE_FIDO_MAX_MSG == CTAP_MAX_MESSAGE_SIZE,
 #endif
 
 extern "C" {
+int cryptick_oath_hid_handle(const uint8_t *req, uint16_t req_len,
+                             uint8_t *resp, uint16_t *resp_len);
 
 /*
  * Deep enough to hold one complete max-size CTAP2 message while the FIDO task
@@ -89,6 +92,7 @@ static SemaphoreHandle_t _up_mutex = NULL;
 typedef struct {
     uint8_t  cmd;
     uint16_t len;
+    uint8_t  is_daemon;
     uint8_t  data[BLE_FIDO_MAX_MSG];
 } fido_ble_request_t;
 
@@ -128,11 +132,40 @@ int fido_ble_submit_request(uint8_t cmd, const uint8_t *msg, uint16_t len)
     _ble_pool_next++;
     req->cmd = cmd;
     req->len = len;
+    req->is_daemon = 0;
     if (len && msg)
         memcpy(req->data, msg, len);
 
     if (xQueueSend((QueueHandle_t)_ble_queue, &req, 0) != pdTRUE) {
         CLOG_W("BLE", "request refused: queue full");
+        return 0;
+    }
+    return 1;
+}
+
+int daemon_ble_submit_request(uint8_t cmd, const uint8_t *msg, uint16_t len)
+{
+    if (cmd == BLE_FIDO_CMD_CANCEL) {
+        ctaphid_cancel_request();
+        return 1;
+    }
+    if (!_ble_queue || len > BLE_FIDO_MAX_MSG)
+        return 0;
+    if (_ctap_busy || uxQueueSpacesAvailable(_ble_queue) == 0) {
+        CLOG_W("DAEMON-BLE", "request refused: CTAP busy");
+        return 0;
+    }
+
+    fido_ble_request_t *req = &_ble_pool[_ble_pool_next & 1u];
+    _ble_pool_next++;
+    req->cmd = cmd;
+    req->len = len;
+    req->is_daemon = 1;
+    if (len && msg)
+        memcpy(req->data, msg, len);
+
+    if (xQueueSend((QueueHandle_t)_ble_queue, &req, 0) != pdTRUE) {
+        CLOG_W("DAEMON-BLE", "request refused: queue full");
         return 0;
     }
     return 1;
@@ -188,9 +221,15 @@ static void piv_ble_dispatch(piv_ble_request_t *req)
 {
     static uint8_t out[BLE_PIV_MAX_MSG];
 
+    if (!ble_fido_is_connected()) {
+        CLOG_W("PIV-BLE", "dropping queued APDU: peer disconnected");
+        return;
+    }
+
     CLOG_I("PIV-BLE", "APDU ins=0x%02X len=%u",
            req->len > 1 ? req->data[1] : 0, (unsigned)req->len);
     _ctap_busy = true;
+    fido_transport_set_active(FIDO_TRANSPORT_BLE);
 
     int n = piv_handle_apdu(req->data, req->len, out, sizeof(out));
     if (n > 0)
@@ -198,18 +237,66 @@ static void piv_ble_dispatch(piv_ble_request_t *req)
     else
         ble_piv_send_error(BLE_FIDO_ERR_OTHER);
 
+    fido_transport_set_active(FIDO_TRANSPORT_NONE);
     _ctap_busy = false;
 }
 #endif /* CRYPTICK_BLE_PIV */
+
+extern "C" void fido_ble_on_disconnect(void)
+{
+    /* Clear pairing screen if peer drops during pairing */
+    device_clear_pairing_passkey();
+
+    /* Drain any pending request so it never runs for a disconnected peer */
+    if (_ble_queue) {
+        fido_ble_request_t *req = NULL;
+        while (xQueueReceive((QueueHandle_t)_ble_queue, &req, 0) == pdTRUE) {
+            CLOG_I("BLE", "discarding queued request on disconnect");
+        }
+    }
+#if defined(CRYPTICK_BLE_PIV) && CRYPTICK_BLE_PIV
+    if (_piv_queue) {
+        piv_ble_request_t *piv_req = NULL;
+        while (xQueueReceive((QueueHandle_t)_piv_queue, &piv_req, 0) == pdTRUE) {
+            CLOG_I("PIV-BLE", "discarding queued APDU on disconnect");
+        }
+    }
+#endif
+    if (fido_transport_active() == FIDO_TRANSPORT_BLE ||
+        fido_transport_active() == FIDO_TRANSPORT_DAEMON_BLE) {
+        CLOG_I("BLE", "peer disconnected during presence wait — aborting");
+        ctaphid_cancel_request();
+    }
+}
 
 /** Run one reassembled BLE request through the CTAP core, on the FIDO task. */
 static void ble_dispatch(fido_ble_request_t *req)
 {
     static CTAP_RESPONSE resp;
 
-    CLOG_I("BLE", "CTAP request cmd=0x%02X len=%u", req->cmd, (unsigned)req->len);
+    if (!ble_fido_is_connected()) {
+        CLOG_W("BLE", "dropping queued request cmd=0x%02X: peer disconnected", req->cmd);
+        return;
+    }
+
+    CLOG_I("BLE", "CTAP request (%s) cmd=0x%02X len=%u",
+           req->is_daemon ? "daemon" : "fido", req->cmd, (unsigned)req->len);
+    _request_cancelled = false;
     _ctap_busy = true;
-    fido_transport_set_active(FIDO_TRANSPORT_BLE);
+    fido_transport_set_active(req->is_daemon ? FIDO_TRANSPORT_DAEMON_BLE : FIDO_TRANSPORT_BLE);
+
+    uint8_t ctap_cmd = (req->len > 0) ? req->data[0] : 0;
+    if (req->is_daemon && (ctap_cmd == 0xE3 || ctap_cmd == 0x63)) {
+        static uint8_t oath_out[512];
+        uint16_t oath_out_len = 0;
+        int rc = cryptick_oath_hid_handle(req->data + 1, (uint16_t)(req->len - 1), oath_out + 1, &oath_out_len);
+        oath_out[0] = (rc == 0) ? 0x00 : 0x01; // status byte
+        uint16_t total_out = (uint16_t)(1 + oath_out_len);
+        ble_daemon_send_response(BLE_FIDO_CMD_MSG, oath_out, total_out);
+        fido_transport_set_active(FIDO_TRANSPORT_NONE);
+        _ctap_busy = false;
+        return;
+    }
 
     ctap_response_init(&resp);
     uint8_t status = ctap_request(req->data, (int)req->len, &resp);
@@ -228,7 +315,11 @@ static void ble_dispatch(fido_ble_request_t *req)
         memcpy(out + 1, resp.data, n);
         out_len = (uint16_t)(1 + n);
     }
-    ble_fido_send_response(BLE_FIDO_CMD_MSG, out, out_len);
+    if (req->is_daemon) {
+        ble_daemon_send_response(BLE_FIDO_CMD_MSG, out, out_len);
+    } else {
+        ble_fido_send_response(BLE_FIDO_CMD_MSG, out, out_len);
+    }
 
     fido_transport_set_active(FIDO_TRANSPORT_NONE);
     _ctap_busy = false;
@@ -246,6 +337,9 @@ static void ble_dispatch(fido_ble_request_t *req)
         device_ctap_finished(status, toast);
     }
 }
+#else /* !CRYPTICK_BLE_FIDO */
+extern "C" int ble_fido_is_connected(void) { return 0; }
+extern "C" void fido_ble_on_disconnect(void) {}
 #endif /* CRYPTICK_BLE_FIDO */
 
 /* CTAPHID packet[4] = type|cmd; CANCEL is TYPE_INIT|0x11 */
@@ -369,7 +463,7 @@ void device_hal_heartbeat() {
      * Never invent success from clearing processing.
      */
     if (_fido_ui_request == 3) {
-        if (now - _last_status_1_or_2_ms > 1500) {
+        if (now - _last_status_1_or_2_ms > 2500) {
             _fido_ui_request = 0;
         }
         return;
@@ -377,10 +471,15 @@ void device_hal_heartbeat() {
     /*
      * The pairing passkey stays up until pairing resolves — a human is typing
      * six digits into a host prompt, which takes longer than the 1.5s idle
-     * clear that suits a presence ceremony.
+     * clear that suits a presence ceremony. If abandoned by the peer, SMP 30s
+     * disconnect or this 35s safety fallback clears it.
      */
-    if (_fido_ui_request == 4)
+    if (_fido_ui_request == 4) {
+        if (now - _last_status_1_or_2_ms > 35000) {
+            _fido_ui_request = 0;
+        }
         return;
+    }
     if (_fido_ui_request != 0 && !_is_processing) {
         if (now - _last_status_1_or_2_ms > 1500) {
             _fido_ui_request = 0;
@@ -420,6 +519,11 @@ void fido_send_keepalive(int8_t status) {
                                     ? BLE_FIDO_STATUS_UP_NEEDED
                                     : BLE_FIDO_STATUS_PROCESSING);
         break;
+    case FIDO_TRANSPORT_DAEMON_BLE:
+        ble_daemon_send_keepalive(status == CTAPHID_STATUS_UPNEEDED
+                                      ? BLE_FIDO_STATUS_UP_NEEDED
+                                      : BLE_FIDO_STATUS_PROCESSING);
+        break;
 #endif
     case FIDO_TRANSPORT_NONE:
     default:
@@ -455,6 +559,7 @@ void device_set_status(uint32_t status) {
 /** After CTAPHID has fully written the CBOR reply (or error status byte). */
 void device_ctap_finished(uint8_t ctap_status, int allow_success_ui) {
     _is_processing = false;
+    _request_cancelled = false;
     if (allow_success_ui && ctap_status == 0) {
         _fido_ui_request = 3; /* real create/get success only */
         CLOG_I("HAL", "CTAP OK → UI success");
@@ -541,6 +646,17 @@ int ctap_user_presence_test_ex(uint32_t delay_ms, int allow_uv_cache) {
 }
 
 static int up_test_locked(uint32_t delay_ms, int allow_uv_cache) {
+    if (_request_cancelled ||
+        ((fido_transport_active() == FIDO_TRANSPORT_BLE ||
+          fido_transport_active() == FIDO_TRANSPORT_DAEMON_BLE) && !ble_fido_is_connected())) {
+        CLOG_I("HAL", "UP Cancelled: already aborted or disconnected");
+        _request_cancelled = false;
+        _fido_ui_request = 0;
+        _is_processing = false;
+        _uv_cache_until_ms = 0;
+        return -1;
+    }
+
     uint32_t now0 = (uint32_t)millis();
     if (allow_uv_cache && _uv_cache_until_ms != 0 &&
         (int32_t)(_uv_cache_until_ms - now0) > 0) {
@@ -569,6 +685,7 @@ static int up_test_locked(uint32_t delay_ms, int allow_uv_cache) {
 
     uint32_t start = millis();
     uint32_t last_keepalive = 0;
+
     /*
      * Hold UI + FP match for the whole delay_ms. Heartbeat may only clear
      * UI when !_is_processing — latch processing for the full wait.
@@ -578,7 +695,6 @@ static int up_test_locked(uint32_t delay_ms, int allow_uv_cache) {
      * self-service GenImg/Search via device_presence_fp_* (no FP on core 0).
      */
     _user_confirmed = false;
-    _request_cancelled = false;
     _is_processing = true;
     _fido_ui_request = 1; /* Prompt UI → fingerprint match on main core */
     _last_status_1_or_2_ms = millis();
@@ -599,10 +715,25 @@ static int up_test_locked(uint32_t delay_ms, int allow_uv_cache) {
             _user_confirmed = true;
         }
 
+        bool is_ble = (fido_transport_active() == FIDO_TRANSPORT_BLE ||
+                       fido_transport_active() == FIDO_TRANSPORT_DAEMON_BLE);
+        if (_request_cancelled || (is_ble && !ble_fido_is_connected())) {
+            CLOG_I("HAL", "UP Cancelled%s",
+                   (is_ble && !ble_fido_is_connected()) ? " (BLE disconnected)" : "");
+            _request_cancelled = false;
+            _fido_ui_request = 0;
+            _is_processing = false;
+            _uv_cache_until_ms = 0;
+            if (self_service)
+                device_presence_fp_end();
+            return -1;
+        }
+
         /* FIDO user presence is fingerprint only (bridge from FpSystem/NavSystem) */
         if (_user_confirmed) {
             CLOG_I("HAL", "UP Success (fingerprint%s)",
                    self_service ? " self-service" : "");
+            _request_cancelled = false;
             _fido_ui_request = 2; /* Processing UI */
             _last_status_1_or_2_ms = now;
             /* Do not arm cache here — only GetTouch (u2f.c) may. */
@@ -610,16 +741,6 @@ static int up_test_locked(uint32_t delay_ms, int allow_uv_cache) {
                 device_presence_fp_end();
             /* Keep processing true until device_set_status(IDLE) after CTAP */
             return 1;
-        }
-
-        if (_request_cancelled) {
-            CLOG_I("HAL", "UP Cancelled");
-            _fido_ui_request = 0;
-            _is_processing = false;
-            _uv_cache_until_ms = 0;
-            if (self_service)
-                device_presence_fp_end();
-            return -1;
         }
 
         /*
@@ -642,6 +763,7 @@ static int up_test_locked(uint32_t delay_ms, int allow_uv_cache) {
     }
 
     CLOG_E("HAL", "UP Timeout");
+    _request_cancelled = false;
     _fido_ui_request = 0;
     _is_processing = false;
     _uv_cache_until_ms = 0;
@@ -658,8 +780,11 @@ void _fido_task_loop(void *pvParameters) {
     uint8_t pkt[64];
     uint32_t last_heartbeat = 0;
     while(true) {
-        if (_hid_queue && xQueueReceive(_hid_queue, pkt, pdMS_TO_TICKS(10)) == pdTRUE) {
+        bool had_work = false;
+        if (_hid_queue && xQueueReceive(_hid_queue, pkt, pdMS_TO_TICKS(5)) == pdTRUE) {
+            had_work = true;
             CLOG_D("FIDO", "RX Packet: CMD 0x%02X", pkt[4]);
+            _request_cancelled = false;
             fido_transport_set_active(FIDO_TRANSPORT_USB);
 #if CRYPTICK_BLE_FIDO
             _ctap_busy = true;
@@ -679,6 +804,7 @@ void _fido_task_loop(void *pvParameters) {
         if (_ble_queue &&
             xQueueReceive((QueueHandle_t)_ble_queue, &ble_req, 0) == pdTRUE &&
             ble_req) {
+            had_work = true;
             ble_dispatch(ble_req);
         }
 #endif
@@ -692,6 +818,7 @@ void _fido_task_loop(void *pvParameters) {
         if (_piv_queue &&
             xQueueReceive((QueueHandle_t)_piv_queue, &piv_req, 0) == pdTRUE &&
             piv_req) {
+            had_work = true;
             piv_ble_dispatch(piv_req);
         }
 #endif
@@ -702,11 +829,16 @@ void _fido_task_loop(void *pvParameters) {
          * task: doing it on the TinyUSB task would stall CDC and HID for the
          * length of the wait, which is indistinguishable from a hung device.
          */
-        usb_ccid_pump();
+        if (usb_ccid_pump())
+            had_work = true;
 #endif
         ctaphid_check_timeouts();
         
-        vTaskDelay(pdMS_TO_TICKS(5)); 
+        if (!had_work) {
+            vTaskDelay(pdMS_TO_TICKS(5));
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
     }
 }
 
@@ -852,8 +984,11 @@ void device_show_pairing_passkey(const char *label) {
 }
 
 void device_clear_pairing_passkey(void) {
-    if (_fido_ui_request == 4)
+    if (_fido_ui_request == 4) {
         _fido_ui_request = 0;
+        _last_status_1_or_2_ms = millis();
+    }
+    device_set_ui_label("FIDO");
 }
 
 int ctap_generate_rng(uint8_t *dst, size_t num) {

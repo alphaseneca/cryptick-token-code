@@ -12,9 +12,13 @@
 #include "oath_ops.h"
 #include "totp_storage.h"
 #include "nav_system.h"
+#include <Preferences.h>
 
 extern "C" {
 #include "device.h"
+#if CRYPTICK_BLE_FIDO
+#include "ble_fido.h"
+#endif
 }
 
 #ifdef CRYPTICK_SERIAL_DEBUG_CMDS
@@ -219,6 +223,7 @@ void processSerialCommands(Stream &serial, std::vector<TOTPCredential> &credenti
                 serial.println("  TOTP_DEL name | OATH DELETE name");
                 serial.println("  DATE | SETTIME <unix> | OATH SET_TIME <unix>");
                 serial.println("UV: finger if templates enrolled; bootstrap if none. HID path: docs/HID_HOST.md");
+                serial.printf("Reset reason: %d\n", (int)esp_reset_reason());
                 serial.printf("Log level now: %d (%s)  0=NONE … 5=TRACE\n",
                               (int)cryptick_log_get_level(),
                               cryptick_log_level_name(cryptick_log_get_level()));
@@ -283,6 +288,15 @@ void processSerialCommands(Stream &serial, std::vector<TOTPCredential> &credenti
             {
                 nav_system_wake();
                 serial.println("OK WAKE");
+            }
+            else if (name == "UNPAIR" || name == "BLE_CLEAR_BONDS" || name == "CLEAR_BONDS")
+            {
+#if CRYPTICK_BLE_FIDO
+                ble_fido_clear_all_bonds();
+                serial.println("OK BLE_CLEAR_BONDS all BLE bonding records deleted from token");
+#else
+                serial.println("ERR BLE not supported in this build");
+#endif
             }
             else if (name == "ATTEST" || name == "AAGUID" || name == "ATTESTATION")
             {

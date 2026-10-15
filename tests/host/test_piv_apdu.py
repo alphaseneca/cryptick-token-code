@@ -56,6 +56,9 @@ SIGN = ctypes.CFUNCTYPE(
     ctypes.c_int, ctypes.c_uint8, ctypes.POINTER(ctypes.c_uint8),
     ctypes.POINTER(ctypes.c_uint8), ctypes.POINTER(ctypes.c_size_t),
 )
+ECDH = ctypes.CFUNCTYPE(
+    ctypes.c_int, ctypes.c_uint8, ctypes.POINTER(ctypes.c_uint8), ctypes.POINTER(ctypes.c_uint8)
+)
 PIN_CHECK = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t)
 PIN_SET = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t)
 PUBKEY = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_uint8, ctypes.POINTER(ctypes.c_uint8))
@@ -71,6 +74,7 @@ class PivHal(ctypes.Structure):
         ("get_object", GET_OBJ),
         ("set_object", SET_OBJ),
         ("sign_p256", SIGN),
+        ("ecdh_p256", ECDH),
         ("pin_check", PIN_CHECK),
         ("pin_set", PIN_SET),
         ("public_key", PUBKEY),
@@ -123,6 +127,11 @@ class Card:
             der_len[0] = len(sig)
             return 1
 
+        def _ecdh(slot, peer_pub, shared32):
+            for i in range(32):
+                shared32[i] = (slot ^ 0x42 ^ i) & 0xFF
+            return 1
+
         def _pin(p, n):
             return 1 if bytes(p[:n]) == self.pin else 0
 
@@ -160,7 +169,7 @@ class Card:
             return 1 if self.presence_ok else 0
 
         self._cbs = [
-            GET_OBJ(_get), SET_OBJ(_set), SIGN(_sign), PIN_CHECK(_pin),
+            GET_OBJ(_get), SET_OBJ(_set), SIGN(_sign), ECDH(_ecdh), PIN_CHECK(_pin),
             PIN_SET(_pin_set), PUBKEY(_pubkey), GUID(_guid), KEYGEN(_keygen),
             RETRIES_GET(_rget), RETRIES_SET(_rset),
             PRESENCE(_presence) if with_presence_hook else ctypes.cast(None, PRESENCE),

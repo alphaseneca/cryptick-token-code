@@ -17,6 +17,7 @@
 
 #include "ble_fido.h"
 #include "ccid_proto.h"
+#include "device.h"
 /* The applet's fingerprint wait is the CTAP one, so cancelling it is the CTAP
  * call. Declared here rather than pulling the whole CTAP HID header into a
  * file that must never reach ctap_request(). */
@@ -24,6 +25,8 @@ extern "C" void ctaphid_cancel_request(void);
 #include <NimBLEDevice.h>
 #include <cryptick_log.h>
 #include <string.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 namespace {
 
@@ -34,14 +37,21 @@ NimBLECharacteristic *g_atr = nullptr;
 
 uint8_t        g_msg[BLE_PIV_MAX_MSG];
 ble_fido_ctx_t g_ctx;
-bool           g_up = false;
+static volatile bool g_up = false;
 
 int notify_fragment(const uint8_t *frag, uint16_t len)
 {
-    if (!g_status || !g_up)
+    if (!g_status || !g_up || !ble_fido_is_connected())
         return 0;
-    g_status->setValue(frag, len);
-    return g_status->notify() ? 1 : 0;
+    for (int retry = 0; retry < 5; retry++) {
+        if (g_status->notify(frag, len)) {
+            return 1;
+        }
+        if (!ble_fido_is_connected())
+            return 0;
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+    return 0;
 }
 
 void publish_control_point_length()
@@ -162,8 +172,7 @@ void ble_piv_gatt_init(void)
 
     g_status = svc->createCharacteristic(
         BLE_PIV_UUID_STATUS,
-        NIMBLE_PROPERTY::NOTIFY | NIMBLE_PROPERTY::READ_ENC |
-            NIMBLE_PROPERTY::READ_AUTHEN);
+        NIMBLE_PROPERTY::NOTIFY);
 
     /* Descriptive, and read before the first transaction. Same reasoning as
      * fidoControlPointLength: gating them costs a discovery path and protects

@@ -9,6 +9,10 @@
 #include "credential_store.h"
 #include "device.h"
 #include "usb_device.h"
+#if CRYPTICK_BLE_FIDO
+#include "ble_fido.h"
+#include "ble_hid_keyboard.h"
+#endif
 #include <U8g2lib.h>
 #include <Wire.h>
 #include <stdio.h>
@@ -137,9 +141,9 @@ static void draw_status_bar(uint32_t utc)
 static void draw_title(const char *title)
 {
     u8g2.setFont(u8g2_font_6x12_tr);
-    draw_str_ellipsis(0, 20, title, 100);
-    u8g2.drawHLine(0, 22, 128);
-    draw_charge_icon(108, 0);
+    draw_str_ellipsis(0, 12, title, 90);
+    u8g2.drawHLine(0, 14, 128);
+    draw_charge_icon(108, 2);
 }
 
 /** Rows that fit under the title bar. */
@@ -147,9 +151,10 @@ static void draw_title(const char *title)
 
 static void draw_list_row(int row, const char *text, bool selected, int maxW)
 {
-    int y = 36 + row * 12;
+    int y = 27 + row * 15;
+    int boxW = (maxW < 120) ? 122 : 128;
     if (selected) {
-        u8g2.drawBox(0, y - 9, 128, 11);
+        u8g2.drawBox(0, y - 10, boxW, 13);
         u8g2.setDrawColor(0);
         draw_str_ellipsis(4, y, text, maxW);
         u8g2.setDrawColor(1);
@@ -159,14 +164,13 @@ static void draw_list_row(int row, const char *text, bool selected, int maxW)
 }
 
 /**
- * Scroll indicator for lists longer than LIST_ROWS. Without it a fourth
- * settings entry is simply invisible with no hint that it exists.
+ * Scroll indicator for lists longer than LIST_ROWS.
  */
 static void draw_scrollbar(int count, int first)
 {
     if (count <= LIST_ROWS)
         return;
-    const int trackY = 26, trackH = 38;
+    const int trackY = 17, trackH = 44;
     int thumbH = trackH * LIST_ROWS / count;
     if (thumbH < 5) thumbH = 5;
     int thumbY = trackY + ((trackH - thumbH) * first) / (count - LIST_ROWS);
@@ -204,7 +208,7 @@ static void draw_settings(void)
     int sel = nav_system_settings_index();
     int first = list_first_row(count, sel);
     const char *msg = nav_system_enroll_message();
-    int maxW = (count > LIST_ROWS) ? 116 : 120;
+    int maxW = (count > LIST_ROWS) ? 114 : 120;
 
     for (int r = 0; r < LIST_ROWS && (first + r) < count; r++) {
         char line[32];
@@ -213,17 +217,74 @@ static void draw_settings(void)
     }
     draw_scrollbar(count, first);
 
-	if (msg && msg[0]) {
-		/*
-		 * Wipe the whole third row — including its selection highlight, which
-		 * spans y 51..61 — so the status never lands on top of half a glyph.
-		 */
-		u8g2.setDrawColor(0);
-		u8g2.drawBox(0, 51, 128, 13);
-		u8g2.setDrawColor(1);
-		u8g2.setFont(u8g2_font_5x7_tr);
-		draw_str_ellipsis(0, 62, msg, 128);
-	}
+    if (msg && msg[0]) {
+        u8g2.setDrawColor(0);
+        u8g2.drawBox(12, 20, 104, 25);
+        u8g2.setDrawColor(1);
+        u8g2.drawFrame(12, 20, 104, 25);
+        u8g2.setFont(u8g2_font_6x12_tr);
+        int mw = u8g2.getStrWidth(msg);
+        u8g2.drawStr((128 - mw) / 2, 36, msg);
+    }
+}
+
+static void draw_ble_menu(void)
+{
+    draw_title("Bluetooth");
+    u8g2.setFont(u8g2_font_5x7_tr);
+
+#if CRYPTICK_BLE_FIDO
+    bool connected = (ble_fido_is_connected() != 0);
+    bool advertising = (ble_fido_is_advertising() != 0);
+    size_t bonds = ble_fido_bond_count();
+
+    char line[36];
+
+    // Status line: State & bond count (y = 23, height 7)
+    if (connected) {
+        snprintf(line, sizeof(line), "Status: Connected (%u bnd)", (unsigned)bonds);
+    } else if (advertising) {
+        snprintf(line, sizeof(line), "Status: Ready to Pair (%u/4)", (unsigned)bonds);
+    } else {
+        snprintf(line, sizeof(line), "Status: Offline");
+    }
+    u8g2.drawStr(0, 23, line);
+
+    // Subtle divider line
+    u8g2.drawHLine(0, 26, 128);
+
+    // Action items
+    int count = nav_system_ble_menu_count();
+    int sel = nav_system_ble_menu_index();
+
+    u8g2.setFont(u8g2_font_6x12_tr);
+    for (int i = 0; i < count; i++) {
+        char act_label[32];
+        nav_system_ble_menu_label(i, act_label, sizeof(act_label));
+        int act_y = 41 + (i * 15);
+        if (i == sel) {
+            u8g2.drawBox(0, act_y - 10, 128, 13);
+            u8g2.setDrawColor(0);
+            draw_str_ellipsis(4, act_y, act_label, 120);
+            u8g2.setDrawColor(1);
+        } else {
+            draw_str_ellipsis(4, act_y, act_label, 120);
+        }
+    }
+#else
+    u8g2.drawStr(0, 35, "BLE not supported");
+#endif
+
+    const char *msg = nav_system_enroll_message();
+    if (msg && msg[0]) {
+        u8g2.setDrawColor(0);
+        u8g2.drawBox(12, 20, 104, 25);
+        u8g2.setDrawColor(1);
+        u8g2.drawFrame(12, 20, 104, 25);
+        u8g2.setFont(u8g2_font_6x12_tr);
+        int mw = u8g2.getStrWidth(msg);
+        u8g2.drawStr((128 - mw) / 2, 36, msg);
+    }
 }
 
 static void draw_device_info(void)
@@ -232,23 +293,23 @@ static void draw_device_info(void)
     u8g2.setFont(u8g2_font_5x7_tr);
 
     char line[36];
-    int y = 33;
+    int y = 25;
 
     snprintf(line, sizeof(line), "USB  %s",
              usb_device_mounted() ? "1209:BEEE host" : "not mounted");
     u8g2.drawStr(0, y, line);
 
-    y += 9;
+    y += 10;
     snprintf(line, sizeof(line), "FP   %s  %u tpl",
              fp_system_ready() ? "ready" : "absent",
              (unsigned)fp_system_template_count());
     u8g2.drawStr(0, y, line);
 
-    y += 9;
+    y += 10;
     snprintf(line, sizeof(line), "OATH %d accounts", nav_system_account_count());
     u8g2.drawStr(0, y, line);
 
-    y += 9;
+    y += 10;
     unsigned long up = millis() / 1000UL;
     uint16_t slp = nav_system_sleep_timeout_sec();
     if (slp)
@@ -277,6 +338,81 @@ static void draw_clock(uint32_t utc)
         u8g2.drawStr(90, 60, "FP");
     else
         u8g2.drawStr(90, 60, "—");
+}
+
+static void draw_home(uint32_t utc)
+{
+    int card = nav_system_home_card();
+    if (card == 1) {
+        /* Quick PIV PIN Card */
+        draw_title("Quick PIV Login");
+        u8g2.setFont(u8g2_font_6x12_tr);
+        u8g2.drawStr(0, 24, "PIN: 123456");
+        u8g2.setFont(u8g2_font_5x7_tr);
+        u8g2.drawStr(0, 36, "Slot 9A • NIST PIV");
+#if CRYPTICK_BLE_FIDO
+        if (ble_hid_keyboard_is_connected()) {
+            u8g2.drawBox(0, 41, 128, 11);
+            u8g2.setDrawColor(0);
+            u8g2.drawStr(4, 49, "[CLICK OK] Auto-Type PIN");
+            u8g2.setDrawColor(1);
+            u8g2.drawStr(0, 61, "BLE: Connected to Mac");
+        } else {
+            u8g2.drawFrame(0, 41, 128, 11);
+            u8g2.drawStr(4, 49, "[CLICK OK] Auto-Type PIN");
+            u8g2.drawStr(0, 61, "BLE: Offline (Connect)");
+        }
+#else
+        u8g2.drawStr(0, 50, "[CLICK OK] Type PIN");
+#endif
+    } else if (card == 2) {
+        /* Quick TOTP Card */
+        draw_status_bar(utc);
+        if (!_creds || _creds->empty()) {
+            draw_title("Quick TOTP");
+            u8g2.setFont(u8g2_font_6x12_tr);
+            u8g2.drawStr(0, 38, "No TOTP accounts");
+            u8g2.setFont(u8g2_font_5x7_tr);
+            u8g2.drawStr(0, 52, "Add via Extension");
+        } else {
+            int idx = nav_system_account_index();
+            if (idx < 0 || idx >= (int)_creds->size()) idx = 0;
+            const TOTPCredential &c = (*_creds)[idx];
+            String code = totp_generate(c, utc);
+
+            char hdr[32];
+            snprintf(hdr, sizeof(hdr), "TOTP %d/%d", idx + 1, (int)_creds->size());
+            u8g2.setFont(u8g2_font_5x7_tr);
+            u8g2.drawStr(0, 18, hdr);
+            int hx = u8g2.getStrWidth(hdr);
+            draw_str_ellipsis(hx + 4, 18, c.label.length() ? c.label.c_str() : "Account", 124 - hx);
+
+            u8g2.setFont(u8g2_font_logisoso22_tn);
+            int cw = u8g2.getStrWidth(code.c_str());
+            u8g2.drawStr((128 - cw) / 2, 46, code.c_str());
+
+            u8g2.setFont(u8g2_font_5x7_tr);
+            u8g2.drawStr(0, 58, "[CLICK OK] Type Code");
+            int rem = 30 - (int)(utc % 30);
+            char rem_s[12];
+            snprintf(rem_s, sizeof(rem_s), "%02ds", rem);
+            int rw = u8g2.getStrWidth(rem_s);
+            u8g2.drawStr(128 - rw, 58, rem_s);
+        }
+    } else {
+        draw_clock(utc);
+    }
+
+    const char *msg = nav_system_enroll_message();
+    if (msg && msg[0]) {
+        u8g2.setDrawColor(0);
+        u8g2.drawBox(10, 20, 108, 26);
+        u8g2.setDrawColor(1);
+        u8g2.drawFrame(10, 20, 108, 26);
+        u8g2.setFont(u8g2_font_6x12_tr);
+        int mw = u8g2.getStrWidth(msg);
+        u8g2.drawStr((128 - mw) / 2, 37, msg);
+    }
 }
 
 static void draw_totp(uint32_t utc)
@@ -319,6 +455,7 @@ static void draw_totp(uint32_t utc)
 
 static void draw_message(const char *t1, const char *t2)
 {
+    if (!t1) t1 = "";
     draw_charge_icon(108, 0);
     u8g2.setFont(u8g2_font_6x12_tr);
     int w1 = u8g2.getStrWidth(t1);
@@ -356,6 +493,140 @@ static void draw_enroll(void)
     u8g2.drawBox(0, 58, fill, 5);
 }
 
+static void draw_piv_pin(void)
+{
+    draw_title("PIV Login PIN");
+    u8g2.setFont(u8g2_font_6x12_tr);
+    u8g2.drawStr(0, 24, "PIN: 123456");
+    u8g2.setFont(u8g2_font_5x7_tr);
+#if CRYPTICK_BLE_FIDO
+    if (ble_hid_keyboard_is_connected()) {
+        u8g2.drawStr(0, 38, "BLE: Connected to Mac");
+        u8g2.drawStr(0, 48, "Press [OK] to Auto-type");
+        u8g2.drawStr(0, 58, "PIN into Lock Screen");
+    } else {
+        u8g2.drawStr(0, 38, "BLE: Not Connected");
+        u8g2.drawStr(0, 48, "Pair Mac Bluetooth or");
+        u8g2.drawStr(0, 58, "type manually: 123456");
+    }
+#else
+    u8g2.drawStr(0, 40, "NIST Default (Slot 9A)");
+    u8g2.drawStr(0, 52, "Enter manually on Mac");
+#endif
+}
+
+static void draw_fido_prompt(void)
+{
+    const char *label = nav_system_fido_label();
+    draw_title("Confirm");
+    u8g2.setFont(u8g2_font_6x12_tr);
+    if (label && label[0] && strcmp(label, "FIDO") != 0) {
+        int lw = u8g2.getStrWidth(label);
+        if (lw > 120)
+            draw_str_ellipsis(4, 32, label, 120);
+        else
+            u8g2.drawStr((128 - lw) / 2, 32, label);
+
+        u8g2.setFont(u8g2_font_5x7_tr);
+        const char *sub = "Touch sensor to confirm";
+        int sw = u8g2.getStrWidth(sub);
+        u8g2.drawStr((128 - sw) / 2, 48, sub);
+
+        const char *hint = "Left = Cancel";
+        int hw = u8g2.getStrWidth(hint);
+        u8g2.drawStr((128 - hw) / 2, 58, hint);
+    } else {
+        const char *m = "WebAuthn / FIDO";
+        int mw = u8g2.getStrWidth(m);
+        u8g2.drawStr((128 - mw) / 2, 32, m);
+
+        u8g2.setFont(u8g2_font_5x7_tr);
+        const char *sub = "Place finger on sensor";
+        int sw = u8g2.getStrWidth(sub);
+        u8g2.drawStr((128 - sw) / 2, 48, sub);
+
+        const char *hint = "Left = Cancel";
+        int hw = u8g2.getStrWidth(hint);
+        u8g2.drawStr((128 - hw) / 2, 58, hint);
+    }
+}
+
+static void draw_fido_processing(void)
+{
+    const char *label = nav_system_fido_label();
+    if (label && label[0] && strcmp(label, "FIDO") != 0) {
+        draw_title("Processing");
+        u8g2.setFont(u8g2_font_6x12_tr);
+        int lw = u8g2.getStrWidth(label);
+        if (lw > 120)
+            draw_str_ellipsis(4, 32, label, 120);
+        else
+            u8g2.drawStr((128 - lw) / 2, 32, label);
+
+        u8g2.setFont(u8g2_font_5x7_tr);
+        const char *sub = "Working… Please wait";
+        int sw = u8g2.getStrWidth(sub);
+        u8g2.drawStr((128 - sw) / 2, 48, sub);
+    } else {
+        draw_message("Working…", "Wait");
+    }
+}
+
+static void draw_fido_success(void)
+{
+    const char *label = nav_system_fido_label();
+    if (!label || !label[0] || strcmp(label, "FIDO") == 0) {
+        draw_title("Success");
+        u8g2.setFont(u8g2_font_6x12_tr);
+        const char *m = "OK";
+        int mw = u8g2.getStrWidth(m);
+        u8g2.drawStr((128 - mw) / 2, 36, m);
+        u8g2.setFont(u8g2_font_5x7_tr);
+        const char *sub = "Success";
+        int sw = u8g2.getStrWidth(sub);
+        u8g2.drawStr((128 - sw) / 2, 50, sub);
+        return;
+    }
+
+    const char *sep = strchr(label, '|');
+    if (sep) {
+        /* OATH confirmation: shows account label and 6-digit TOTP code */
+        char account[48];
+        size_t alen = (size_t)(sep - label);
+        if (alen >= sizeof(account)) alen = sizeof(account) - 1;
+        memcpy(account, label, alen);
+        account[alen] = 0;
+        const char *code = sep + 1;
+
+        draw_title("TOTP Code");
+        u8g2.setFont(u8g2_font_5x7_tr);
+        int aw = u8g2.getStrWidth(account);
+        if (aw > 120)
+            draw_str_ellipsis(4, 25, account, 120);
+        else
+            u8g2.drawStr((128 - aw) / 2, 25, account);
+
+        u8g2.setFont(u8g2_font_logisoso22_tn);
+        int cw = u8g2.getStrWidth(code);
+        u8g2.drawStr((128 - cw) / 2, 52, code);
+        return;
+    }
+
+    /* WebAuthn confirmation: shows relying party ID */
+    draw_title("Authorized");
+    u8g2.setFont(u8g2_font_6x12_tr);
+    int lw = u8g2.getStrWidth(label);
+    if (lw > 120)
+        draw_str_ellipsis(4, 34, label, 120);
+    else
+        u8g2.drawStr((128 - lw) / 2, 34, label);
+
+    u8g2.setFont(u8g2_font_5x7_tr);
+    const char *sub = "Transaction Confirmed";
+    int sw = u8g2.getStrWidth(sub);
+    u8g2.drawStr((128 - sw) / 2, 50, sub);
+}
+
 static void render(void)
 {
     if (!_oled_ok)
@@ -371,13 +642,19 @@ static void render(void)
 
     switch (st) {
     case UI_CLOCK:
-        draw_clock(utc);
+        draw_home(utc);
         break;
     case UI_MENU: {
-        static const char *items[] = { "TOTP", "Settings" };
-        draw_menu_list(items, 2, nav_system_menu_index());
+        static const char *items[] = { "TOTP", "PIV Login PIN", "Bluetooth", "Settings" };
+        draw_menu_list(items, 4, nav_system_menu_index());
         break;
     }
+    case UI_PIV_PIN:
+        draw_piv_pin();
+        break;
+    case UI_BLE_MENU:
+        draw_ble_menu();
+        break;
     case UI_TOTP:
         draw_totp(utc);
         break;
@@ -400,17 +677,17 @@ static void render(void)
         draw_message("Clear all FP?", "OK=Yes  Left=No");
         break;
     case UI_FIDO_PROMPT:
-        draw_message(nav_system_fido_label(), "Place finger");
+        draw_fido_prompt();
         break;
     case UI_BLE_PAIRING:
         /* Caption carries the 6 digits; the host prompts for them. */
         draw_message(nav_system_fido_label(), "Type on host");
         break;
     case UI_FIDO_PROCESSING:
-        draw_message("Working…", "Wait");
+        draw_fido_processing();
         break;
     case UI_FIDO_SUCCESS:
-        draw_message("OK", "Success");
+        draw_fido_success();
         break;
     case UI_DEVICE_INFO:
         draw_device_info();

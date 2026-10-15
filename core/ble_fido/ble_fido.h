@@ -214,6 +214,41 @@ int ble_fido_is_receiving(void);
  */
 void ble_fido_gatt_init(void);
 
+/**
+ * Returns the active advertised BLE device name (e.g. "Cryptick-5C6E").
+ */
+const char *ble_fido_get_device_name(void);
+
+/**
+ * Returns whether a BLE peer is currently connected.
+ */
+int ble_fido_is_connected(void);
+
+/**
+ * Returns whether the token is currently advertising over BLE.
+ */
+int ble_fido_is_advertising(void);
+
+/**
+ * Starts BLE advertising once all GATT services are initialized.
+ */
+void ble_fido_start_advertising(void);
+
+/**
+ * Restarts BLE advertising.
+ */
+void ble_fido_restart_advertising(void);
+
+/**
+ * Returns the number of bonded hosts in NVS.
+ */
+size_t ble_fido_bond_count(void);
+
+/**
+ * Delete all stored BLE bonding records from NVS and restart advertising.
+ */
+void ble_fido_clear_all_bonds(void);
+
 #ifdef __cplusplus
 }
 #endif

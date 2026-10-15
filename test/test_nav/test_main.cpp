@@ -285,6 +285,28 @@ void test_settings_labels_cover_every_item(void)
     }
 }
 
+void test_ble_pairing_screen_lifecycle(void)
+{
+    reset_nav();
+    nav_system_set_sleep_timeout_sec(5, false);
+
+    /* Pairing request sets state to UI_BLE_PAIRING and displays passkey */
+    nav_system_set_fido_label("123456");
+    nav_system_set_fido_ui(4);
+    TEST_ASSERT_EQUAL(UI_BLE_PAIRING, nav_system_state());
+    TEST_ASSERT_EQUAL_STRING("123456", nav_system_fido_label());
+
+    /* Panel must not sleep while pairing passkey is on screen */
+    tick_after_idle(600);
+    TEST_ASSERT_EQUAL(UI_BLE_PAIRING, nav_system_state());
+    TEST_ASSERT_FALSE(nav_system_is_asleep());
+
+    /* Clearing pairing returns to UI_CLOCK and restores default FIDO label */
+    nav_system_set_fido_ui(0);
+    TEST_ASSERT_EQUAL(UI_CLOCK, nav_system_state());
+    TEST_ASSERT_EQUAL_STRING("FIDO", nav_system_fido_label());
+}
+
 void setup()
 {
     delay(1500);
@@ -300,6 +322,7 @@ void setup()
     RUN_TEST(test_no_sleep_while_awaiting_user);
     RUN_TEST(test_host_request_wakes_from_sleep);
     RUN_TEST(test_no_sleep_during_fido_ceremony_hold);
+    RUN_TEST(test_ble_pairing_screen_lifecycle);
     RUN_TEST(test_sleep_drops_unlock_session);
     RUN_TEST(test_settings_labels_cover_every_item);
     UNITY_END();

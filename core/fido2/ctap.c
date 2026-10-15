@@ -207,29 +207,14 @@ uint8_t ctap_get_info(CborEncoder * encoder)
             check_ret(ret);
             {
                 /*
-                 * Canonical CBOR text-key order (bytewise):
-                 * clientPin?, credMgmt, plat, rk, up, uv
-                 * Non-canonical maps break some strict WebAuthn platforms into
-                 * U2F-only fall-back after GetInfo.
+                 * Canonical CBOR key order (RFC 7049 §3.9 / RFC 8949 §4.2.1):
+                 * 1. Shortest encoded byte length first:
+                 *    - 2-byte keys: "rk" (0x62726b), "up" (0x627570), "uv" (0x627576)
+                 *    - 4-byte keys: "plat" (0x64706c6174)
+                 *    - 8-byte keys: "credMgmt" (0x68637265644d676d74)
+                 *    - 9-byte keys: "clientPin" (0x69636c69656e7450696e)
+                 * 2. Lexicographical order for equal lengths.
                  */
-                if (pin_set)
-                {
-                    ret = cbor_encode_text_string(&options, "clientPin", 9);
-                    check_ret(ret);
-                    ret = cbor_encode_boolean(&options, 1);
-                    check_ret(ret);
-                }
-
-                ret = cbor_encode_text_string(&options, "credMgmt", 8);
-                check_ret(ret);
-                ret = cbor_encode_boolean(&options, 1);
-                check_ret(ret);
-
-                ret = cbor_encode_text_string(&options, "plat", 4);
-                check_ret(ret);
-                ret = cbor_encode_boolean(&options, 0);
-                check_ret(ret);
-
                 ret = cbor_encode_text_string(&options, "rk", 2);
                 check_ret(ret);
                 ret = cbor_encode_boolean(&options, 1);
@@ -244,6 +229,24 @@ uint8_t ctap_get_info(CborEncoder * encoder)
                 check_ret(ret);
                 ret = cbor_encode_boolean(&options, 1);
                 check_ret(ret);
+
+                ret = cbor_encode_text_string(&options, "plat", 4);
+                check_ret(ret);
+                ret = cbor_encode_boolean(&options, 0);
+                check_ret(ret);
+
+                ret = cbor_encode_text_string(&options, "credMgmt", 8);
+                check_ret(ret);
+                ret = cbor_encode_boolean(&options, 1);
+                check_ret(ret);
+
+                if (pin_set)
+                {
+                    ret = cbor_encode_text_string(&options, "clientPin", 9);
+                    check_ret(ret);
+                    ret = cbor_encode_boolean(&options, 1);
+                    check_ret(ret);
+                }
             }
             ret = cbor_encoder_close_container(&map, &options);
             check_ret(ret);
@@ -290,10 +293,19 @@ uint8_t ctap_get_info(CborEncoder * encoder)
         ret = cbor_encode_uint(&map, 0x09); // transports
         check_ret(ret);
         {
+#if defined(CRYPTICK_BLE_FIDO) && CRYPTICK_BLE_FIDO
+            ret = cbor_encoder_create_array(&map, &array, 2);
+            check_ret(ret);
+            ret = cbor_encode_text_stringz(&array, "usb");
+            check_ret(ret);
+            ret = cbor_encode_text_stringz(&array, "ble");
+            check_ret(ret);
+#else
             ret = cbor_encoder_create_array(&map, &array, 1);
             check_ret(ret);
             ret = cbor_encode_text_stringz(&array, "usb");
             check_ret(ret);
+#endif
             ret = cbor_encoder_close_container(&map, &array);
             check_ret(ret);
         }
@@ -302,11 +314,12 @@ uint8_t ctap_get_info(CborEncoder * encoder)
         check_ret(ret);
         {
             CborEncoder alg;
-            ret = cbor_encoder_create_array(&map, &array, 1);
+            ret = cbor_encoder_create_array(&map, &array, 2);
             check_ret(ret);
+
+            /* Canonical key order: "alg" then "type" */
             ret = cbor_encoder_create_map(&array, &alg, 2);
             check_ret(ret);
-            /* Canonical key order: "alg" then "type" */
             ret = cbor_encode_text_stringz(&alg, "alg");
             check_ret(ret);
             ret = cbor_encode_int(&alg, -7); // ES256
@@ -317,6 +330,20 @@ uint8_t ctap_get_info(CborEncoder * encoder)
             check_ret(ret);
             ret = cbor_encoder_close_container(&array, &alg);
             check_ret(ret);
+
+            ret = cbor_encoder_create_map(&array, &alg, 2);
+            check_ret(ret);
+            ret = cbor_encode_text_stringz(&alg, "alg");
+            check_ret(ret);
+            ret = cbor_encode_int(&alg, -8); // EDDSA (Ed25519)
+            check_ret(ret);
+            ret = cbor_encode_text_stringz(&alg, "type");
+            check_ret(ret);
+            ret = cbor_encode_text_stringz(&alg, "public-key");
+            check_ret(ret);
+            ret = cbor_encoder_close_container(&array, &alg);
+            check_ret(ret);
+
             ret = cbor_encoder_close_container(&map, &array);
             check_ret(ret);
         }
@@ -999,6 +1026,10 @@ uint8_t ctap_make_credential(CborEncoder * encoder, uint8_t * request, int lengt
         printf2(TAG_ERR,"error, parse_make_credential failed\n");
         return ret;
     }
+    if (MC.rp.id[0] != 0)
+    {
+        device_set_ui_label((const char *)MC.rp.id);
+    }
     if (MC.pinAuthEmpty)
     {
         /*
@@ -1427,6 +1458,7 @@ uint8_t ctap_end_get_assertion(CborEncoder * map, CTAP_credentialDescriptor * cr
         crypto_ecc256_load_key((uint8_t*)&cred->credential.id, cred_size, NULL, 0);
     }
 
+    uint8_t hashbuf[32];
 #ifdef ENABLE_U2F_EXTENSIONS
     if ( extend_fido2(&cred->credential.id, sigder) )
     {
@@ -1435,7 +1467,7 @@ uint8_t ctap_end_get_assertion(CborEncoder * map, CTAP_credentialDescriptor * cr
     else
 #endif
     {
-        sigder_sz = ctap_calculate_signature(auth_data_buf, auth_data_buf_sz, clientDataHash, auth_data_buf, sigbuf, sigder, cose_alg);
+        sigder_sz = ctap_calculate_signature(auth_data_buf, auth_data_buf_sz, clientDataHash, hashbuf, sigbuf, sigder, cose_alg);
     }
 
     printf1(TAG_GREEN, "sigder_sz = %d\n", sigder_sz);
@@ -1919,6 +1951,10 @@ uint8_t ctap_get_assertion(CborEncoder * encoder, uint8_t * request, int length)
     {
         printf2(TAG_ERR,"error, parse_get_assertion failed\n");
         return ret;
+    }
+    if (GA.rp.id[0] != 0)
+    {
+        device_set_ui_label((const char *)GA.rp.id);
     }
 
     if (GA.pinAuthEmpty)

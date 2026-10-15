@@ -146,7 +146,7 @@ static volatile bool _tx_zlp;
 #define CCID_NVS_NS    "cryptick"
 #define CCID_NVS_FAIL  "ccid_fail"
 #define CCID_NVS_IMG   "ccid_img"
-#define CCID_FAIL_LIMIT 2
+#define CCID_FAIL_LIMIT 10
 
 /**
  * Decide whether to put CCID on the composite this boot, and count the try.
@@ -424,12 +424,47 @@ static bool ccid_drv_xfer_cb(uint8_t rhport, uint8_t ep_addr,
             return true;
         }
         if (_rx_len >= CCID_HEADER_LEN + body) {
+            uint32_t msg_total_len = CCID_HEADER_LEN + body;
             /*
-             * Refuse rather than queue behind the message in flight, for the
-             * same reason the BLE side does: the one ahead may be waiting on
-             * a fingerprint, and a request accepted now would be answered
-             * minutes later against a host that has long since given up.
+             * Is this a blocking message?
+             * Only XFR_BLOCK carrying PIV_INS_GENERAL_AUTHENTICATE (0x87) waits for
+             * user presence (fingerprint/touch) up to CRYPTICK_FIDO_UP_TIMEOUT_MS.
+             * All other CCID messages (GetSlotStatus 0x65, IccPowerOn 0x62, IccPowerOff 0x63,
+             * GetParameters 0x6C, Select AID, GetData, Verify, etc.) execute in microseconds
+             * and MUST be answered immediately on the USB task without queue latency.
              */
+            bool is_blocking = (_rx[0] == CCID_PC_TO_RDR_XFR_BLOCK && body >= 2 &&
+                                _rx[CCID_HEADER_LEN + 1] == 0x87); // PIV_INS_GENERAL_AUTHENTICATE
+
+            if (!is_blocking) {
+                if (_busy) {
+                    uint8_t hdr[CCID_HEADER_LEN];
+                    memcpy(hdr, _rx, CCID_HEADER_LEN);
+                    _rx_len = 0;
+                    ccid_reply_error(hdr, CCID_ERR_SLOT_BUSY);
+                    ccid_arm_out();
+                    return true;
+                }
+                if (usbd_edpt_claim(CCID_RHPORT, _ep_in)) {
+                    size_t rlen = ccid_handle_message(_rx, msg_total_len, _reply, sizeof(_reply));
+                    _rx_len = 0;
+                    if (rlen > 0 && rlen <= sizeof(_tx)) {
+                        memcpy(_tx, _reply, rlen);
+                        _tx_len = (uint16_t)rlen;
+                        _tx_zlp = (rlen % CCID_EP_SIZE) == 0;
+                        if (!usbd_edpt_xfer(CCID_RHPORT, _ep_in, _tx, _tx_len)) {
+                            _tx_zlp = false;
+                            usbd_edpt_release(CCID_RHPORT, _ep_in);
+                        }
+                    } else {
+                        usbd_edpt_release(CCID_RHPORT, _ep_in);
+                    }
+                }
+                ccid_arm_out();
+                return true;
+            }
+
+            /* Blocking message: route to FIDO task queue for user presence / touch */
             if (_busy || !_queue || uxQueueSpacesAvailable(_queue) == 0) {
                 uint8_t hdr[CCID_HEADER_LEN];
                 memcpy(hdr, _rx, CCID_HEADER_LEN);
@@ -440,7 +475,7 @@ static bool ccid_drv_xfer_cb(uint8_t rhport, uint8_t ep_addr,
             }
             ccid_msg_t *slot = &_pool[_pool_next & 1u];
             _pool_next++;
-            slot->len = CCID_HEADER_LEN + body;
+            slot->len = msg_total_len;
             memcpy(slot->data, _rx, slot->len);
             _rx_len = 0;
             if (xQueueSend(_queue, &slot, 0) != pdTRUE)

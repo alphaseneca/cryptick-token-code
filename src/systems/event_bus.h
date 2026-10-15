@@ -43,7 +43,9 @@ enum UiState : uint8_t {
     UI_FIDO_SUCCESS,
     UI_SLEEP,        /* panel off; CENTER or a host request wakes it */
     UI_DEVICE_INFO,  /* Settings → Info */
-    UI_BLE_PAIRING   /* 6-digit LESC passkey; typed on the host, not a finger */
+    UI_BLE_PAIRING,  /* 6-digit LESC passkey; typed on the host, not a finger */
+    UI_BLE_MENU,     /* Top-level Bluetooth status and controls */
+    UI_PIV_PIN       /* PIV Login PIN display */
 };
 
 enum FpEventKind : uint8_t {

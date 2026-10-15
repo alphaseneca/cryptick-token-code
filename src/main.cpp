@@ -26,6 +26,8 @@
 #include "ble_piv.h"
 #if CRYPTICK_BLE_FIDO
 #include "ble_fido.h"
+#include "ble_daemon.h"
+#include "ble_hid_keyboard.h"
 #endif
 #include "piv.h"
 #include "ctaphid.h"
@@ -41,7 +43,7 @@ extern "C" {
 }
 
 RTC_DS3231 rtc;
-static bool g_rtc_ok = false;
+bool g_rtc_ok = false;
 std::vector<TOTPCredential> credentials;
 bool g_setup_finished = false;
 
@@ -125,16 +127,11 @@ void setup()
      * 1) USB CDC first so all probe lines are visible on the host.
      * 2) OLED / buttons / FP after Serial is up (blank-screen diagnosis).
      */
+    Serial.begin(115200);
     cryptick_log_init();
     i2c_mutex_init();
     credential_store_init();
     bus_init();
-
-    usb_device_init();
-    banner();
-    CLOG_I("BOOT", "log_level=%d (%s)  set via LOGLEVEL 0..5",
-           (int)cryptick_log_get_level(),
-           cryptick_log_level_name(cryptick_log_get_level()));
 
     display_system_init();
     display_system_boot_animation();
@@ -183,11 +180,28 @@ void setup()
      * NimBLE server this service is added to. */
     ble_piv_gatt_init();
 #endif
+#if defined(CRYPTICK_BLE_FIDO) && CRYPTICK_BLE_FIDO
+    ble_daemon_gatt_init();
+    ble_hid_keyboard_init();
+    ble_fido_start_advertising();
+#endif
 #if defined(CRYPTICK_USB_CCID) && CRYPTICK_USB_CCID
     /* After piv_hal_init(): the first CCID message can arrive as soon as the
      * host powers the card, and it lands in the applet. */
     usb_ccid_init();
 #endif
+
+    /*
+     * Initialize USB composite *after* LittleFS, crypto, PIV HAL, and CCID are
+     * ready so that the host's immediate enumeration probes (e.g. PC_to_RDR_GetSlotStatus)
+     * find all endpoints and data structures fully instantiated.
+     */
+    usb_device_init();
+    banner();
+    CLOG_I("BOOT", "reset_reason=%d log_level=%d (%s)  set via LOGLEVEL 0..5",
+           (int)esp_reset_reason(),
+           (int)cryptick_log_get_level(),
+           cryptick_log_level_name(cryptick_log_get_level()));
 
     CLOG_I("BOOT", "Ready — type HELP");
     g_setup_finished = true;
@@ -217,6 +231,17 @@ void loop()
         }
     }
 
+#if defined(CRYPTICK_BLE_FIDO) && CRYPTICK_BLE_FIDO
+    static uint32_t lastAdvCheck = 0;
+    if (now - lastAdvCheck >= 2000) {
+        lastAdvCheck = now;
+        if (!ble_fido_is_connected() && !ble_fido_is_advertising()) {
+            CLOG_D("BLE", "Keepalive: restarting advertising");
+            ble_fido_start_advertising();
+        }
+    }
+#endif
+
     /*
      * nav_system is loop-owned. The FIDO task signals it indirectly: a prompt
      * caption via device_take_ui_label() and the prompt/processing/success
@@ -243,6 +268,13 @@ void loop()
 #endif
 
     processSerialCommands(CryptickLog, credentials,
+#ifdef ENABLE_FINGERPRINT
+                          fp_system_driver(), fp_system_ready()
+#else
+                          nullptr, false
+#endif
+    );
+    processSerialCommands(Serial, credentials,
 #ifdef ENABLE_FINGERPRINT
                           fp_system_driver(), fp_system_ready()
 #else

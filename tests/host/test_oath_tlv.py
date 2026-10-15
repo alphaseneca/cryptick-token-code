@@ -53,5 +53,16 @@ def test_set_time_raw():
     assert pkt[5:9] == data
 
 
+def test_set_time_tlv():
+    ts = 1700000000
+    chal = struct.pack(">Q", ts)
+    body = tlv(TAG_CHALLENGE, chal)
+    pkt = apdu(OATH_INS_SET_TIME, body)
+    assert pkt[1] == OATH_INS_SET_TIME
+    assert pkt[5] == TAG_CHALLENGE
+    assert pkt[6] == 8
+    assert pkt[7:15] == chal
+
+
 def test_sw_constants():
     assert 0x9000 >> 8 == 0x90

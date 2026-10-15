@@ -110,6 +110,7 @@ static void sink_write(const char *s)
         return;
     bool held = sink_lock();
     USBLog.print(s);
+    Serial.print(s);
     sink_unlock(held);
 }
 

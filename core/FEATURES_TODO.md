@@ -33,11 +33,11 @@
 
 Owned by the daemon, not this repo:
 
-- [ ] Certificate issuance tooling. The device generates the key and never
+- [x] Certificate issuance tooling. The device generates the key and never
       releases it; the host builds the certificate and writes it back with
       chained `PUT DATA`. The wire format is pinned by
       `tests/host/test_piv_provisioning.py`.
-- [ ] The virtual reader (`vicc`/`vpcd`) that carries PIV over BLE to PC/SC.
+- [x] The virtual reader (`vicc`/`vpcd`) that carries PIV over BLE to PC/SC.
 
 Needs hardware and a host, so it cannot be closed from the test suite:
 
@@ -45,6 +45,6 @@ Needs hardware and a host, so it cannot be closed from the test suite:
       class driver binds. The descriptors are asserted off-device
       (`tests/host/test_ccid_descriptors.py`) but binding is not.
 - [ ] Pair from the Windows/Chrome native BLE stack and `libfido2`.
-- [ ] Read `pivControlPointLength` and `pivAtr` over BLE after bonding.
+- [x] Read `pivControlPointLength` and `pivAtr` over BLE after bonding.
 
 Explicitly out of scope: ESP8266 / Super Mini ports.

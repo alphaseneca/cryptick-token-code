@@ -15,10 +15,17 @@ int nav_system_menu_index(void);
 int nav_system_settings_index(void);
 int nav_system_account_index(void);
 int nav_system_account_count(void);
+int nav_system_home_card(void);
+void nav_system_set_home_card(int card);
 
 /** Settings list, rendered by display_system (label depends on live state). */
 int nav_system_settings_count(void);
 void nav_system_settings_label(int idx, char *out, size_t cap);
+
+/** Bluetooth menu list, rendered by display_system. */
+int nav_system_ble_menu_index(void);
+int nav_system_ble_menu_count(void);
+void nav_system_ble_menu_label(int idx, char *out, size_t cap);
 
 /*
  * Idle sleep. This powers the OLED down and drops the unlock session; the MCU

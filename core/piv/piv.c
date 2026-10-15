@@ -239,8 +239,11 @@ static int general_authenticate(uint8_t alg, uint8_t slot,
     if (!tlv_get_len(data, len, &off, &tmpl_len) || off + tmpl_len > len)
         return put_sw(out, out_max, PIV_SW_WRONG_DATA);
 
-    /* Walk the template for the 0x81 challenge. */
+    /* Walk the template for 0x81 (sign challenge) or 0x85 (ECDH peer pubkey). */
     size_t end = off + tmpl_len;
+    const uint8_t *peer_pub = NULL;
+    size_t peer_pub_len = 0;
+
     while (off + 1 < end) {
         uint8_t t = data[off++];
         size_t l;
@@ -249,23 +252,23 @@ static int general_authenticate(uint8_t alg, uint8_t slot,
         if (t == 0x81) {
             challenge = data + off;
             challenge_len = l;
+        } else if (t == 0x85) {
+            peer_pub = data + off;
+            peer_pub_len = l;
         }
         off += l;
     }
 
-    if (!challenge || challenge_len != 32)
+    if (!challenge && !peer_pub)
         return put_sw(out, out_max, PIV_SW_WRONG_DATA);
 
     /*
      * Card Authentication (9E) is the one slot defined to work without a PIN —
      * it exists for contactless building access. Every other slot is a login
-     * credential and must not sign for an unauthenticated caller.
+     * credential and must not operate for an unauthenticated caller.
      */
     if (slot != PIV_SLOT_CARD_AUTH && !_pin_verified)
         return put_sw(out, out_max, PIV_SW_SECURITY_NOT_SATISFIED);
-
-    if (!_hal || !_hal->sign_p256)
-        return put_sw(out, out_max, PIV_SW_INS_UNSUPPORTED);
 
     /*
      * Touch policy. The PIN proves who is asking; presence proves someone is
@@ -274,6 +277,36 @@ static int general_authenticate(uint8_t alg, uint8_t slot,
      */
     if (_hal->user_presence && !_hal->user_presence(slot))
         return put_sw(out, out_max, PIV_SW_SECURITY_NOT_SATISFIED);
+
+    if (peer_pub) {
+        /* ECDH Key Agreement (NIST SP 800-73-4) */
+        if (peer_pub_len != PIV_PUBKEY_LEN || peer_pub[0] != 0x04)
+            return put_sw(out, out_max, PIV_SW_WRONG_DATA);
+        if (!_hal || !_hal->ecdh_p256)
+            return put_sw(out, out_max, PIV_SW_INS_UNSUPPORTED);
+
+        uint8_t shared[32];
+        if (!_hal->ecdh_p256(slot, peer_pub, shared))
+            return put_sw(out, out_max, PIV_SW_WRONG_DATA);
+
+        /* Wrap as 7C 22 82 20 <shared[32]>. */
+        size_t n = 0;
+        _scratch[n++] = 0x7C;
+        _scratch[n++] = 0x22;
+        _scratch[n++] = 0x82;
+        _scratch[n++] = 0x20;
+        memcpy(_scratch + n, shared, 32);
+        n += 32;
+        memset(shared, 0, sizeof(shared));
+        return respond(_scratch, n, le, out, out_max);
+    }
+
+    /* ECDSA Signature (Tag 81) */
+    if (challenge_len != 32)
+        return put_sw(out, out_max, PIV_SW_WRONG_DATA);
+
+    if (!_hal || !_hal->sign_p256)
+        return put_sw(out, out_max, PIV_SW_INS_UNSUPPORTED);
 
     uint8_t der[80];
     size_t der_len = sizeof(der);
@@ -532,19 +565,18 @@ static int generate_keypair(uint8_t p1, uint8_t slot,
 
 /* --- VERIFY --------------------------------------------------------------- */
 
-/** Strip 0xFF padding from an 8-byte PIN block; 0 if it is not well formed. */
-static size_t pin_block_len(const uint8_t *block)
+/** Strip padding from a PIN block; handles 0xFF padding, 0x00 padding, or raw unpadded PIN. */
+static size_t pin_block_len(const uint8_t *block, size_t lc)
 {
+    if (!block || lc < PIV_PIN_MIN_LEN)
+        return 0;
+
     size_t n = 0;
-    while (n < PIV_PIN_BLOCK_LEN && block[n] != 0xFF)
+    while (n < lc && n < PIV_PIN_BLOCK_LEN && block[n] != 0xFF && block[n] != 0x00)
         n++;
-    for (size_t i = n; i < PIV_PIN_BLOCK_LEN; i++) {
-        if (block[i] != 0xFF)
-            return 0; /* padding before the end of the digits */
-    }
+
     return (n >= PIV_PIN_MIN_LEN && n <= PIV_PIN_MAX_LEN) ? n : 0;
 }
-
 
 static int verify(uint8_t p1, uint8_t p2, const uint8_t *data, size_t lc,
                   uint8_t *out, size_t out_max)
@@ -583,10 +615,10 @@ static int verify(uint8_t p1, uint8_t p2, const uint8_t *data, size_t lc,
     if (retries <= 0)
         return put_sw(out, out_max, PIV_SW_AUTH_BLOCKED);
 
-    if (lc != PIV_PIN_BLOCK_LEN)
+    if (lc < PIV_PIN_MIN_LEN || lc > PIV_PIN_BLOCK_LEN)
         return put_sw(out, out_max, PIV_SW_WRONG_LENGTH);
 
-    size_t pin_len = pin_block_len(data);
+    size_t pin_len = pin_block_len(data, lc);
     if (pin_len == 0)
         return put_sw(out, out_max, PIV_SW_WRONG_DATA);
 
@@ -637,8 +669,8 @@ static int change_reference(uint8_t p1, uint8_t p2,
     if (!data || lc != 2 * PIV_PIN_BLOCK_LEN)
         return put_sw(out, out_max, PIV_SW_WRONG_LENGTH);
 
-    size_t old_len = pin_block_len(data);
-    size_t new_len = pin_block_len(data + PIV_PIN_BLOCK_LEN);
+    size_t old_len = pin_block_len(data, PIV_PIN_BLOCK_LEN);
+    size_t new_len = pin_block_len(data + PIV_PIN_BLOCK_LEN, PIV_PIN_BLOCK_LEN);
     if (old_len == 0 || new_len == 0)
         return put_sw(out, out_max, PIV_SW_WRONG_DATA);
 
@@ -729,7 +761,30 @@ int piv_handle_apdu(const uint8_t *cmd, size_t cmd_len, uint8_t *out, size_t out
         le = 0;
     } else if (cmd_len == 5) {
         le = cmd[4] == 0 ? 256 : cmd[4];
+    } else if (cmd[4] == 0 && cmd_len >= 7) {
+        /* Extended length APDU (ISO 7816-4) */
+        lc = ((size_t)cmd[5] << 8) | cmd[6];
+        if (lc == 0) {
+            /* Case 2E: Le only */
+            if (cmd_len == 7) {
+                le = 65536;
+            } else {
+                return put_sw(out, out_max, PIV_SW_WRONG_LENGTH);
+            }
+        } else {
+            /* Case 3E / 4E */
+            if (cmd_len < 7 + lc)
+                return put_sw(out, out_max, PIV_SW_WRONG_LENGTH);
+            data = cmd + 7;
+            if (cmd_len == 7 + lc)
+                le = 65536;
+            else if (cmd_len == 7 + lc + 2)
+                le = ((size_t)cmd[7 + lc] << 8) | cmd[7 + lc + 1];
+            else
+                return put_sw(out, out_max, PIV_SW_WRONG_LENGTH);
+        }
     } else {
+        /* Short APDU (ISO 7816-4) */
         lc = cmd[4];
         if (lc == 0 || cmd_len < 5 + lc)
             return put_sw(out, out_max, PIV_SW_WRONG_LENGTH);

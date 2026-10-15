@@ -60,9 +60,10 @@ void device_set_status(uint32_t status);
  * task; the presence loop only asks the HAL to send, and knows no transport.
  */
 typedef enum {
-    FIDO_TRANSPORT_NONE = 0,
-    FIDO_TRANSPORT_USB  = 1,
-    FIDO_TRANSPORT_BLE  = 2,
+    FIDO_TRANSPORT_NONE       = 0,
+    FIDO_TRANSPORT_USB        = 1,
+    FIDO_TRANSPORT_BLE        = 2,
+    FIDO_TRANSPORT_DAEMON_BLE = 3,
 } fido_transport_t;
 
 /** Set by the producer before the FIDO task dispatches the request. */
@@ -91,6 +92,10 @@ void device_clear_pairing_passkey(void);
  * CMD_CANCEL is handled inline and always returns 1.
  */
 int fido_ble_submit_request(uint8_t cmd, const uint8_t *msg, uint16_t len);
+
+/** Connection state query and peer disconnect cleanup for FIDO BLE transport. */
+int ble_fido_is_connected(void);
+void fido_ble_on_disconnect(void);
 
 /** After full CTAPHID writeback. allow_success_ui: only for MakeCredential/GetAssertion. */
 void device_ctap_finished(uint8_t ctap_status, int allow_success_ui);

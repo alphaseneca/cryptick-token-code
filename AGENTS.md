@@ -297,9 +297,10 @@ Work these in order unless the user prioritizes otherwise:
 | `core/cryptick_log.cpp` | Unified CDC log sink (mutex-guarded) |
 | `core/totp.*` | TOTP + strict base32 decode |
 | `core/fido2/*` | Vendored Solo CTAP stack + `hal_esp32.cpp` |
-| `core/ble_fido/*` | FIDO BLE transport: framing (host-testable) + NimBLE GATT |
-| `core/piv/*` | PIV applet (SP 800-73-4) + ESP32 hooks |
-| `drivers/ccid_proto.*` | CCID bulk protocol; host-tested, no USB interface yet |
+| `core/ble_fido/*` | FIDO BLE transport: framing (host-testable) + NimBLE GATT + Daemon GATT |
+| `core/piv/*` | PIV applet (SP 800-73-4), LittleFS cert store, extended APDU support + ESP32 hooks |
+| `drivers/usb_ccid.*` | CCID USB interface: synchronous non-blocking execution, T=1, macOS CryptoTokenKit |
+| `drivers/ccid_proto.*` | CCID bulk protocol; host-tested |
 | `test/test_*/test_main.cpp` | L1 Unity suites |
 | `tests/{host,device,support}` | L0/L2 pytest and shared transport helpers |
 | `scripts/syntax_check_scaffolds.sh` | Compile-checks sources outside `build_src_filter` |

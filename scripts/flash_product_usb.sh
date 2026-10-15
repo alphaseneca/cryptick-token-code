@@ -33,7 +33,10 @@ if command -v lsof >/dev/null 2>&1; then
   sleep 0.5
 fi
 
-ESPTOOL="$(find "${HOME}/.platformio/packages" -name esptool.py 2>/dev/null | head -1)"
+ESPTOOL="$(find "${HOME}/.platformio/packages" -path "*/tool-esptoolpy/esptool.py" 2>/dev/null | head -1)"
+if [[ -z "${ESPTOOL}" ]]; then
+  ESPTOOL="$(find "${HOME}/.platformio/packages" -name esptool.py 2>/dev/null | head -1)"
+fi
 BOOT_APP0="${HOME}/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin"
 BUILD=".pio/build/esp32-s3-n16r8-install"
 
