@@ -1,4 +1,322 @@
-# Agent work notes — branch `agent/ble-power-piv-ui`
+# Agent work notes — branch `feature/uv-token-credential-management`
+
+Three pieces of work, done in priority order: (1) a critical on-device
+authentication gap found and fixed across `src/systems/nav_system.cpp` and
+`src/host/serial_comm.cpp`, (2) an investigation (no firmware fix needed —
+or possible, from this repo) into a reported BLE disconnect during OATH
+`CALCULATE`, (3) the originally-assigned task: CTAP2.1
+`getPinUvAuthTokenUsingUvWithPermissions`, so credential management can be
+gated by the fingerprint sensor instead of a PIN. No physical device was
+available — verification is `pio run` across all four firmware
+environments (`esp32-s3-n16r8`, `-ship`, `-jtag`, `-install`) plus
+`pio test -e test_nav --without-uploading --without-testing`, all
+succeeding, and careful manual tracing against the existing code and the
+CTAP2.1 spec text. Everything below marked "needs hardware" is unverified
+until someone runs it on a unit.
+
+---
+
+## 0. Critical: on-device menu had zero authentication on three destructive actions
+
+Found while sweeping `src/systems/nav_system.cpp`'s state machine (asked for
+explicitly, ahead of the UV-token task, once the gap was reported):
+
+- **`start_enroll()`** (Settings → Enroll finger): gated on `fp_system_ready()`
+  (sensor present) only — nothing checked *who* was pressing the button.
+  Enrolling only ever appends a template, never replaces one, so this was
+  the easy way in even on a device that already had an owner's fingerprint
+  and an active Clear-FP gate: just add a second one.
+- **`start_clear()`** (Settings → Clear FP → confirm → wipes every
+  template): gated on `auth_system_needs_auth()`, which is satisfied by an
+  *existing session* (`auth_system_is_authenticated()`) — not a fresh
+  touch. An owner who viewed a TOTP code a minute ago and walked away left
+  the device one CENTER-press-to-prompt, one fingerprint-confirm away from
+  a totally open wipe for anyone who picked it up inside the inactivity
+  window. The double-press "confirm" screen is a fat-finger safety net, not
+  authentication.
+- **`BLE_ACT_UNPAIR`** (BLE menu → Unpair/Wipe Bonds): a single CENTER
+  press called `ble_fido_clear_all_bonds()` with no gate of any kind —
+  the least-protected of the three.
+
+**Fix:** all three now call a new `require_fresh_touch(PendingAction)` in
+`nav_system.cpp`, which always starts a brand-new `CMD_FP_MATCH_AUTH`
+match window (`fp_system`'s `_lastMatchPoll` reset to 0 — no cached/stale
+match can satisfy it) and only proceeds once `FP_MATCHED` arrives, never on
+an existing `auth_system` session. `PendingAction` (`PENDING_TOTP` /
+`_CLEAR_CONFIRM` / `_ENROLL` / `_BLE_UNPAIR`) replaces the old single
+`_pending_clear` bool so the one `UI_AUTH_PROMPT` screen can resume any of
+four different actions after the touch. A failed match or a `KEY_LEFT`
+abort clears `_pendingAction` so a later, unrelated match can't be
+misattributed. **Bootstrap case** (`fp_system_template_count() == 0`) stays
+fully open for all three — there is nothing yet to prove ownership of, so
+first-time setup still works unattended.
+
+This mirrors `enter_totp()`'s own pre-existing fresh-touch mechanism rather
+than reusing `ctap_user_presence_test`/`oath_ensure_uv` directly:
+`nav_system_on_event()` runs synchronously on the Arduino main loop and
+cannot block on a multi-second finger wait without stalling display/input/
+BLE servicing for everyone else, so it uses the same asynchronous "ask,
+then resume on the next `FP_MATCHED` event" pattern `enter_totp()` already
+established, generalized to four callers instead of one. The underlying
+sensor access is still the same single `fp_system` singleton every other
+UV path in this firmware shares.
+
+**Bonus, same sweep:** `src/host/serial_comm.cpp`'s CDC `UNPAIR` /
+`BLE_CLEAR_BONDS` / `CLEAR_BONDS` command — a *different* front door to the
+exact same `ble_fido_clear_all_bonds()` action — had the same zero-gate
+problem, and unlike `OATH PUT`/`TOTP_DEL` two commands above it in the same
+file, called it directly. Fixed using that file's own established pattern:
+`oath_ensure_uv("Unpair")` before clearing, if/else (not an early `return`,
+since this branch is inline in `processSerialCommands` rather than its own
+helper function — a bare `return` would skip the `"cryptick> "` reprompt
+every other command path falls through to).
+
+**Found, not fixed, with reason:**
+- No other destructive/trust-changing action exists in `nav_system.cpp`'s
+  state machine — grepped the whole file and `src/systems/` for
+  factory-reset/wipe/erase patterns; `CMD_FP_CLEAR_ALL` and
+  `ble_fido_clear_all_bonds()` (now both gated, the latter in two places)
+  are the only two sinks. There is no PIV-reset or FIDO-reset reachable
+  from this on-device menu at all (`CTAP_RESET` is a host-driven CTAPHID
+  command, already gated by its own `ctap2_user_presence_test(0)`).
+- `nav_system`'s `CMD_FP_MATCH_AUTH` ceremony and the HAL's
+  `ctap_user_presence_test_ex()`/`device_presence_fp_*` ceremony
+  (`core/fido2/hal_esp32.cpp`) are two *different* mechanisms driving the
+  same single `fp_system` sensor singleton, and nothing serializes them
+  against each other the way `_up_mutex` serializes concurrent
+  `ctap_user_presence_test_ex()` callers. In principle a CDC `OATH PUT`
+  self-service wait (blocks the main loop, polls the sensor directly) could
+  overlap a `UI_AUTH_PROMPT` ceremony the user had just triggered from the
+  menu on a *previous* loop iteration, and a touch meant for one could be
+  misattributed to the other. This is pre-existing (the exact same
+  structure `enter_totp()` already had), not introduced by this change, and
+  genuinely serializing two independently-evolved async/UI state machines
+  without hardware to test the result felt riskier than leaving a
+  already-present, narrow, hard-to-trigger race alone. Flagging it here for
+  whoever owns `fp_system`/`nav_system` next.
+- While adding regression tests for the fix (`test/test_nav/test_main.cpp`),
+  found that the pre-existing `test_menu_to_settings` and
+  `test_settings_enroll_flow_via_bus` tests navigate the top menu with the
+  wrong number of key presses (one `KEY_DOWN` from `MENU_TOTP` lands on
+  `MENU_PIV`, index 1, not `MENU_SETTINGS`, index 3 — confirmed directly
+  against the `enum MenuItem` ordering and the `UI_MENU` key-dispatch code).
+  They would fail if actually executed. This was never caught because, per
+  this file's own prior note, `test_nav` has only ever been compiled, never
+  run (no hardware). Not fixed — out of scope for this change, and I did
+  not want to touch pre-existing test assertions I wasn't asked to audit.
+  My own four new test helpers (`goto_settings()`, `goto_ble_menu()`) use
+  the verified-correct navigation.
+
+**Needs hardware to confirm:** a real fresh-touch wait on `UI_AUTH_PROMPT`
+feels/behaves the same for these three new callers as it already does for
+TOTP unlock; whether the nav/HAL dual-mechanism race above is actually
+reachable in practice.
+
+## 0a. Investigation: does the OATH `CALCULATE` UV wait cause a real BLE disconnect?
+
+Looked for a firmware-side cause first. `up_test_locked()`
+(`core/fido2/hal_esp32.cpp`) is the function actually running during this
+wait when `CTAPHID_CRYPTICK_OATH`'s `CALCULATE` reaches the token over BLE
+(dispatched on the core-0 FIDO task, so it takes the *not* self-service
+branch): it sends a real `CMD_KEEPALIVE` (`fido_send_keepalive` →
+`ble_fido_send_keepalive`/`ble_daemon_send_keepalive`) every
+`CRYPTICK_FIDO_KEEPALIVE_MS` (100 ms), `vTaskDelay(10ms)`-yielding every
+loop iteration — no blocking call runs in this specific branch. The
+product's own BLE connection-parameter tuning (already merged to `main`)
+sets the supervision timeout to `CONN_SUPERVISION_TIMEOUT_UNITS = 400`
+(4000 ms, `core/ble_fido/ble_gatt_esp32.cpp`). A 100 ms keepalive cadence
+against a 4000 ms supervision timeout is a ~40x margin — **the firmware's
+own BLE radio tuning does not look, from source, like the cause.**
+
+The actual mechanism, found by reading the sibling `cryptick-token-daemon`
+repo (checked out alongside this one at
+`/Users/aurelius/Projects/cryptick-token-daemon`, read for context only —
+no changes made there, it's a different team's repo):
+`crates/daemon/src/session.rs`'s `Session::transact()` enforces an
+**absolute deadline from entry that keepalives explicitly do not extend**
+(its own doc comment: *"a device that keeps saying 'still working' must not
+be able to hold a transaction open indefinitely"*). On expiry it sends
+`CANCEL` to the device and returns `DaemonError::Timeout` →
+`ErrorCode::Timeout` on the IPC wire (`crates/ipc/src/lib.rs`) — a value
+distinct from `ErrorCode::NotConnected`, so the daemon itself does not
+conflate "timed out" with "disconnected." For the `ctap.request` IPC
+message this whole thing hangs off, `timeout_ms` is a **mandatory,
+client-supplied field with no server-side default**
+(`crates/daemon/src/server.rs`) — i.e. the browser extension decides it,
+and I did not find the extension's own source anywhere in reach to read
+what it actually sends. Separately, `crates/token-manager/src/oath.rs`
+(a different, APDU/YKOATH-style OATH client in the same daemon, unclear
+whether it's the one actually wired to the Authenticator tab) hardcodes its
+own `OATH_UV_TIMEOUT = 30s` for the CALCULATE transceive — comfortably
+above the firmware's own 25s `CRYPTICK_OATH_UV_TIMEOUT_MS` / 29s
+`CRYPTICK_FIDO_UP_TIMEOUT_MS`, so *that* specific pairing looks safe on its
+face.
+
+**Conclusion:** most likely a host-side (daemon and/or extension) timeout
+racing real-world finger-placement time against a deadline that firmware
+keepalives cannot extend by design — not a firmware BLE tuning problem.
+Whether the extension's UI then renders a `Timeout` indistinguishable from
+a real disconnect is an extension-side question I could not answer: that
+repo was not in reach from here. **What would confirm this:** either read
+the extension's own source for the actual `timeout_ms` it sends and how it
+maps `error{code:"TIMEOUT"}` in its UI, or capture a live repro's IPC
+traffic (or a BLE sniffer trace) around the moment the UI shows
+"disconnected" — specifically whether it was preceded by
+`ctap.keepalive{reason:"up"}` / `error{code:"TIMEOUT"}` (host gave up) or
+an actual `device.range{inRange:false}` (real link loss). No firmware
+change is proposed here; I did not find one to make.
+
+## 0b. CTAP2.1 `getPinUvAuthTokenUsingUvWithPermissions` — the originally-assigned task
+
+The real problem, confirmed in source before touching anything: FIDO2
+sign-in is fingerprint-gated (`core/fido2/ctap.c`, `ctap_get_info()`'s own
+comment: *"UV = fingerprint (options.uv=true), not clientPin"*), but
+`ctap_cred_mgmt_pinauth()` requires a valid `pinAuth`, checked by
+`verify_pin_auth_ex()` against the global `PIN_TOKEN` — and the *only*
+thing that ever populated `PIN_TOKEN` was `CP_cmdGetPinToken`, which
+requires a PIN hash the product has no PIN-entry UI to set in the first
+place. There was no fingerprint path to credential management at all.
+
+### Exact wire format (for the daemon/extension tasks to build against)
+
+**Subcommand:** `CP_cmdGetPinUvAuthTokenUsingUvWithPermissions = 0x06`
+(`CP_subCommand`, request key `0x02`). Confirmed against the CTAP2.1 spec
+text itself, not assumed from the numbering — verified the subcommand
+table (`0x01 getRetries, 0x02 getKeyAgreement, 0x03 setPin, 0x04
+changePin, 0x05 getPinToken, 0x06 getPinUvAuthTokenUsingUvWithPermissions,
+0x07 getUVRetries, 0x09 getPinUvAuthTokenUsingPinWithPermissions`) against
+two independent published sources (the FIDO Alliance CTAP 2.1-ps-20210615
+spec and the WebauthnWorks CTAP2.1-Migration-Guide) plus cross-checking
+third-party implementations, because the first fetch of the FIDO Alliance
+page itself came back internally inconsistent (its own summarizer
+duplicated key 0x02/0x03 across two different subcommand names) and was
+*not* trusted on its own. `0x06` being this file's natural next integer
+and the spec's real assigned value are confirmed independently coincident,
+not assumed.
+
+**Request (CBOR map, same `authenticatorClientPIN` command 0x06 as every
+other ClientPIN subcommand):**
+
+| Key | Name | Type | Required |
+| --- | --- | --- | --- |
+| 0x01 | pinUvAuthProtocol | uint | yes, must be `1` (this device implements only PIN/UV Auth Protocol One) |
+| 0x02 | subCommand | uint | yes, `0x06` |
+| 0x03 | keyAgreement | COSE key | yes — used to derive the shared secret the response is wrapped under |
+| 0x09 | permissions | uint (bitmask) | yes, must be non-zero |
+| 0x0A | rpId | text string | no — parsed and stored (`struct rpId`, reusing the existing `parse_rp_id()`) but not currently enforced; nothing downstream scopes `PIN_TOKEN` by rpId yet, same as before this change |
+
+Permission bits (CTAP2.1 §6.4, verified against the same two sources, not
+a half-remembered layout): `mc=0x01, ga=0x02, cm=0x04, be=0x08, lbw=0x10,
+acfg=0x20`. **`cm` (credential management) is bit 2, value `0x04`** — the
+one value the task asked me to specifically double-check, and it is not
+`0x02` or `0x08` as a slightly-off guess might produce. This device does
+not currently enforce *which* bits were granted against what's actually
+attempted later (nothing downstream checks permissions at all — see
+`ctap_cred_mgmt_pinauth()`/`verify_pin_auth_ex()`, both untouched) — a
+request for `cm` alone is what credential management needs and is what
+this was built for; requesting other bits is accepted, not rejected, since
+there is no enforcement point yet to reject them meaningfully against.
+
+**Response (identical CBOR shape to `CP_cmdGetPinToken`'s, by design, so
+nothing downstream needs to special-case which subcommand produced it):**
+
+| Key | Name | Type |
+| --- | --- | --- |
+| 0x02 | pinUvAuthToken (`RESP_pinToken`) | byte string, `PIN_TOKEN_SIZE` bytes, AES-256-CBC-encrypted under the shared secret from `keyAgreement`, zero IV — identical wrapping to `CP_cmdGetPinToken`'s `ctap_add_pin_if_verified()` |
+
+**Errors:** `CTAP2_ERR_MISSING_PARAMETER` (0x14) if `keyAgreement` or
+`permissions` is absent; `CTAP1_ERR_INVALID_PARAMETER` (0x02) if
+`permissions == 0`; on a failed/timed-out fingerprint match,
+`CTAP2_ERR_ACTION_TIMEOUT` (0x3A) or `CTAP2_ERR_KEEPALIVE_CANCEL` (0x2D) —
+this file's own existing `ctap2_user_presence_test()` helper (already used
+by `CTAP_RESET`) does this conversion; no new error convention invented.
+
+**GetInfo change:** `pinUvAuthProtocols` (`RESP_pinProtocols`, key `0x6`)
+was previously only advertised when a PIN was set — meaning a factory-
+fresh device (no PIN) advertised no protocol number at all, so a platform
+had nothing telling it which protocol to negotiate `keyAgreement`/encrypt
+the response under before it could even attempt this subcommand. Now
+advertised whenever a pinUvAuthToken is obtainable *at all* — by PIN or by
+UV — matching how `options.uv` is already unconditionally `true` on this
+product. Always `[1]` (Protocol One only). `options.credMgmt` was already
+unconditionally `true` before this change — it is now actually true
+rather than aspirational, since there is finally a way to obtain a usable
+token for it.
+
+### The fingerprint gate itself
+
+Reuses `ctap2_user_presence_test(allow_uv_cache)` — a `static` helper
+**already in `ctap.c`** (used today by `CTAP_RESET`), which itself wraps
+`ctap_user_presence_test_ex()`, the exact mechanism named in the brief
+(`oath_ensure_uv → ctap_user_presence_test`, same family). Called as
+`ctap2_user_presence_test(0)` — **`allow_uv_cache` is deliberately `0`,
+not `1`.** `_uv_cache_until_ms` (armed by `ctap_uv_cache_arm_gettouch()`)
+is a one-shot credit that lets a prior Chrome `GetTouch` satisfy exactly
+one later `MakeCredential`, and nothing else is supposed to opt into
+consuming it (`device.h`'s own doc comment: *"GetAssertion / U2F_AUTHENTICATE
+must pass 0"*). Passing `1` here would let a touch meant for an unrelated
+`MakeCredential` moments earlier silently authorize listing or deleting
+resident credentials — exactly the double-count hazard the brief warned
+about. Passing `0` sidesteps it entirely: this subcommand always demands a
+finger placed *after* the request arrives, full stop.
+
+On success: `ctap_make_uv_pin_token()` (new, `ctap.c`, declared in `ctap.h`
+next to its sibling `ctap_add_pin_if_verified()`) generates a **brand-new**
+`PIN_TOKEN` via `ctap_generate_rng()` (same RNG-failure → `device_reboot()`
+convention as `ctap_init()`/`ctap_reset()`), then wraps it under the ECDH
+shared secret exactly the way `ctap_add_pin_if_verified()`'s tail already
+does (same `crypto_ecc256_shared_secret` → SHA-256 → `crypto_aes256_init`
+→ reset IV → encrypt sequence, copied, not reinvented). Regenerating
+`PIN_TOKEN` per UV grant (rather than re-wrapping whatever the PIN path
+last issued, which is what `CP_cmdGetPinToken` itself does today) means a
+fresh UV grant invalidates whatever token a PIN-based grant last issued —
+correct for this single-session, single-`PIN_TOKEN` authenticator, and
+transparent to both consumers since `verify_pin_auth_ex()` and
+`ctap_cred_mgmt_pinauth()` only ever check whatever is *currently* in
+`PIN_TOKEN` — confirmed **zero changes** needed to either, as required.
+
+Not gated behind `ctap_device_locked()`/`ctap_device_boot_locked()`
+(the PIN-retry lockout counters) — deliberately: those track *PIN*-hash
+mismatches, a completely different retry budget than the fingerprint
+sensor's own. A PIN lockout must not block UV, and this codebase's
+existing dispatch switch already only applies that check to
+`SetPin`/`ChangePin`/`GetPinToken`, so leaving the new subcommand out of
+it is consistent with, not a deviation from, the existing pattern.
+
+### What's verified vs. inferred
+
+Verified directly against spec text (cross-checked, not memory-only): the
+subcommand number, the four request parameter keys and their types, the
+six permission bit values. Verified directly against this codebase: every
+reused helper/pattern cited above actually does what the comment next to
+my call site says it does (read, not assumed). Inferred/not spec-checked:
+exact platform error-recovery behavior on `CTAP1_ERR_INVALID_PARAMETER`
+for `permissions == 0` (plausible per spec intent, not cross-referenced
+against a second source the way the subcommand table was).
+
+### Build verification
+
+`pio run` for `esp32-s3-n16r8`, `-ship`, `-jtag`, `-install` — all succeed,
+no new warnings. `core/fido2/ctap.c`/`.h`/`ctap_parse.c` are not part of
+`test_nav`'s build, and this repo has no native/host-compiled harness for
+`ctap_client_pin()`'s CBOR dispatch the way `tests/host/test_piv_apdu.py`
+has for `piv.c` (that harness is specific to `piv.c`/`ccid_proto.c`) — a
+`pytest tests/host` run was not attempted this session (no `pytest`
+installed in this environment), but nothing in `core/piv` or
+`drivers/ccid_proto.c` was touched, so no regression risk there.
+
+### Needs real hardware to confirm
+
+Everything above is static review and spec-text cross-referencing, not a
+flashed board: a real fingerprint touch actually producing a `PIN_TOKEN`
+that a real daemon can decrypt and then successfully HMAC-verify through
+`ctap_cred_mgmt_pinauth()` end-to-end has not been exercised. In
+particular: that a real platform's ECDH/AES wrapping round-trips
+correctly against `ctap_make_uv_pin_token()`'s output, and that the
+fingerprint sensor's actual retry/match timing behaves sanely under this
+new call path the same way it already does under `CTAP_RESET`'s.
+
+---
 
 Scope: rotary encoder wiring, BLE power/advertising tuning, BLE/PIV transport
 encryption, PIV correctness, OLED UI overhaul. No physical device was
