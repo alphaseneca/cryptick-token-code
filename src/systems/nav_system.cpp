@@ -533,6 +533,19 @@ void nav_system_on_event(const BusEvent &e)
     InputKey key = (InputKey)e.kind;
 
     /*
+     * SW2 rotary encoder (GPIO40/41 — see board_config.h): one tick feeds
+     * exactly the same scroll semantics as a 5-way UP/DOWN press, so every
+     * list in the firmware (top menu, BLE menu, Settings, TOTP accounts,
+     * Home quick cards) becomes encoder-scrollable for free, with no
+     * per-state duplication and no change to what the 5-way does on its
+     * own. The encoder's integral pushbutton is wired to GND on this PCB
+     * rev, not to a GPIO (see input_system.cpp), so CENTER stays the only
+     * confirm/select action — there is no separate "encoder click" to wire.
+     */
+    if (key == KEY_ENCODER_CW) key = KEY_DOWN;
+    else if (key == KEY_ENCODER_CCW) key = KEY_UP;
+
+    /*
      * Asleep: only CENTER wakes, and that press is consumed by the wake itself
      * so the user never lands somewhere unexpected from a pocket press. Other
      * keys are swallowed without even resetting the idle clock.

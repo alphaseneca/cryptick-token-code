@@ -40,8 +40,26 @@
 #define LEFT_BUTTON_PIN 6
 #define BUTTON_PIN 15 /* CENTER */
 
-#define ENCODER_CW_PIN -1
-#define ENCODER_CCW_PIN -1
+/*
+ * SW2 (silkscreen), ALPS EC05E1220401 quadrature rotary encoder, sits next to
+ * the fingerprint sensor opening near the logo edge. Verified in the KiCad
+ * source (not on a flashed board — no hardware was available to this change):
+ * cryptick-token-pcb.kicad_pcb footprint "easyeda2kicad:SW-SMD_EC05E1220401"
+ * ref SW2 — pad "A" (channel 1) is net `/CW`, pad "B" (channel 2) is net
+ * `/CCW`. Both nets carry a real routed F.Cu/B.Cu track + via (not just a
+ * schematic label) to ESP32-S3-WROOM-1 module pads 33 (`IO40_33`) and 34
+ * (`IO41_34`) respectively — i.e. GPIO40 / GPIO41 — each pulled up to +3V3
+ * through its own 0603 resistor. Earlier firmware shipped this as -1/-1;
+ * that was stale against this PCB revision, not a hardware absence.
+ *
+ * The encoder's integral pushbutton (pads 4/5, common C) is wired straight to
+ * GND on this revision, not to any GPIO — so there is no separate "encoder
+ * click" signal available in firmware. Only rotation is readable. Confirm
+ * GPIO40/41 on a flashed unit before relying on this for production;
+ * schematic/PCB review is not the same as a bring-up log.
+ */
+#define ENCODER_CW_PIN 40
+#define ENCODER_CCW_PIN 41
 
 #define STAT1_PIN 38
 #define STAT2_PIN 39

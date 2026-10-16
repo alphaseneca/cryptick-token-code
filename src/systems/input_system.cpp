@@ -44,7 +44,44 @@ static Btn _btn[] = {
 };
 static constexpr int N = (int)(sizeof(_btn) / sizeof(_btn[0]));
 
-/* Lock-free press queue from ISR → main (key index 0..N-1) */
+/*
+ * SW2 quadrature rotary encoder (GPIO40=CW/A, GPIO41=CCW/B — see
+ * board_config.h for how that was verified against the PCB). Queue indices
+ * N and N+1 are reserved for its two tick directions, past the 5-way slots.
+ */
+static constexpr int IDX_ENC_CW = N;
+static constexpr int IDX_ENC_CCW = N + 1;
+struct EncKeyInfo { InputKey key; const char *name; int pin; };
+static const EncKeyInfo _enc_info[2] = {
+    { KEY_ENCODER_CW, "ENC_CW", ENCODER_CW_PIN },
+    { KEY_ENCODER_CCW, "ENC_CCW", ENCODER_CCW_PIN },
+};
+static constexpr bool ENCODER_PRESENT = (ENCODER_CW_PIN >= 0) && (ENCODER_CCW_PIN >= 0);
+
+/*
+ * Gray-code quadrature table: index = (previous AB << 2) | current AB,
+ * value = +1 on a valid CW step, -1 on a valid CCW step, 0 on a repeat or an
+ * illegal (bounce/skipped-state) transition. Four valid steps make one
+ * mechanical detent on the EC05E1220401, so ticks accumulate in _enc_accum
+ * and only fire an event (and reset) once |_enc_accum| reaches 4 — this is
+ * what turns noisy quadrature edges into one event per physical click.
+ */
+static const int8_t ENC_QUAD_TABLE[16] = {
+    0, -1, +1, 0,
+   +1,  0,  0, -1,
+   -1,  0,  0, +1,
+    0, +1, -1, 0,
+};
+/* Debounced-settled AB state feeding the quadrature table (ISR-owned). */
+static uint8_t _enc_settled_ab = 0;
+static uint8_t _enc_raw_ab = 0;
+static uint8_t _enc_streak = 0;
+static int8_t _enc_accum = 0;
+/* Same sample-rate math as STABLE_NEED below, against ENCODER_DEBOUNCE_MS. */
+static constexpr uint8_t ENC_STABLE_NEED =
+    (uint8_t)((ENCODER_DEBOUNCE_MS + 1) / 2);
+
+/* Lock-free press queue from ISR → main (key index 0..N-1, or IDX_ENC_*) */
 static volatile uint8_t _press_q[16];
 static volatile uint8_t _press_head = 0;
 static volatile uint8_t _press_tail = 0;
@@ -93,10 +130,55 @@ static void IRAM_ATTR push_press(uint8_t idx)
 #endif
 }
 
+/*
+ * One quadrature sample. Called from the same 2ms cadence as the button
+ * scan so a single timer owns all physical-input timing. Debounces into
+ * _enc_settled_ab, feeds genuinely-new settled states through the Gray-code
+ * table, and queues one tick per 4 valid steps (one detent).
+ *
+ * CW/CCW direction here follows the PCB's own net names (`/CW`, `/CCW`
+ * ending at GPIO40/GPIO41 — see board_config.h); it has not been confirmed
+ * against a spinning physical knob. If a flashed unit scrolls backwards,
+ * swap ENCODER_CW_PIN and ENCODER_CCW_PIN in board_config.h — the decode
+ * logic itself does not need to change.
+ */
+static void IRAM_ATTR encoder_sample(void)
+{
+    if (!ENCODER_PRESENT)
+        return;
+    uint8_t a = raw_low(ENCODER_CW_PIN) ? 0 : 1;
+    uint8_t b = raw_low(ENCODER_CCW_PIN) ? 0 : 1;
+    uint8_t ab = (uint8_t)((a << 1) | b);
+
+    if (ab == _enc_raw_ab) {
+        if (_enc_streak < 255)
+            _enc_streak++;
+    } else {
+        _enc_raw_ab = ab;
+        _enc_streak = 1;
+    }
+
+    if (_enc_streak >= ENC_STABLE_NEED && ab != _enc_settled_ab) {
+        int8_t step = ENC_QUAD_TABLE[(uint8_t)((_enc_settled_ab << 2) | ab)];
+        _enc_settled_ab = ab;
+        if (step != 0) {
+            _enc_accum = (int8_t)(_enc_accum + step);
+            if (_enc_accum >= 4) {
+                _enc_accum = 0;
+                push_press((uint8_t)IDX_ENC_CW);
+            } else if (_enc_accum <= -4) {
+                _enc_accum = 0;
+                push_press((uint8_t)IDX_ENC_CCW);
+            }
+        }
+    }
+}
+
 #if defined(ESP32)
 static void IRAM_ATTR button_timer_cb(void *arg)
 {
     (void)arg;
+    encoder_sample();
     for (int i = 0; i < N; i++) {
         if (_btn[i].pin < 0)
             continue;
@@ -123,17 +205,30 @@ static void IRAM_ATTR button_timer_cb(void *arg)
 
 static void emit_key(int idx)
 {
-    if (idx < 0 || idx >= N)
-        return;
-    BusEvent e{};
-    e.type = EVT_INPUT;
-    e.kind = (uint8_t)_btn[idx].key;
-    e.a = 1;
-    if (!bus_publish(e)) {
-        CLOG_D("IN", "bus full: %s", _btn[idx].name);
+    InputKey key;
+    const char *name;
+    int pin;
+    if (idx >= 0 && idx < N) {
+        key = _btn[idx].key;
+        name = _btn[idx].name;
+        pin = _btn[idx].pin;
+    } else if (idx == IDX_ENC_CW || idx == IDX_ENC_CCW) {
+        const EncKeyInfo &info = _enc_info[idx - IDX_ENC_CW];
+        key = info.key;
+        name = info.name;
+        pin = info.pin;
+    } else {
         return;
     }
-    CLOG_D("IN", "%s (GPIO%d)", _btn[idx].name, _btn[idx].pin);
+    BusEvent e{};
+    e.type = EVT_INPUT;
+    e.kind = (uint8_t)key;
+    e.a = 1;
+    if (!bus_publish(e)) {
+        CLOG_D("IN", "bus full: %s", name);
+        return;
+    }
+    CLOG_D("IN", "%s (GPIO%d)", name, pin);
 }
 
 void input_system_init(void)
@@ -152,6 +247,21 @@ void input_system_init(void)
         _btn[i].armed = !low; /* if already pressed at boot, wait for release */
         CLOG_D("IN", "%-6s GPIO%-2d idle=%s",
                            _btn[i].name, _btn[i].pin, low ? "LOW?" : "HIGH");
+    }
+
+    if (ENCODER_PRESENT) {
+        setup_pin(ENCODER_CW_PIN);
+        setup_pin(ENCODER_CCW_PIN);
+        delay(1);
+        _enc_raw_ab = (uint8_t)(((raw_low(ENCODER_CW_PIN) ? 0 : 1) << 1) |
+                                 (raw_low(ENCODER_CCW_PIN) ? 0 : 1));
+        _enc_settled_ab = _enc_raw_ab;
+        _enc_streak = 0;
+        _enc_accum = 0;
+        CLOG_I("IN", "encoder CW=GPIO%d CCW=GPIO%d (quadrature, %ums debounce)",
+               ENCODER_CW_PIN, ENCODER_CCW_PIN, (unsigned)ENCODER_DEBOUNCE_MS);
+    } else {
+        CLOG_I("IN", "encoder not wired on this board rev (CW/CCW pin -1)");
     }
 
 #if defined(ESP32)
@@ -200,6 +310,7 @@ void input_system_tick(unsigned long nowMs)
         return;
 #endif
     /* Fallback if timer failed: still sample once per main-loop call */
+    encoder_sample();
     for (int i = 0; i < N; i++) {
         if (_btn[i].pin < 0)
             continue;

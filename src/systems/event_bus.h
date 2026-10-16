@@ -18,7 +18,15 @@ enum InputKey : uint8_t {
     KEY_LEFT,
     KEY_RIGHT,
     KEY_UP,
-    KEY_DOWN
+    KEY_DOWN,
+    /*
+     * SW2 quadrature rotary encoder (GPIO40/41, see board_config.h). Raised
+     * one per detent, not per quadrature edge. nav_system treats these as
+     * KEY_DOWN/KEY_UP for scrolling, but input_system reports the distinct
+     * source so logs can tell a rotation tick from a 5-way press.
+     */
+    KEY_ENCODER_CW,
+    KEY_ENCODER_CCW
 };
 
 enum ChargeState : uint8_t {
