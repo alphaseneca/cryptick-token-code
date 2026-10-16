@@ -60,6 +60,107 @@ NimBLECharacteristic *g_status = nullptr;
 NimBLECharacteristic *g_control_point_len = nullptr;
 NimBLECharacteristic *g_revision = nullptr;
 static volatile bool g_connected = false;
+static char g_device_name[32] = CRYPTICK_BLE_DEVICE_NAME;
+
+/*
+ * Advertising interval tiers.
+ *
+ * Units are 0.625 ms per tick (the BLE advertising-interval field). The
+ * split follows the Bluetooth Core Specification Supplement, Part A
+ * §3.1.1 "recommended advertising intervals" — the same fast/slow pattern
+ * most battery-powered accessories use:
+ *
+ *   - Fast (30-60 ms): run for a bounded 60s window right after boot,
+ *     right after a disconnect, and on an explicit "Restart Adv" — the
+ *     moments a central is actually likely to be looking (the daemon
+ *     reconnecting, a fresh pairing attempt).
+ *   - Slow / reduced-power (1000-2500 ms): what the radio drops to once a
+ *     fast window elapses with nobody connecting. That is roughly 1/40th
+ *     the duty cycle of the old fixed 20-40 ms interval this replaces —
+ *     a device sitting unpaired on a desk for hours was keying the radio
+ *     25-50 times a second indefinitely for no reason. 0xFFFD still goes
+ *     out on every advertising event in both tiers; only the cadence
+ *     changes, so FIDO discoverability is unaffected, just less frequent
+ *     when nothing has shown interest in a while.
+ */
+constexpr uint16_t ADV_FAST_MIN_UNITS = 48;        // 30.00 ms
+constexpr uint16_t ADV_FAST_MAX_UNITS = 96;        // 60.00 ms
+constexpr uint32_t ADV_FAST_DURATION_MS = 60000;   // 60 s fast window
+constexpr uint16_t ADV_SLOW_MIN_UNITS = 1600;      // 1000.00 ms
+constexpr uint16_t ADV_SLOW_MAX_UNITS = 4000;      // 2500.00 ms
+
+/*
+ * Connection parameters requested once a central bonds. Units: 1.25 ms per
+ * interval tick, 10 ms per supervision-timeout tick (BLE connection params).
+ *
+ *   - 15-30 ms interval: snappy enough that a FIDO sign, a PIV APDU, or an
+ *     OATH calculate does not feel laggy over BLE compared to USB — well
+ *     inside the CRYPTICK_FIDO_KEEPALIVE_MS=100ms budget this firmware
+ *     already promises the host (board_config.h).
+ *   - Slave latency 4: lets the radio skip up to 4 connection events (up to
+ *     ~150 ms) when the link is idle and we have nothing queued. This does
+ *     not delay anything *we* initiate — a KEEPALIVE or a response is
+ *     always sent at the next scheduled event regardless of the latency
+ *     budget — it only lets the radio sleep between events that would
+ *     otherwise be wasted. This is the "stays alive without needlessly
+ *     aggressive duty cycling" half of the request, for the connected case.
+ *   - Supervision timeout 4000 ms: comfortably satisfies the mandatory
+ *     constraint timeout > (1 + latency) * interval_max * 2 (= 300 ms
+ *     here) with headroom for a brief radio interference event, without
+ *     leaving a truly dead link undetected for long.
+ *
+ * Central platforms are free to renegotiate this (iOS in particular tends
+ * to substitute its own preferred range); onConnParamsUpdate logs whatever
+ * was actually accepted so the real value is visible over the console.
+ */
+constexpr uint16_t CONN_MIN_INTERVAL_UNITS = 12;         // 15.00 ms
+constexpr uint16_t CONN_MAX_INTERVAL_UNITS = 24;         // 30.00 ms
+constexpr uint16_t CONN_LATENCY_EVENTS = 4;              // may skip up to 4 idle events
+constexpr uint16_t CONN_SUPERVISION_TIMEOUT_UNITS = 400; // 4000 ms
+
+/** GAP advertising interval only: name/UUID/appearance are set once, at
+ *  init, since NimBLEAdvertising::addServiceUUID() appends rather than
+ *  replacing — calling it again on every tier switch would grow the
+ *  advertisement payload without bound and eventually overflow it. */
+void configure_adv_interval(NimBLEAdvertising *adv, bool fast)
+{
+    adv->setMinInterval(fast ? ADV_FAST_MIN_UNITS : ADV_SLOW_MIN_UNITS);
+    adv->setMaxInterval(fast ? ADV_FAST_MAX_UNITS : ADV_SLOW_MAX_UNITS);
+}
+
+/** (Re)start advertising in the given tier. Safe to call while already
+ *  advertising (stops first) so tier transitions never race a start. */
+void begin_advertising(bool fast)
+{
+    NimBLEAdvertising *adv = NimBLEDevice::getAdvertising();
+    if (!adv)
+        return;
+    if (adv->isAdvertising())
+        NimBLEDevice::stopAdvertising();
+    configure_adv_interval(adv, fast);
+    NimBLEDevice::startAdvertising(fast ? ADV_FAST_DURATION_MS : 0);
+    CLOG_I("BLE", "advertising %s (%u-%ums) as \"%s\"",
+           fast ? "fast" : "slow",
+           (unsigned)((fast ? ADV_FAST_MIN_UNITS : ADV_SLOW_MIN_UNITS) * 5 / 8),
+           (unsigned)((fast ? ADV_FAST_MAX_UNITS : ADV_SLOW_MAX_UNITS) * 5 / 8),
+           g_device_name);
+}
+
+/*
+ * Fires only when a *bounded*-duration advertising window elapses with
+ * nobody connecting — begin_advertising() only ever bounds the fast tier,
+ * so reaching here always means the 60s fast window ran out unanswered.
+ * Dropping to the slow cadence here, rather than re-arming fast forever, is
+ * the actual fix for "battery consumption is like hell".
+ */
+void on_adv_complete(NimBLEAdvertising *adv)
+{
+    (void)adv;
+    if (g_connected)
+        return; /* a connection landed right as the timer fired; nothing to do */
+    CLOG_I("BLE", "fast advertising window elapsed, unanswered -> slow cadence");
+    begin_advertising(false);
+}
 
 /** fidoControlPointLength is read as 2 bytes, big-endian. */
 void publish_control_point_length()
@@ -123,6 +224,19 @@ class ServerCallbacks : public NimBLEServerCallbacks {
 #endif
         ble_daemon_set_mtu(BLE_ATT_MTU_DFLT);
         CLOG_I("BLE", "connected handle=%u", (unsigned)info.getConnHandle());
+
+        /* See CONN_MIN_INTERVAL_UNITS above for the numbers and why. */
+        server->updateConnParams(info.getConnHandle(), CONN_MIN_INTERVAL_UNITS,
+                                  CONN_MAX_INTERVAL_UNITS, CONN_LATENCY_EVENTS,
+                                  CONN_SUPERVISION_TIMEOUT_UNITS);
+    }
+
+    void onConnParamsUpdate(NimBLEConnInfo &info) override
+    {
+        CLOG_I("BLE", "conn params: interval=%ums latency=%u timeout=%ums",
+               (unsigned)(info.getConnInterval() * 125 / 100),
+               (unsigned)info.getConnLatency(),
+               (unsigned)info.getConnTimeout() * 10);
     }
 
     void onDisconnect(NimBLEServer *server, NimBLEConnInfo &info, int reason) override
@@ -137,8 +251,11 @@ class ServerCallbacks : public NimBLEServerCallbacks {
 #endif
         ble_daemon_reset();
         device_clear_pairing_passkey();
-        CLOG_I("BLE", "disconnected reason=%d, advertising again", reason);
-        NimBLEDevice::startAdvertising();
+        CLOG_I("BLE", "disconnected reason=%d, advertising again (fast)", reason);
+        /* A disconnect is the strongest signal reconnection is imminent (the
+         * daemon retrying, or the same host coming back) — re-arm the fast
+         * tier rather than whatever cadence was active before. */
+        begin_advertising(true);
     }
 
     void onMTUChange(uint16_t mtu, NimBLEConnInfo &info) override
@@ -194,8 +311,6 @@ extern "C" int ble_fido_is_connected(void)
 {
     return g_connected ? 1 : 0;
 }
-
-static char g_device_name[32] = CRYPTICK_BLE_DEVICE_NAME;
 
 #include <Preferences.h>
 
@@ -260,9 +375,26 @@ void ble_fido_gatt_init(void)
      *
      * Gating CCCD read behind authentication breaks GATT discovery on macOS,
      * Windows, and Linux, wedging the connection into an endless retry loop.
-     * CCCD write remains protected, and control point write enforces bonding.
+     *
+     * CCCD *write* (i.e. subscribing: enabling notify) is a different
+     * operation and the spec clause above does not cover it. This mask used
+     * to be plain READ|WRITE — which left every status/report CCCD on this
+     * device (fidoStatus, the daemon bridge status, pivStatus, and the BLE
+     * HID keyboard's input-report CCCD) subscribable by *any* connected
+     * peer, bonded or not: ble_gatts_clt_cfg_access() in NimBLE enforces
+     * exactly the bits passed here, at the ATT layer, before the write ever
+     * reaches a characteristic callback, so no per-characteristic onWrite
+     * check downstream could compensate for the missing bits. Concretely,
+     * an unbonded attacker's phone sitting nearby could subscribe to the HID
+     * input report and silently receive every OTP/PIV keystroke this device
+     * ever sends to the real host via the quick-action feature.
+     * WRITE_ENC | WRITE_AUTHEN closes that: subscribing now requires the
+     * same encrypted + MITM-authenticated link as the control point writes
+     * already require (NimBLEDevice::setSecurityAuth(true, true, true)
+     * above), while CCCD read stays open as the spec mandates.
      */
-    ble_gatts_set_clt_cfg_perm_flags(BLE_ATT_F_READ | BLE_ATT_F_WRITE);
+    ble_gatts_set_clt_cfg_perm_flags(BLE_ATT_F_READ | BLE_ATT_F_WRITE |
+                                      BLE_ATT_F_WRITE_ENC | BLE_ATT_F_WRITE_AUTHEN);
 
     g_server = NimBLEDevice::createServer();
     g_server->setCallbacks(&g_server_callbacks);
@@ -314,6 +446,23 @@ void ble_fido_gatt_init(void)
     publish_control_point_length();
 
     svc->start();
+
+    /*
+     * Static advertisement payload: set once, never repeated. (See
+     * configure_adv_interval() above for why addServiceUUID() in particular
+     * must not be called again on every tier switch.) The completion
+     * callback is what lets a bounded fast-tier window hand off to the
+     * slow tier on its own, with no main-loop polling needed to notice it.
+     */
+    NimBLEAdvertising *adv = NimBLEDevice::getAdvertising();
+    if (adv) {
+        adv->setAppearance(0x03C1); // HID_KEYBOARD
+        adv->addServiceUUID(NimBLEUUID((uint16_t)BLE_FIDO_SERVICE_UUID16));
+        adv->setName(g_device_name);
+        adv->enableScanResponse(true);
+        adv->setAdvertisingCompleteCallback(on_adv_complete);
+    }
+
     CLOG_I("BLE", "FIDO service 0xFFFD up (advertising deferred until all services ready)");
 }
 
@@ -322,17 +471,8 @@ void ble_fido_start_advertising(void)
     if (g_server) {
         g_server->start();
     }
-    NimBLEAdvertising *adv = NimBLEDevice::getAdvertising();
-    if (adv && !adv->isAdvertising()) {
-        adv->setMinInterval(32);
-        adv->setMaxInterval(64);
-        adv->setAppearance(0x03C1); // HID_KEYBOARD
-        adv->addServiceUUID(NimBLEUUID((uint16_t)BLE_FIDO_SERVICE_UUID16));
-        adv->setName(g_device_name);
-        adv->enableScanResponse(true);
-        NimBLEDevice::startAdvertising();
-        CLOG_I("BLE", "All services started, advertising as \"%s\"", g_device_name);
-    }
+    begin_advertising(true);
+    CLOG_I("BLE", "All services started, advertising as \"%s\"", g_device_name);
 }
 
 int ble_fido_is_advertising(void)
@@ -343,20 +483,10 @@ int ble_fido_is_advertising(void)
 
 void ble_fido_restart_advertising(void)
 {
-    NimBLEAdvertising *adv = NimBLEDevice::getAdvertising();
-    if (adv) {
-        if (adv->isAdvertising()) {
-            NimBLEDevice::stopAdvertising();
-        }
-        adv->setMinInterval(32);
-        adv->setMaxInterval(64);
-        adv->setAppearance(0x03C1); // HID_KEYBOARD
-        adv->addServiceUUID(NimBLEUUID((uint16_t)BLE_FIDO_SERVICE_UUID16));
-        adv->setName(g_device_name);
-        adv->enableScanResponse(true);
-        NimBLEDevice::startAdvertising();
-        CLOG_I("BLE", "Advertising restarted as \"%s\"", g_device_name);
-    }
+    /* Explicit user/console request: treat it the same as "just
+     * disconnected" and re-arm the fast, easy-to-find tier. */
+    begin_advertising(true);
+    CLOG_I("BLE", "Advertising restarted (fast) as \"%s\"", g_device_name);
 }
 
 size_t ble_fido_bond_count(void)
