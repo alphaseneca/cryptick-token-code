@@ -41,6 +41,22 @@ enum BleMenuItem {
     BLE_ITEM_COUNT
 };
 
+/*
+ * What UI_AUTH_PROMPT is being asked to authorize. TOTP viewing is the
+ * original, low-stakes case: a session (auth_system_is_authenticated())
+ * is enough, so enter_totp() only routes here when there is no session yet.
+ * The other three are trust-state changes (new fingerprint template, wiping
+ * every template, wiping every BLE bond) and must NOT be satisfiable by an
+ * existing session — see require_fresh_touch() below.
+ */
+enum PendingAction : uint8_t {
+    PENDING_NONE = 0,
+    PENDING_TOTP,
+    PENDING_CLEAR_CONFIRM,
+    PENDING_ENROLL,
+    PENDING_BLE_UNPAIR,
+};
+
 static UiState _state = UI_CLOCK;
 static int _homeCard = 0; // 0 = Clock, 1 = Quick PIV, 2 = Quick TOTP
 static int _menuIdx = 0;
@@ -56,7 +72,7 @@ static bool _enrollRemove = false;
 static char _fidoLabel[64] = "FIDO";
 static char _enrollMsg[24] = "";
 static int8_t _lastFidoReq = 0;
-static bool _pending_clear = false;
+static PendingAction _pendingAction = PENDING_NONE;
 
 /*
  * UI idle clock. Deliberately separate from the auth session in auth_system:
@@ -377,11 +393,30 @@ static void enter_menu(void)
     auth_system_record_activity(millis());
 }
 
+/*
+ * Security gate for destructive/trust-changing actions (new enrollment,
+ * wiping all fingerprints, wiping all BLE bonds): always demands a brand
+ * new sensor match, never an existing auth_system session.
+ *
+ * CMD_FP_MATCH_AUTH resets fp_system's poll window (_lastMatchPoll = 0,
+ * see fp_system.cpp), so this always requires a finger placed *after* this
+ * call — there is no cached/stale state that can satisfy it. Callers resume
+ * their action from the FP_MATCHED handler in nav_system_on_event, keyed on
+ * _pendingAction; a failed/aborted attempt must clear _pendingAction so a
+ * later, unrelated match can't be misattributed (see the FP_NO_MATCH and
+ * UI_AUTH_PROMPT/KEY_LEFT handling below).
+ */
+static void require_fresh_touch(PendingAction action)
+{
+    _pendingAction = action;
+    set_state(UI_AUTH_PROMPT);
+    cmd_fp(CMD_FP_MATCH_AUTH);
+}
+
 static void enter_totp(unsigned long now)
 {
     if (auth_system_needs_auth()) {
-        set_state(UI_AUTH_PROMPT);
-        cmd_fp(CMD_FP_MATCH_AUTH);
+        require_fresh_touch(PENDING_TOTP);
     } else {
         _accountIdx = 0;
         set_state(UI_TOTP);
@@ -403,6 +438,15 @@ static void enter_ble(unsigned long now)
     auth_system_record_activity(now);
 }
 
+static void begin_enroll_now(void)
+{
+    _enrollStep = 1;
+    _enrollRemove = false;
+    _enrollMsg[0] = 0;
+    set_state(UI_FP_ENROLL);
+    cmd_fp(CMD_FP_ENROLL_START);
+}
+
 static void start_enroll(void)
 {
     if (!fp_system_ready()) {
@@ -411,11 +455,23 @@ static void start_enroll(void)
         set_state(UI_AUTH_ERROR);
         return;
     }
-    _enrollStep = 1;
-    _enrollRemove = false;
-    _enrollMsg[0] = 0;
-    set_state(UI_FP_ENROLL);
-    cmd_fp(CMD_FP_ENROLL_START);
+    /*
+     * Security gap closed: this used to be reachable from Settings with no
+     * gate at all beyond "is the sensor present" — anyone with brief
+     * physical access could add their own fingerprint as a standing
+     * credential alongside the owner's. Enrolling only ever appends a
+     * template (fp_system CMD_FP_ENROLL_START / AutoEnroll), it never
+     * replaces one, so this was the easy path even when Clear-FP had some
+     * gate.
+     *
+     * Bootstrap case stays open: with zero templates there is nothing yet
+     * to prove ownership of, and first-time setup must still work.
+     */
+    if (fp_system_template_count() > 0) {
+        require_fresh_touch(PENDING_ENROLL);
+        return;
+    }
+    begin_enroll_now();
 }
 
 static void cycle_sleep_preset(void)
@@ -433,13 +489,20 @@ static void cycle_sleep_preset(void)
 
 static void start_clear(void)
 {
-    if (fp_system_template_count() > 0 && auth_system_needs_auth()) {
-        _pending_clear = true;
-        set_state(UI_AUTH_PROMPT);
-        cmd_fp(CMD_FP_MATCH_AUTH);
+    /*
+     * Security gap closed: this used to skip straight to the double-press
+     * confirm screen whenever auth_system already had a live session (e.g.
+     * the owner viewed a TOTP code a minute ago and walked away) — that
+     * confirm press is a fat-finger safety net, not authentication, and
+     * proves nothing about who is holding the device right now. A
+     * destructive action always demands a fresh touch, regardless of
+     * session state; only the template-count==0 bootstrap case (nothing to
+     * clear/prove ownership of) skips the gate.
+     */
+    if (fp_system_template_count() > 0) {
+        require_fresh_touch(PENDING_CLEAR_CONFIRM);
         return;
     }
-    _pending_clear = false;
     set_state(UI_FP_CLEAR_CONFIRM);
 }
 
@@ -456,12 +519,35 @@ void nav_system_on_event(const BusEvent &e)
                 auth_system_on_match();
                 auth_system_record_activity(now);
                 cmd_fp(CMD_FP_MATCH_STOP);
-                if (_pending_clear) {
-                    _pending_clear = false;
+                /*
+                 * Dispatch on what this particular fresh touch was for. Each
+                 * branch clears _pendingAction before acting so a repeat or
+                 * stray FP_MATCHED (there should not be one — MATCH_STOP was
+                 * just issued above — but see the fp_system/HAL concurrency
+                 * note in the branch's own history) cannot replay the action.
+                 */
+                PendingAction action = _pendingAction;
+                _pendingAction = PENDING_NONE;
+                switch (action) {
+                case PENDING_CLEAR_CONFIRM:
                     set_state(UI_FP_CLEAR_CONFIRM);
-                } else {
+                    break;
+                case PENDING_ENROLL:
+                    begin_enroll_now();
+                    break;
+                case PENDING_BLE_UNPAIR:
+#if CRYPTICK_BLE_FIDO
+                    ble_fido_clear_all_bonds();
+                    strncpy(_enrollMsg, "Bonds Wiped", sizeof(_enrollMsg) - 1);
+                    _enrollMsgStart = now;
+#endif
+                    set_state(UI_BLE_MENU);
+                    break;
+                case PENDING_TOTP:
+                default:
                     _accountIdx = 0;
                     set_state(UI_TOTP);
+                    break;
                 }
             } else if (_state == UI_FIDO_PROMPT) {
                 ctaphid_confirm_user_presence();
@@ -472,6 +558,9 @@ void nav_system_on_event(const BusEvent &e)
             if (_state == UI_AUTH_PROMPT) {
                 auth_system_on_fail();
                 cmd_fp(CMD_FP_MATCH_STOP);
+                /* A failed fresh-touch attempt must not leave a pending
+                 * destructive action armed for some later, unrelated match. */
+                _pendingAction = PENDING_NONE;
                 _authErrorStart = now;
                 strncpy(_enrollMsg, "No match", sizeof(_enrollMsg) - 1);
                 set_state(UI_AUTH_ERROR);
@@ -644,6 +733,25 @@ void nav_system_on_event(const BusEvent &e)
             set_state(UI_MENU);
         } else if (key == KEY_CENTER) {
             if (_bleMenuIdx == BLE_ACT_UNPAIR) {
+                /*
+                 * Security gap closed: this used to wipe every BLE bond on
+                 * a single CENTER press with no confirmation and no
+                 * authentication at all — the least-gated of the three
+                 * destructive actions found in this file. Standing pairings
+                 * are trust state exactly like fingerprint templates, so the
+                 * same fresh-touch gate applies; bootstrap (no fingerprints
+                 * enrolled yet) still allows unpairing with no gate, same as
+                 * the other two actions, so a factory-fresh unit with no FP
+                 * set up yet isn't locked out of its own BLE menu. The gate
+                 * itself is not behind CRYPTICK_BLE_FIDO — it is nav_system
+                 * policy, independent of whether the BLE stack is compiled
+                 * in, and test_nav exercises it on the host build where that
+                 * stack is absent.
+                 */
+                if (fp_system_template_count() > 0) {
+                    require_fresh_touch(PENDING_BLE_UNPAIR);
+                    return;
+                }
 #if CRYPTICK_BLE_FIDO
                 ble_fido_clear_all_bonds();
                 strncpy(_enrollMsg, "Bonds Wiped", sizeof(_enrollMsg) - 1);
@@ -748,6 +856,8 @@ void nav_system_on_event(const BusEvent &e)
         if (key == KEY_LEFT) {
             cmd_fp(CMD_FP_MATCH_STOP);
             auth_system_clear();
+            /* Cancelled fresh-touch request: nothing pending survives this. */
+            _pendingAction = PENDING_NONE;
             set_state(UI_CLOCK);
         }
         break;

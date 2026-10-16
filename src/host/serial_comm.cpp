@@ -292,8 +292,30 @@ void processSerialCommands(Stream &serial, std::vector<TOTPCredential> &credenti
             else if (name == "UNPAIR" || name == "BLE_CLEAR_BONDS" || name == "CLEAR_BONDS")
             {
 #if CRYPTICK_BLE_FIDO
-                ble_fido_clear_all_bonds();
-                serial.println("OK BLE_CLEAR_BONDS all BLE bonding records deleted from token");
+                /*
+                 * Security gap found during the on-device nav_system sweep
+                 * (same action, same risk, a different front door): this
+                 * CDC command wiped every BLE bond with no gate at all,
+                 * unlike OATH PUT/TOTP_DEL above which already require UV
+                 * via oath_ensure_uv(). Same fix, same established
+                 * mechanism — a USB-connected caller now needs a finger on
+                 * the sensor (or a bootstrap unit with nothing enrolled)
+                 * exactly like managing TOTP credentials already does.
+                 *
+                 * if/else rather than early return: this branch is inline
+                 * in processSerialCommands (unlike cmd_totp_put/_delete,
+                 * which are their own functions), so a bare `return` here
+                 * would skip the "cryptick> " reprompt every other command
+                 * path falls through to below.
+                 */
+                serial.println("… UNPAIR confirm with finger if enrolled (or skip if no templates)");
+                serial.flush();
+                if (!oath_ensure_uv("Unpair")) {
+                    serial.println("ERR UNPAIR UV required (place finger) or timeout");
+                } else {
+                    ble_fido_clear_all_bonds();
+                    serial.println("OK BLE_CLEAR_BONDS all BLE bonding records deleted from token");
+                }
 #else
                 serial.println("ERR BLE not supported in this build");
 #endif

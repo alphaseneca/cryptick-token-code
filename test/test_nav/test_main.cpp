@@ -272,6 +272,135 @@ void test_sleep_drops_unlock_session(void)
     TEST_ASSERT_FALSE(auth_system_is_authenticated());
 }
 
+/*
+ * Security regression coverage: Enroll / Clear-FP / BLE-unpair must demand a
+ * *fresh* fingerprint match whenever a template already exists, never ride
+ * on an existing auth_system session, and must stay reachable with no gate
+ * at all in the bootstrap case (zero templates).
+ */
+/*
+ * Top menu order is MENU_TOTP=0, MENU_PIV=1, MENU_BLE=2, MENU_SETTINGS=3
+ * (nav_system.cpp). enter_menu() always resets _menuIdx to 0, so one KEY_UP
+ * wraps straight to Settings (index 3) and two KEY_DOWN reaches BLE
+ * (index 2) — used consistently below instead of hand-counting presses
+ * inline at each call site.
+ */
+static void goto_settings(void)
+{
+    inject_key(KEY_CENTER); /* UI_CLOCK -> UI_MENU, idx 0 (TOTP) */
+    inject_key(KEY_UP);     /* idx wraps to 3 (SETTINGS) */
+    inject_key(KEY_CENTER); /* UI_MENU -> UI_SETTINGS */
+}
+
+static void goto_ble_menu(void)
+{
+    inject_key(KEY_CENTER); /* UI_CLOCK -> UI_MENU, idx 0 (TOTP) */
+    inject_key(KEY_DOWN);   /* idx 1 (PIV) */
+    inject_key(KEY_DOWN);   /* idx 2 (BLE) */
+    inject_key(KEY_CENTER); /* UI_MENU -> UI_BLE_MENU */
+}
+
+void test_enroll_requires_fresh_touch_when_templates_exist(void)
+{
+    reset_nav();
+    g_fp_count = 1;
+
+    goto_settings();
+    TEST_ASSERT_EQUAL(UI_SETTINGS, nav_system_state());
+
+    inject_key(KEY_CENTER); /* SET_ENROLL, index 0 */
+    TEST_ASSERT_EQUAL_MESSAGE(UI_AUTH_PROMPT, nav_system_state(),
+                               "Enroll must gate behind a fresh touch once a template exists");
+
+    inject_fp(FP_MATCHED, 1, 100);
+    TEST_ASSERT_EQUAL(UI_FP_ENROLL, nav_system_state());
+}
+
+void test_enroll_bootstrap_stays_ungated(void)
+{
+    reset_nav();
+    g_fp_count = 0;
+
+    goto_settings();
+    inject_key(KEY_CENTER); /* SET_ENROLL */
+    TEST_ASSERT_EQUAL_MESSAGE(UI_FP_ENROLL, nav_system_state(),
+                               "First-time setup (no templates yet) must stay reachable with no gate");
+}
+
+void test_clear_fp_requires_fresh_touch_even_with_live_session(void)
+{
+    reset_nav();
+    g_fp_count = 1;
+    /* Simulate an owner who unlocked TOTP a moment ago and is still "in
+     * session" — that must NOT be enough to authorize wiping fingerprints. */
+    auth_system_set_fingerprint_enabled(true);
+    auth_system_on_match();
+    TEST_ASSERT_TRUE(auth_system_is_authenticated());
+
+    goto_settings();
+    inject_key(KEY_DOWN);
+    inject_key(KEY_CENTER); /* SET_CLEAR, index 1 */
+    TEST_ASSERT_EQUAL_MESSAGE(UI_AUTH_PROMPT, nav_system_state(),
+                               "Clear-FP must not be satisfied by a pre-existing session");
+
+    inject_fp(FP_NO_MATCH);
+    TEST_ASSERT_EQUAL_MESSAGE(UI_AUTH_ERROR, nav_system_state(),
+                               "A failed fresh-touch attempt must not fall through to the confirm screen");
+}
+
+void test_clear_fp_confirm_reached_after_fresh_match(void)
+{
+    reset_nav();
+    g_fp_count = 1;
+
+    goto_settings();
+    inject_key(KEY_DOWN);
+    inject_key(KEY_CENTER); /* SET_CLEAR */
+    TEST_ASSERT_EQUAL(UI_AUTH_PROMPT, nav_system_state());
+
+    inject_fp(FP_MATCHED, 1, 100);
+    TEST_ASSERT_EQUAL(UI_FP_CLEAR_CONFIRM, nav_system_state());
+}
+
+void test_clear_fp_bootstrap_stays_ungated(void)
+{
+    reset_nav();
+    g_fp_count = 0;
+
+    goto_settings();
+    inject_key(KEY_DOWN);
+    inject_key(KEY_CENTER); /* SET_CLEAR */
+    TEST_ASSERT_EQUAL_MESSAGE(UI_FP_CLEAR_CONFIRM, nav_system_state(),
+                               "Nothing enrolled yet means nothing to clear/prove ownership of");
+}
+
+void test_ble_unpair_requires_fresh_touch_when_templates_exist(void)
+{
+    reset_nav();
+    g_fp_count = 1;
+
+    goto_ble_menu();
+    TEST_ASSERT_EQUAL(UI_BLE_MENU, nav_system_state());
+
+    inject_key(KEY_CENTER); /* BLE_ACT_UNPAIR, index 0 */
+    TEST_ASSERT_EQUAL_MESSAGE(UI_AUTH_PROMPT, nav_system_state(),
+                               "Unpair must gate behind a fresh touch once a template exists");
+
+    inject_fp(FP_MATCHED, 1, 100);
+    TEST_ASSERT_EQUAL(UI_BLE_MENU, nav_system_state());
+}
+
+void test_ble_unpair_bootstrap_stays_ungated(void)
+{
+    reset_nav();
+    g_fp_count = 0;
+
+    goto_ble_menu();
+    inject_key(KEY_CENTER); /* BLE_ACT_UNPAIR */
+    TEST_ASSERT_EQUAL_MESSAGE(UI_BLE_MENU, nav_system_state(),
+                               "No fingerprints enrolled yet must not lock the owner out of their own BLE menu");
+}
+
 void test_settings_labels_cover_every_item(void)
 {
     reset_nav();
