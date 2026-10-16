@@ -762,27 +762,20 @@ int piv_handle_apdu(const uint8_t *cmd, size_t cmd_len, uint8_t *out, size_t out
     } else if (cmd_len == 5) {
         le = cmd[4] == 0 ? 256 : cmd[4];
     } else if (cmd[4] == 0 && cmd_len >= 7) {
-        /* Extended length APDU (ISO 7816-4) */
-        lc = ((size_t)cmd[5] << 8) | cmd[6];
-        if (lc == 0) {
-            /* Case 2E: Le only */
-            if (cmd_len == 7) {
-                le = 65536;
-            } else {
-                return put_sw(out, out_max, PIV_SW_WRONG_LENGTH);
-            }
-        } else {
-            /* Case 3E / 4E */
-            if (cmd_len < 7 + lc)
-                return put_sw(out, out_max, PIV_SW_WRONG_LENGTH);
-            data = cmd + 7;
-            if (cmd_len == 7 + lc)
-                le = 65536;
-            else if (cmd_len == 7 + lc + 2)
-                le = ((size_t)cmd[7 + lc] << 8) | cmd[7 + lc + 1];
-            else
-                return put_sw(out, out_max, PIV_SW_WRONG_LENGTH);
-        }
+        /*
+         * Extended-length encoding (ISO 7816-4, leading Lc byte 0x00).
+         * docs/device-protocol.md is explicit: "The applet accepts short
+         * APDUs only; extended-length encoding is rejected with 6700."
+         * This used to be parsed and accepted here (case 2E/3E/4E), which
+         * is a real protocol-contract violation, not just an unimplemented
+         * extra: a certificate too big for a short Lc must go through GET
+         * RESPONSE chaining (the 61xx path below) so every transport —
+         * including BLE PIV's 261-byte ceiling, which cannot carry an
+         * extended APDU intact in the first place — sees the same command
+         * shape. Silently accepting extended length over USB CCID let that
+         * assumption quietly break for exactly one transport.
+         */
+        return put_sw(out, out_max, PIV_SW_WRONG_LENGTH);
     } else {
         /* Short APDU (ISO 7816-4) */
         lc = cmd[4];

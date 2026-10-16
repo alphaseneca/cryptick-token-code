@@ -573,6 +573,24 @@ def test_unsupported_class_is_rejected(card, cla):
     assert card.apdu(bytes([cla, 0xA4, 0x04, 0x00]))[0] == SW_CLA_UNSUPPORTED
 
 
+def test_extended_length_body_is_rejected(card):
+    """device-protocol.md: "The applet accepts short APDUs only;
+    extended-length encoding is rejected with 6700." This used to be parsed
+    (case 3E/4E) instead of refused — a certificate too big for a short Lc
+    must go through GET RESPONSE chaining, the same shape on every
+    transport, including BLE PIV's 261-byte ceiling, which cannot carry an
+    extended APDU intact in the first place."""
+    cmd = bytes([0x00, 0xA4, 0x04, 0x00, 0x00, 0x00, 0x0B]) + EXPECTED_AID
+    assert card.apdu(cmd)[0] == SW_WRONG_LENGTH
+
+
+def test_extended_length_le_only_is_rejected(card):
+    """Case 2E (Lc escape byte present, encoded length 0, meaning Le-only)
+    used to be accepted as Le=65536; it is extended-length encoding too."""
+    cmd = bytes([0x00, 0xA4, 0x04, 0x00, 0x00, 0x00, 0x00])
+    assert card.apdu(cmd)[0] == SW_WRONG_LENGTH
+
+
 def test_out_buffer_too_small(card):
     buf = (ctypes.c_uint8 * 1)()
     cmd = bytes([0x00, 0xA4, 0x04, 0x00, 0x0B]) + EXPECTED_AID

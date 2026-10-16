@@ -30,6 +30,7 @@
 #include "usb_ccid.h"
 #include "ccid_proto.h"
 #include "ccid_descriptors.h"
+#include "piv.h"
 
 #include <string.h>
 
@@ -427,14 +428,43 @@ static bool ccid_drv_xfer_cb(uint8_t rhport, uint8_t ep_addr,
             uint32_t msg_total_len = CCID_HEADER_LEN + body;
             /*
              * Is this a blocking message?
-             * Only XFR_BLOCK carrying PIV_INS_GENERAL_AUTHENTICATE (0x87) waits for
-             * user presence (fingerprint/touch) up to CRYPTICK_FIDO_UP_TIMEOUT_MS.
-             * All other CCID messages (GetSlotStatus 0x65, IccPowerOn 0x62, IccPowerOff 0x63,
-             * GetParameters 0x6C, Select AID, GetData, Verify, etc.) execute in microseconds
-             * and MUST be answered immediately on the USB task without queue latency.
+             *
+             * Two instructions can call into _hal->user_presence(): INS 0x87
+             * (GENERAL_AUTHENTICATE, to sign or do ECDH) and INS 0x47
+             * (GENERATE_KEYPAIR, to roll a slot's key). Both take the slot in
+             * the P2 byte. piv_user_presence() in piv_hal_esp32.cpp returns
+             * immediately for 9A/9D/9E (9A is verified by PIN, not touch; 9D
+             * and 9E have no touch requirement) and only blocks — on
+             * ctap_user_presence_test(), up to CRYPTICK_FIDO_UP_TIMEOUT_MS —
+             * for slot 9C (PIV_SLOT_SIGNATURE).
+             *
+             * This used to check only INS==0x87, which had two failure
+             * modes:
+             *   1. Every GENERAL_AUTHENTICATE, including the 9A login slot —
+             *      the single most common PIV operation, since 9A is what
+             *      macOS/Linux use for every unlock — was routed through the
+             *      FIDO-task queue for no reason: queue latency, and a
+             *      spurious CCID_ERR_SLOT_BUSY if the FIDO task happened to
+             *      be mid-ceremony on an unrelated USB/BLE FIDO request,
+             *      despite 9A never touching that gate.
+             *   2. GENERATE_KEYPAIR on slot 9C was not flagged at all, so it
+             *      took the "answer immediately on this task" path below and
+             *      called straight into ctap_user_presence_test() — up to a
+             *      29-second block of the TinyUSB task itself, stalling CDC
+             *      and HID along with it (see the file banner's "Blocking"
+             *      hazard). Rolling the signature key over USB looked like
+             *      the device had hung.
+             *
+             * Gating on slot as well as instruction fixes both: only a
+             * request that can actually wait on a fingerprint is deferred to
+             * the FIDO task, and every one that can is.
              */
-            bool is_blocking = (_rx[0] == CCID_PC_TO_RDR_XFR_BLOCK && body >= 2 &&
-                                _rx[CCID_HEADER_LEN + 1] == 0x87); // PIV_INS_GENERAL_AUTHENTICATE
+            bool is_presence_gated_ins =
+                (_rx[CCID_HEADER_LEN + 1] == PIV_INS_GENERAL_AUTHENTICATE ||
+                 _rx[CCID_HEADER_LEN + 1] == PIV_INS_GENERATE_KEYPAIR);
+            bool is_blocking = (_rx[0] == CCID_PC_TO_RDR_XFR_BLOCK && body >= 4 &&
+                                is_presence_gated_ins &&
+                                _rx[CCID_HEADER_LEN + 3] == PIV_SLOT_SIGNATURE);
 
             if (!is_blocking) {
                 if (_busy) {
