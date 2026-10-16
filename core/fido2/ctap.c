@@ -148,9 +148,26 @@ uint8_t ctap_get_info(CborEncoder * encoder)
      *    showed Place finger. Only list clientPin when a PIN is actually set.
      *  - versions: U2F_V2 + FIDO_2_0 (Chrome often creates via CTAPHID_MSG/U2F).
      *  - Not FIDO_2_1_PRE: stay on CTAP2.0 built-in UV, not pinUvAuthToken-only.
+     *    (That is about the everyday sign-in ceremony only — MakeCredential/
+     *    GetAssertion still gate on a direct per-request touch, never on a
+     *    pinUvAuthToken. It does not affect whether authenticatorClientPIN's
+     *    own subcommands, below, are advertised.)
+     *  - pinUvAuthProtocols: a platform needs this to know which protocol
+     *    number to negotiate keyAgreement/pinUvAuthParam under *before* it
+     *    can call CP_cmdGetPinUvAuthTokenUsingUvWithPermissions (CTAP2.1
+     *    §6.5.5) for credential management — so, like `uv` above, this is
+     *    advertised whenever a pinUvAuthToken is obtainable at all, by PIN
+     *    *or* by UV, not only when a PIN happens to be set. This device
+     *    implements exactly PIN/UV Auth Protocol One (see the pinProtocol
+     *    != 1 check in ctap_client_pin()), so the array is always `[1]`.
      */
     const int pin_set = (ctap_is_pin_set() != 0);
-    const int map_keys = pin_set ? 10 : 9;
+    /* UV (fingerprint) is always available on this product, per the `uv`
+     * policy above — so a pinUvAuthToken is always obtainable one way or
+     * the other, and pinUvAuthProtocols is unconditional like `uv` is,
+     * not conditional like `clientPin` (which depends on a PIN existing). */
+    const int uv_token_obtainable = 1;
+    const int map_keys = (pin_set || uv_token_obtainable) ? 10 : 9;
     const int opt_keys = pin_set ? 6 : 5;
 
     ret = cbor_encoder_create_map(encoder, &map, map_keys);
@@ -259,7 +276,7 @@ uint8_t ctap_get_info(CborEncoder * encoder)
             check_ret(ret);
         }
 
-        if (pin_set)
+        if (pin_set || uv_token_obtainable)
         {
             ret = cbor_encode_uint(&map, RESP_pinProtocols);
             check_ret(ret);
@@ -2262,6 +2279,50 @@ uint8_t ctap_add_pin_if_verified(uint8_t * pinTokenEnc, uint8_t * platform_pubke
     return 0;
 }
 
+/*
+ * UV counterpart of ctap_add_pin_if_verified(): no pinHashEnc to check (the
+ * fingerprint match already happened, in the caller, via
+ * ctap2_user_presence_test()) — this only derives the shared secret and
+ * wraps a token under it, for CP_cmdGetPinUvAuthTokenUsingUvWithPermissions.
+ *
+ * Generates a brand-new PIN_TOKEN (same ctap_generate_rng() + reboot-on-
+ * failure convention as ctap_init()/ctap_reset(), ctap.c ~line 2626/2842)
+ * rather than re-wrapping whatever the PIN path last issued: a fresh UV
+ * grant is a new token issuance, not a re-delivery of an old one. This
+ * invalidates any token a prior CP_cmdGetPinToken call handed out, which is
+ * correct for a single-session authenticator — there is exactly one
+ * standing PIN_TOKEN, and whichever ceremony (PIN or UV) most recently
+ * proved the user is the one that gets to mint it.
+ *
+ * verify_pin_auth_ex() / ctap_cred_mgmt_pinauth() need no changes: both
+ * already just HMAC-check against whatever PIN_TOKEN currently holds.
+ */
+uint8_t ctap_make_uv_pin_token(uint8_t * pinTokenEnc, uint8_t * platform_pubkey)
+{
+    uint8_t shared_secret[32];
+
+    crypto_ecc256_shared_secret(platform_pubkey, KEY_AGREEMENT_PRIV, shared_secret);
+
+    crypto_sha256_init();
+    crypto_sha256_update(shared_secret, 32);
+    crypto_sha256_final(shared_secret);
+
+    if (ctap_generate_rng(PIN_TOKEN, PIN_TOKEN_SIZE) != 1)
+    {
+        printf2(TAG_ERR,"Error, rng failed\n");
+        /* Cannot produce a safe authenticator state; reboot instead of exit(). */
+        device_reboot();
+    }
+
+    crypto_aes256_init(shared_secret, NULL);
+    crypto_aes256_reset_iv(NULL);
+
+    memmove(pinTokenEnc, PIN_TOKEN, PIN_TOKEN_SIZE);
+    crypto_aes256_encrypt(pinTokenEnc, PIN_TOKEN_SIZE);
+
+    return 0;
+}
+
 uint8_t ctap_client_pin(CborEncoder * encoder, uint8_t * request, int length)
 {
     CTAP_clientPin CP;
@@ -2382,6 +2443,69 @@ uint8_t ctap_client_pin(CborEncoder * encoder, uint8_t * request, int length)
             check_ret(ret);
 
 
+
+            break;
+
+        case CP_cmdGetPinUvAuthTokenUsingUvWithPermissions:
+            /*
+             * CTAP2.1 §6.5.5 / §6.5.5.7.2: the actual spec mechanism for
+             * obtaining a pinUvAuthToken via built-in UV instead of a PIN.
+             * This is the fix that lets credential management
+             * (ctap_cred_mgmt_pinauth(), which only ever checks whatever is
+             * in PIN_TOKEN via verify_pin_auth_ex()) be gated by the
+             * fingerprint sensor instead of requiring a PIN flow — no
+             * change needed to either of those, by design.
+             */
+            num_map++;
+            ret = cbor_encoder_create_map(encoder, &map, num_map);
+            check_ret(ret);
+
+            printf1(TAG_CP,"CP_cmdGetPinUvAuthTokenUsingUvWithPermissions\n");
+            if (CP.keyAgreementPresent == 0 || CP.permissionsPresent == 0)
+            {
+                printf2(TAG_ERR,"Error, missing keyAgreement or permissions for cmdGetPinUvAuthTokenUsingUvWithPermissions\n");
+                return CTAP2_ERR_MISSING_PARAMETER;
+            }
+            if (CP.permissions == 0)
+            {
+                /* §6.5.5.7.2: a platform must ask for at least one specific
+                 * permission — zero is not "no restriction", it is invalid. */
+                printf2(TAG_ERR,"Error, permissions == 0\n");
+                return CTAP1_ERR_INVALID_PARAMETER;
+            }
+
+            /*
+             * Real, fresh fingerprint match — not the cached GetTouch
+             * credit. allow_uv_cache must be 0 here: per device.h's own
+             * doc comment, that cache is a one-shot MakeCredential-only
+             * credit for a Chrome U2F quirk (ctap_uv_cache_arm_gettouch()),
+             * consumed by ctap_user_presence_test_ex() when the *caller*
+             * passes allow_uv_cache=1 — nothing else may opt into it. If
+             * this call opted in, a touch meant for an entirely unrelated
+             * MakeCredential moments earlier could silently authorize
+             * listing/deleting resident credentials, exactly the
+             * cross-ceremony double-count hazard that comment warns about.
+             * ctap2_user_presence_test(0) is this file's own existing
+             * UP/UV-test-to-CTAP-status helper (used by CTAP_RESET above)
+             * — it already converts ctap_user_presence_test_ex()'s raw
+             * 1/0/-1 into CTAP1_ERR_SUCCESS / CTAP2_ERR_ACTION_TIMEOUT /
+             * CTAP2_ERR_KEEPALIVE_CANCEL, so this introduces no new
+             * timeout/cancel error convention.
+             */
+            ret = ctap2_user_presence_test(0);
+            if (ret != CTAP1_ERR_SUCCESS)
+            {
+                return ret;
+            }
+
+            ret = cbor_encode_int(&map, RESP_pinToken);
+            check_ret(ret);
+
+            ret = ctap_make_uv_pin_token(pinTokenEnc, (uint8_t*)&CP.keyAgreement.pubkey);
+            check_retr(ret);
+
+            ret = cbor_encode_byte_string(&map, pinTokenEnc, PIN_TOKEN_SIZE);
+            check_ret(ret);
 
             break;
 

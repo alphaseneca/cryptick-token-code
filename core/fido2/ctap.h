@@ -56,6 +56,29 @@ extern "C" {
 #define CM_pinProtocol            0x03
 #define CM_pinAuth                0x04
 
+/*
+ * authenticatorClientPIN (0x06) request parameter map keys and subCommand
+ * values, verified against the CTAP2.1 spec text (FIDO Alliance, CTAP
+ * v2.1-ps-20210615) section 6.5.5 "authenticatorClientPIN (0x06)" — cross-
+ * checked against two independent published references (the
+ * WebauthnWorks CTAP2.1-Migration-Guide PinUvAuthnProtocol2.md, and
+ * multiple third-party CTAP2 implementations) rather than taken from
+ * memory, since this codebase predates CTAP2.1 and only ever implemented
+ * the CTAP2.0 subset (subCommands 0x01-0x05):
+ *
+ *   0x01 getRetries                                (pre-existing)
+ *   0x02 getKeyAgreement                            (pre-existing)
+ *   0x03 setPin                                     (pre-existing)
+ *   0x04 changePin                                  (pre-existing)
+ *   0x05 getPinToken                                (pre-existing, PIN-only)
+ *   0x06 getPinUvAuthTokenUsingUvWithPermissions     (new, this change)
+ *   0x07 getUVRetries                                (not implemented)
+ *   0x09 getPinUvAuthTokenUsingPinWithPermissions    (not implemented)
+ *
+ * 0x06 was already the natural next integer in this file's own numbering —
+ * confirmed above that is not a coincidence, it is genuinely the value the
+ * spec assigns to this subcommand.
+ */
 #define CP_pinProtocol            0x01
 #define CP_subCommand             0x02
     #define CP_cmdGetRetries      0x01
@@ -63,12 +86,34 @@ extern "C" {
     #define CP_cmdSetPin          0x03
     #define CP_cmdChangePin       0x04
     #define CP_cmdGetPinToken     0x05
+    #define CP_cmdGetPinUvAuthTokenUsingUvWithPermissions 0x06
 #define CP_keyAgreement           0x03
 #define CP_pinAuth                0x04
 #define CP_newPinEnc              0x05
 #define CP_pinHashEnc             0x06
 #define CP_getKeyAgreement        0x07
 #define CP_getRetries             0x08
+/*
+ * permissions (0x09) and rpId (0x0A): CTAP2.1 §6.5.5, same request map as
+ * above. Also verified, not guessed — these two keys did not exist at all
+ * in this file's CTAP2.0-only parser before this change.
+ */
+#define CP_permissions            0x09
+#define CP_rpId                   0x0A
+
+/*
+ * pinUvAuthToken permission bits, CTAP2.1 §6.4 "Permissions" (table of
+ * mc/ga/cm/be/lbw/acfg). This is the exact bit layout the task called out
+ * to verify rather than assume — `cm` (credential management, the one this
+ * change exists to unlock) is bit 2, value 0x04, not 0x02 or 0x08 as a
+ * half-remembered layout might guess.
+ */
+#define CP_PERM_MC                0x01 /* MakeCredential */
+#define CP_PERM_GA                0x02 /* GetAssertion */
+#define CP_PERM_CM                0x04 /* CredentialManagement */
+#define CP_PERM_BE                0x08 /* BioEnrollment */
+#define CP_PERM_LBW               0x10 /* LargeBlobWrite */
+#define CP_PERM_ACFG              0x20 /* AuthenticatorConfiguration */
 
 #define EXT_HMAC_SECRET_COSE_KEY    0x01
 #define EXT_HMAC_SECRET_SALT_ENC    0x02
@@ -360,6 +405,16 @@ typedef struct
     uint8_t pinHashEncPresent;
     _Bool getKeyAgreement;
     _Bool getRetries;
+    /*
+     * CP_permissions / CP_rpId (CTAP2.1 §6.5.5), new for
+     * getPinUvAuthTokenUsingUvWithPermissions. rpId reuses struct rpId /
+     * parse_rp_id() — the same bare-text-string parser GetAssertion's
+     * GA_rpId already uses — rather than a new ad hoc string field.
+     */
+    int permissions;
+    uint8_t permissionsPresent;
+    struct rpId rpId;
+    uint8_t rpIdPresent;
 } CTAP_clientPin;
 
 
@@ -397,6 +452,7 @@ void ctap_reset_state();
 
 uint8_t ctap_add_pin_if_verified(uint8_t * pinTokenEnc, uint8_t * platform_pubkey, uint8_t * pinHashEnc);
 uint8_t ctap_update_pin_if_verified(uint8_t * pinEnc, int len, uint8_t * platform_pubkey, uint8_t * pinAuth, uint8_t * pinHashEnc);
+uint8_t ctap_make_uv_pin_token(uint8_t * pinTokenEnc, uint8_t * platform_pubkey);
 
 uint8_t ctap_update_pin(uint8_t * pin, int len);
 uint8_t ctap_decrement_pin_attempts();

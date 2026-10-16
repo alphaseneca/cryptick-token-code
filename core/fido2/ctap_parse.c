@@ -1538,6 +1538,25 @@ uint8_t ctap_parse_client_pin(CTAP_clientPin * CP, uint8_t * request, int length
                 ret = cbor_value_get_boolean(&map, &CP->getRetries);
                 check_ret(ret);
                 break;
+            case CP_permissions:
+                printf1(TAG_CP,"CP_permissions\n");
+                if (cbor_value_get_type(&map) == CborIntegerType)
+                {
+                    ret = cbor_value_get_int_checked(&map, &CP->permissions);
+                    check_ret(ret);
+                    CP->permissionsPresent = 1;
+                }
+                else
+                {
+                    return CTAP2_ERR_INVALID_CBOR_TYPE;
+                }
+                break;
+            case CP_rpId:
+                printf1(TAG_CP,"CP_rpId\n");
+                ret = parse_rp_id(&CP->rpId, &map);
+                check_retr(ret);
+                CP->rpIdPresent = 1;
+                break;
             default:
                 printf1(TAG_CP,"Unknown key %d\n", key);
         }
