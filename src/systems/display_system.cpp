@@ -17,6 +17,7 @@
 #include <Wire.h>
 #include <stdio.h>
 #include <string.h>
+#include "display_icons.h"
 
 /* Use HW I2C without clock/data args — Wire.begin(SDA,SCL) owns the pins.
  * Passing SCL/SDA into the U8g2 HW constructor can re-init Wire and hang
@@ -36,6 +37,19 @@ static bool _oled_ok = false;
 static bool _asleep = false;
 static uint8_t _oled_addr = OLED_ADDRESS;
 
+/*
+ * Truncation marker. Every font this file uses (u8g2_font_*_tr/_tn) is built
+ * with "Glyphs: 95/N" in its own header comment in U8g2's font table — the
+ * 95 printable ASCII characters, 0x20-0x7E, and nothing else. u8g2.drawStr()
+ * draws via u8x8_ascii_next (one input *byte* = one glyph lookup, no UTF-8
+ * decoding — that path only exists in u8g2.drawUTF8()), so a real ellipsis
+ * character ('…', UTF-8 bytes E2 80 A6) used to turn into three
+ * out-of-range glyph lookups per truncated string: this file's single most
+ * common rendering call. Two ASCII periods read clearly at this pixel size
+ * and cost less width than three.
+ */
+static const char *const kEllipsis = "..";
+
 static void draw_str_ellipsis(int x, int y, const char *s, int maxW)
 {
     if (!s) s = "";
@@ -53,13 +67,13 @@ static void draw_str_ellipsis(int x, int y, const char *s, int maxW)
         n--;
         buf[n] = 0;
         char tmp[44];
-        snprintf(tmp, sizeof(tmp), "%s…", buf);
+        snprintf(tmp, sizeof(tmp), "%s%s", buf, kEllipsis);
         if (u8g2.getStrWidth(tmp) <= maxW) {
             u8g2.drawStr(x, y, tmp);
             return;
         }
     }
-    u8g2.drawStr(x, y, "…");
+    u8g2.drawStr(x, y, kEllipsis);
 }
 
 static void format_time(uint32_t t, char *date_str, size_t ds, char *time_str, size_t ts)
@@ -93,10 +107,59 @@ static void format_time(uint32_t t, char *date_str, size_t ds, char *time_str, s
     snprintf(date_str, ds, "%02d/%02d/%04d", day, month, year);
 }
 
-static void draw_charge_icon(int x, int y)
+/*
+ * Shared status-icon cluster, right-aligned, reused by every screen that
+ * shows a title row or a home/TOTP status bar (draw_title / draw_status_bar
+ * / draw_clock below) — one fixed layout instead of each screen placing its
+ * own battery glyph at its own x, which is how the old draw_charge_icon(108,
+ * ...) and draw_title's 90px title budget ended up able to collide: a long
+ * title plus a battery *label* (see draw_battery_icon) floating further
+ * left than either side accounted for. Reserving this zone, and clipping
+ * title text to end before it (TITLE_SAFE_W), removes that class of bug by
+ * construction instead of by tuning more magic numbers.
+ */
+#if CRYPTICK_BLE_FIDO
+static const int STATUS_BLE_X = 90;
+static const int STATUS_BATTERY_X = 104;
+static const int TITLE_SAFE_W = 86;
+#else
+static const int STATUS_BATTERY_X = 104;
+static const int TITLE_SAFE_W = 100;
+#endif
+
+/** Draw an XBM glyph; strike it diagonally when `ok` is false. One shape per
+ *  concept, told apart by the strike-through rather than a second bitmap —
+ *  reused for BLE connected/disconnected and fingerprint ready/absent. */
+static void draw_icon_state(int x, int y, const unsigned char *bits, int w, int h, bool ok)
 {
-    u8g2.drawFrame(x, y, 18, 9);
-    u8g2.drawBox(x + 18, y + 2, 2, 5);
+    u8g2.drawXBMP(x, y, w, h, bits);
+    if (!ok)
+        u8g2.drawLine(x, y, x + w - 1, y + h - 1);
+}
+
+static void draw_ble_icon(int x, int y)
+{
+#if CRYPTICK_BLE_FIDO
+    draw_icon_state(x, y, icon_ble_bits, ICON_BLE_W, ICON_BLE_H,
+                    ble_fido_is_connected() != 0);
+#else
+    (void)x; (void)y;
+#endif
+}
+
+/**
+ * Battery glyph: the XBM shell (see display_icons.h for why — no fuel-gauge
+ * ADC on this board, so there is no "level" to show, only the charger's
+ * idle/charging/done/fault state) plus a fill drawn at the same relative
+ * offsets the old hand-drawn frame used, so the charging animation and fault
+ * mark are unchanged, just built on the shared glyph instead of one-off
+ * vector calls. `with_label` adds the short CHG/FULL/FLT text to its left —
+ * left on for the home/TOTP status bar, which has room; left off for the
+ * title-bar usage, which must stay a fixed width for TITLE_SAFE_W to hold.
+ */
+static void draw_battery_icon(int x, int y, bool with_label)
+{
+    u8g2.drawXBMP(x, y, ICON_BATTERY_W, ICON_BATTERY_H, icon_battery_shell_bits);
 
     switch (_charge) {
     case CHARGE_CHARGING: {
@@ -121,11 +184,13 @@ static void draw_charge_icon(int x, int y)
         break;
     }
 
-    u8g2.setFont(u8g2_font_5x7_tr);
-    const char *lab = battery_system_label();
-    if (lab && lab[0]) {
-        int lw = u8g2.getStrWidth(lab);
-        u8g2.drawStr(x - lw - 2, y + 7, lab);
+    if (with_label) {
+        u8g2.setFont(u8g2_font_5x7_tr);
+        const char *lab = battery_system_label();
+        if (lab && lab[0]) {
+            int lw = u8g2.getStrWidth(lab);
+            u8g2.drawStr(x - lw - 2, y + 7, lab);
+        }
     }
 }
 
@@ -135,15 +200,17 @@ static void draw_status_bar(uint32_t utc)
     format_time(utc, date_str, sizeof(date_str), time_str, sizeof(time_str));
     u8g2.setFont(u8g2_font_5x7_tr);
     u8g2.drawStr(0, 7, date_str);
-    draw_charge_icon(108, 0);
+    draw_ble_icon(STATUS_BLE_X, 0);
+    draw_battery_icon(STATUS_BATTERY_X, 0, true);
 }
 
 static void draw_title(const char *title)
 {
     u8g2.setFont(u8g2_font_6x12_tr);
-    draw_str_ellipsis(0, 12, title, 90);
+    draw_str_ellipsis(0, 12, title, TITLE_SAFE_W);
     u8g2.drawHLine(0, 14, 128);
-    draw_charge_icon(108, 2);
+    draw_ble_icon(STATUS_BLE_X, 2);
+    draw_battery_icon(STATUS_BATTERY_X, 2, false);
 }
 
 /** Rows that fit under the title bar. */
@@ -238,39 +305,41 @@ static void draw_ble_menu(void)
     bool advertising = (ble_fido_is_advertising() != 0);
     size_t bonds = ble_fido_bond_count();
 
+    /*
+     * Status line sits in list-grid "row 0" (draw_list_row's y=27, box
+     * 17-30) with its own icon instead of the word "Status:" — the action
+     * items below reuse rows 1-2 of the exact same grid draw_settings and
+     * draw_menu_list use, which is what makes this screen stop having its
+     * own layout. draw_str_ellipsis bounds it against the icon's right
+     * edge, since a bond count is runtime data and this file's fonts have
+     * no slack to eyeball widths by hand (see draw_str_ellipsis's comment).
+     */
+    draw_icon_state(0, 17, icon_ble_bits, ICON_BLE_W, ICON_BLE_H, connected);
     char line[36];
+    if (connected)
+        snprintf(line, sizeof(line), "Connected - %u bond%s", (unsigned)bonds,
+                 bonds == 1 ? "" : "s");
+    else if (advertising)
+        snprintf(line, sizeof(line), "Advertising - %u/4 bond%s", (unsigned)bonds,
+                 bonds == 1 ? "" : "s");
+    else
+        snprintf(line, sizeof(line), "Offline");
+    draw_str_ellipsis(15, 25, line, 113);
 
-    // Status line: State & bond count (y = 23, height 7)
-    if (connected) {
-        snprintf(line, sizeof(line), "Status: Connected (%u bnd)", (unsigned)bonds);
-    } else if (advertising) {
-        snprintf(line, sizeof(line), "Status: Ready to Pair (%u/4)", (unsigned)bonds);
-    } else {
-        snprintf(line, sizeof(line), "Status: Offline");
-    }
-    u8g2.drawStr(0, 23, line);
+    u8g2.drawHLine(0, 30, 128);
 
-    // Subtle divider line
-    u8g2.drawHLine(0, 26, 128);
-
-    // Action items
     int count = nav_system_ble_menu_count();
     int sel = nav_system_ble_menu_index();
+    int first = list_first_row(count, sel);
 
     u8g2.setFont(u8g2_font_6x12_tr);
-    for (int i = 0; i < count; i++) {
+    /* Row 0 is the status line above; action items start at row 1. */
+    for (int r = 0; r < LIST_ROWS - 1 && (first + r) < count; r++) {
         char act_label[32];
-        nav_system_ble_menu_label(i, act_label, sizeof(act_label));
-        int act_y = 41 + (i * 15);
-        if (i == sel) {
-            u8g2.drawBox(0, act_y - 10, 128, 13);
-            u8g2.setDrawColor(0);
-            draw_str_ellipsis(4, act_y, act_label, 120);
-            u8g2.setDrawColor(1);
-        } else {
-            draw_str_ellipsis(4, act_y, act_label, 120);
-        }
+        nav_system_ble_menu_label(first + r, act_label, sizeof(act_label));
+        draw_list_row(r + 1, act_label, (first + r) == sel, 120);
     }
+    draw_scrollbar(count, first);
 #else
     u8g2.drawStr(0, 35, "BLE not supported");
 #endif
@@ -295,19 +364,26 @@ static void draw_device_info(void)
     char line[36];
     int y = 25;
 
+    /*
+     * Every line here carries at least one runtime value (template/account
+     * counts, uptime), so each goes through draw_str_ellipsis rather than a
+     * bare drawStr: this is the one screen where uptime in particular grows
+     * without bound (weeks of uptime widen "Up NNNNm59s"), and nothing here
+     * is worth a hard clip at the 128px edge over a two-char "..".
+     */
     snprintf(line, sizeof(line), "USB  %s",
              usb_device_mounted() ? "1209:BEEE host" : "not mounted");
-    u8g2.drawStr(0, y, line);
+    draw_str_ellipsis(0, y, line, 128);
 
     y += 10;
     snprintf(line, sizeof(line), "FP   %s  %u tpl",
              fp_system_ready() ? "ready" : "absent",
              (unsigned)fp_system_template_count());
-    u8g2.drawStr(0, y, line);
+    draw_str_ellipsis(0, y, line, 128);
 
     y += 10;
     snprintf(line, sizeof(line), "OATH %d accounts", nav_system_account_count());
-    u8g2.drawStr(0, y, line);
+    draw_str_ellipsis(0, y, line, 128);
 
     y += 10;
     unsigned long up = millis() / 1000UL;
@@ -317,7 +393,7 @@ static void draw_device_info(void)
                  up / 60UL, up % 60UL, (unsigned)slp);
     else
         snprintf(line, sizeof(line), "Up %lum%02lus   Slp off", up / 60UL, up % 60UL);
-    u8g2.drawStr(0, y, line);
+    draw_str_ellipsis(0, y, line, 128);
 }
 
 static void draw_clock(uint32_t utc)
@@ -326,7 +402,8 @@ static void draw_clock(uint32_t utc)
     format_time(utc, date_str, sizeof(date_str), time_str, sizeof(time_str));
     u8g2.setFont(u8g2_font_5x7_tr);
     u8g2.drawStr(0, 7, date_str);
-    draw_charge_icon(108, 0);
+    draw_ble_icon(STATUS_BLE_X, 0);
+    draw_battery_icon(STATUS_BATTERY_X, 0, true);
 
     u8g2.setFont(u8g2_font_logisoso22_tn);
     int tw = u8g2.getStrWidth(time_str);
@@ -334,10 +411,9 @@ static void draw_clock(uint32_t utc)
 
     u8g2.setFont(u8g2_font_6x12_tr);
     draw_str_ellipsis(0, 60, _user, 80);
-    if (fp_system_ready())
-        u8g2.drawStr(90, 60, "FP");
-    else
-        u8g2.drawStr(90, 60, "—");
+    /* A real glyph, struck through when absent, in place of "FP" / "-" text. */
+    draw_icon_state(112, 50, icon_fingerprint_bits, ICON_FINGERPRINT_W,
+                    ICON_FINGERPRINT_H, fp_system_ready());
 }
 
 static void draw_home(uint32_t utc)
@@ -346,34 +422,35 @@ static void draw_home(uint32_t utc)
     if (card == 1) {
         /* Quick PIV PIN Card */
         draw_title("Quick PIV Login");
+        draw_icon_state(0, 19, icon_lock_bits, ICON_LOCK_W, ICON_LOCK_H, true);
         u8g2.setFont(u8g2_font_6x12_tr);
-        u8g2.drawStr(0, 24, "PIN: 123456");
+        u8g2.drawStr(16, 28, "PIN  123456");
         u8g2.setFont(u8g2_font_5x7_tr);
-        u8g2.drawStr(0, 36, "Slot 9A • NIST PIV");
+        u8g2.drawStr(16, 38, "Slot 9A - NIST PIV");
 #if CRYPTICK_BLE_FIDO
-        if (ble_hid_keyboard_is_connected()) {
+        bool hidc = ble_hid_keyboard_is_connected();
+        if (hidc) {
             u8g2.drawBox(0, 41, 128, 11);
             u8g2.setDrawColor(0);
-            u8g2.drawStr(4, 49, "[CLICK OK] Auto-Type PIN");
+            u8g2.drawStr(4, 49, "[OK] Auto-type PIN");
             u8g2.setDrawColor(1);
-            u8g2.drawStr(0, 61, "BLE: Connected to Mac");
         } else {
             u8g2.drawFrame(0, 41, 128, 11);
-            u8g2.drawStr(4, 49, "[CLICK OK] Auto-Type PIN");
-            u8g2.drawStr(0, 61, "BLE: Offline (Connect)");
+            u8g2.drawStr(4, 49, "[OK] Auto-type PIN");
         }
+        draw_icon_state(0, 52, icon_ble_bits, ICON_BLE_W, ICON_BLE_H, hidc);
+        draw_str_ellipsis(15, 61, hidc ? "Connected" : "Offline - pair to use", 113);
 #else
-        u8g2.drawStr(0, 50, "[CLICK OK] Type PIN");
+        u8g2.drawStr(0, 50, "[OK] Type PIN");
 #endif
     } else if (card == 2) {
         /* Quick TOTP Card */
         draw_status_bar(utc);
         if (!_creds || _creds->empty()) {
-            draw_title("Quick TOTP");
             u8g2.setFont(u8g2_font_6x12_tr);
-            u8g2.drawStr(0, 38, "No TOTP accounts");
+            u8g2.drawStr(0, 30, "No TOTP accounts");
             u8g2.setFont(u8g2_font_5x7_tr);
-            u8g2.drawStr(0, 52, "Add via Extension");
+            u8g2.drawStr(0, 44, "Add via Extension");
         } else {
             int idx = nav_system_account_index();
             if (idx < 0 || idx >= (int)_creds->size()) idx = 0;
@@ -392,7 +469,7 @@ static void draw_home(uint32_t utc)
             u8g2.drawStr((128 - cw) / 2, 46, code.c_str());
 
             u8g2.setFont(u8g2_font_5x7_tr);
-            u8g2.drawStr(0, 58, "[CLICK OK] Type Code");
+            u8g2.drawStr(0, 58, "[OK] Type code");
             int rem = 30 - (int)(utc % 30);
             char rem_s[12];
             snprintf(rem_s, sizeof(rem_s), "%02ds", rem);
@@ -453,10 +530,21 @@ static void draw_totp(uint32_t utc)
     u8g2.drawBox(0, 60, barW, 3);
 }
 
-static void draw_message(const char *t1, const char *t2)
+/**
+ * Generic two-line message screen. `icon`, when given, is centered above
+ * the text (used for the fingerprint prompt and the auth-error warning) —
+ * optional and defaulted so the plain BLE-pairing / clear-confirm callers
+ * below are unaffected.
+ */
+static void draw_message(const char *t1, const char *t2,
+                         const unsigned char *icon = nullptr,
+                         int icon_w = 0, int icon_h = 0)
 {
     if (!t1) t1 = "";
-    draw_charge_icon(108, 0);
+    draw_ble_icon(STATUS_BLE_X, 0);
+    draw_battery_icon(STATUS_BATTERY_X, 0, false);
+    if (icon)
+        u8g2.drawXBMP((128 - icon_w) / 2, 2, icon_w, icon_h, icon);
     u8g2.setFont(u8g2_font_6x12_tr);
     int w1 = u8g2.getStrWidth(t1);
     if (w1 > 120)
@@ -496,22 +584,21 @@ static void draw_enroll(void)
 static void draw_piv_pin(void)
 {
     draw_title("PIV Login PIN");
+    draw_icon_state(0, 18, icon_lock_bits, ICON_LOCK_W, ICON_LOCK_H, true);
     u8g2.setFont(u8g2_font_6x12_tr);
-    u8g2.drawStr(0, 24, "PIN: 123456");
+    u8g2.drawStr(16, 27, "PIN  123456");
+
     u8g2.setFont(u8g2_font_5x7_tr);
 #if CRYPTICK_BLE_FIDO
-    if (ble_hid_keyboard_is_connected()) {
-        u8g2.drawStr(0, 38, "BLE: Connected to Mac");
-        u8g2.drawStr(0, 48, "Press [OK] to Auto-type");
-        u8g2.drawStr(0, 58, "PIN into Lock Screen");
-    } else {
-        u8g2.drawStr(0, 38, "BLE: Not Connected");
-        u8g2.drawStr(0, 48, "Pair Mac Bluetooth or");
-        u8g2.drawStr(0, 58, "type manually: 123456");
-    }
+    bool hidc = ble_hid_keyboard_is_connected();
+    draw_icon_state(0, 36, icon_ble_bits, ICON_BLE_W, ICON_BLE_H, hidc);
+    draw_str_ellipsis(15, 44, hidc ? "Connected" : "Offline", 113);
+    draw_str_ellipsis(0, 58,
+                      hidc ? "[OK] Auto-type into host" : "Pair, or type 123456 by hand",
+                      128);
 #else
-    u8g2.drawStr(0, 40, "NIST Default (Slot 9A)");
-    u8g2.drawStr(0, 52, "Enter manually on Mac");
+    u8g2.drawStr(0, 40, "NIST default - Slot 9A");
+    u8g2.drawStr(0, 54, "Enter manually on host");
 #endif
 }
 
@@ -564,11 +651,11 @@ static void draw_fido_processing(void)
             u8g2.drawStr((128 - lw) / 2, 32, label);
 
         u8g2.setFont(u8g2_font_5x7_tr);
-        const char *sub = "Working… Please wait";
+        const char *sub = "Working... please wait";
         int sw = u8g2.getStrWidth(sub);
         u8g2.drawStr((128 - sw) / 2, 48, sub);
     } else {
-        draw_message("Working…", "Wait");
+        draw_message("Working...", "Please wait");
     }
 }
 
@@ -662,12 +749,14 @@ static void render(void)
         draw_settings();
         break;
     case UI_AUTH_PROMPT:
-        draw_message("Place finger", "to unlock");
+        draw_message("Place finger", "to unlock", icon_fingerprint_bits,
+                     ICON_FINGERPRINT_W, ICON_FINGERPRINT_H);
         break;
     case UI_AUTH_ERROR: {
         const char *m = nav_system_enroll_message();
         draw_message(m && m[0] ? m : "Fingerprint",
-                     m && m[0] && strcmp(m, "No match") == 0 ? "try again" : "");
+                     m && m[0] && strcmp(m, "No match") == 0 ? "try again" : "",
+                     icon_warning_bits, ICON_WARNING_W, ICON_WARNING_H);
         break;
     }
     case UI_FP_ENROLL:
