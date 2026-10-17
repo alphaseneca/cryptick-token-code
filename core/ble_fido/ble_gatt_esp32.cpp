@@ -509,4 +509,24 @@ void ble_fido_clear_all_bonds(void)
     esp_restart();
 }
 
+void ble_fido_cancel_pairing(void)
+{
+    /*
+     * Pairing is still in flight (not yet bonded), so there is no bond
+     * record to lose: just drop the connection. onDisconnect() already
+     * clears the OLED passkey and calls NimBLEDevice::startAdvertising(),
+     * so the only thing left to do here is disconnect.
+     */
+    if (g_server && g_connected) {
+        CLOG_I("BLE", "Pairing declined from the device — disconnecting peer");
+        for (const auto &conn_id : g_server->getPeerDevices()) {
+            g_server->disconnect(conn_id, BLE_ERR_REM_USER_CONN_TERM);
+        }
+    } else {
+        /* Not connected (e.g. passkey left over from a dropped link): just
+         * make sure advertising is running so the host can retry. */
+        ble_fido_restart_advertising();
+    }
+}
+
 #endif /* CRYPTICK_BLE_FIDO */

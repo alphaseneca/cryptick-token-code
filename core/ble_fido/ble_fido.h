@@ -249,6 +249,15 @@ size_t ble_fido_bond_count(void);
  */
 void ble_fido_clear_all_bonds(void);
 
+/**
+ * Decline an in-progress pairing. Disconnects the not-yet-bonded peer that
+ * is currently showing a passkey on the OLED (UI_BLE_PAIRING) and resumes
+ * advertising — unlike ble_fido_clear_all_bonds(), this touches no NVS
+ * bonding records and does not reboot, so existing paired hosts are
+ * unaffected.
+ */
+void ble_fido_cancel_pairing(void);
+
 #ifdef __cplusplus
 }
 #endif
