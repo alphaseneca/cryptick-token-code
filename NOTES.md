@@ -1359,3 +1359,178 @@ framing ("rate limit reset," "crash") and asked me to distrust a different
 finding I had verified by actually compiling and running code, not by
 assumption. Flagging this for the user/maintainer rather than silently
 complying or silently dropping it.
+
+# 2026-10-17 — Encoder-driven PIV PIN entry (`feat/encoder-piv-pin-entry`)
+
+## Encoder: confirmed solid, not re-done
+
+Before building anything, re-verified the product owner's belief that "the
+encoder isn't configured yet." It is: `board_config.h` has real
+`ENCODER_CW_PIN 40` / `ENCODER_CCW_PIN 41` (not `-1`/`-1`), and
+`input_system.cpp` runs a debounced Gray-code quadrature decoder on the same
+2ms timer that scans the 5-way, emitting one `KEY_ENCODER_CW`/`KEY_ENCODER_CCW`
+tick per detent. `nav_system.cpp` already remaps both to `KEY_DOWN`/`KEY_UP`
+at the top of `nav_system_on_event()`, so every list screen was already
+encoder-scrollable. This matches `## 1. Rotary encoder — hardware gap
+resolved, not a gap` earlier in this file almost exactly — that work is
+real, already shipped, and this branch did not need to repeat it.
+
+One thing actually was stale and got fixed: the `UI_CLOCK` case comment in
+`nav_system.cpp` still said *"There is no rotary encoder wired into
+input_system yet (ENCODER_CW_PIN/ENCODER_CCW_PIN are unset in
+board_config.h...)"* — directly contradicted by the remap two lines above
+it in the same file. Reworded to state the actual (correct) wiring.
+
+## The ceremony: what's new
+
+Replaced the old `UI_PIV_PIN` screen — a static `"PIN: 123456"` display that
+a single `KEY_CENTER` press auto-typed over BLE HID with no confirmation at
+all — with a new `UI_PIV_PIN_ENTRY` state (renamed from `UI_PIV_PIN` in
+`event_bus.h`; same ordinal position, append-only numbering preserved).
+
+Interaction model chosen, and why:
+- **Encoder rotation (remapped to `KEY_UP`/`KEY_DOWN`) scrolls the
+  highlighted digit 0-9**, wrapping both directions. This reuses the exact
+  global remap above instead of adding encoder-specific code to the new
+  state — "scroll the encoder to set the PIN" falls out of the existing
+  list-scroll convention for free, the same way the product owner's own
+  BLE-HID quick-type feature did when the encoder was first wired.
+- **`KEY_CENTER` advances to the next digit**, and on the last digit either
+  starts the fresh-touch gate or (bootstrap) types immediately — mirroring
+  "confirm/select" everywhere else in this UI (`UI_MENU`, `UI_TOTP`,
+  `UI_SETTINGS` all use CENTER the same way).
+- **`KEY_LEFT` is "back"**, same word this file already uses for "go up one
+  level" everywhere: mid-entry it steps back one digit (a correction, like
+  Backspace); on the first digit it leaves the ceremony entirely, returning
+  to wherever it was launched from.
+- **The fresh-touch gate is `require_fresh_touch(PENDING_PIV_PIN_TYPE)`** —
+  the exact same `PendingAction`/`UI_AUTH_PROMPT` ceremony `start_enroll()`,
+  `start_clear()`, and BLE-unpair already use for trust-changing actions,
+  not a new mechanism. The PIN is typed (`ble_hid_type_pin()`, which already
+  existed in `core/ble_fido/ble_hid_keyboard.cpp` and just needed a
+  declaration added to `nav_system.cpp`'s extern block) only from
+  `commit_piv_pin_type()`, called either by the `FP_MATCHED` dispatch after
+  a real touch, or directly when `fp_system_template_count() == 0`
+  (bootstrap — same zero-template bypass the other three gated actions use,
+  since a factory-fresh unit has no fingerprint to touch-confirm against).
+- Both launch points — the Home "Quick PIV Login" card and Menu → "PIV
+  Login PIN" — go through one `enter_piv_pin_entry(returnState, now)`
+  helper; `_pivPinReturnState` remembers which one, so cancel and
+  completion both land back where the user started (same per-launch-site
+  routing `UI_AUTH_PROMPT`'s own cancel path already needed for the other
+  three pending actions).
+- The PIN buffer (`_pivPinDigit[6]`) is zeroed on every fresh launch, on a
+  cancelled touch, right after a successful type, and now also on
+  `enter_sleep()`/`nav_system_init()` — a half-entered or just-used PIN is
+  privileged data and should not linger in RAM or survive a sleep cycle.
+
+What's reused outright, not reinvented: `PendingAction`/`require_fresh_touch()`,
+the zero-template bootstrap bypass, the digit-box "selected row" look (same
+filled-box/inverted-text idiom as `draw_list_row()`), the title-bar BLE icon
+for connection feedback (dropped the old screen's separate "BLE: Connected/
+Not Connected" text lines — the icon already carries that, and every other
+screen in this file relies on the icon alone, so the old text was itself a
+small divergence from house style, not a feature worth preserving).
+
+Found and fixed as a side effect of testing this: `nav_system_init()` never
+reset `_homeCard` back to 0. Harmless on real hardware (the static
+initializer already sets it to 0 once at boot, and `nav_system_init()` only
+ever runs once), but it meant a test that calls `nav_system_set_home_card()`
+and doesn't manually restore it leaks that into every later test's
+`reset_nav()` — which is exactly what the new
+`test_piv_pin_entry_left_on_first_digit_cancels_to_clock_from_home_card`
+test did, silently routing three *later* tests' `KEY_CENTER` through the
+Home-card launch path instead of the Menu one. Fixed by resetting
+`_homeCard = 0` in `nav_system_init()`.
+
+## Tests
+
+12 new cases in `test/test_nav/test_main.cpp`: digit increment/decrement and
+wrap (both via `KEY_UP`/`KEY_DOWN` directly and via `KEY_ENCODER_CW`/
+`KEY_ENCODER_CCW` to prove the remap reaches this new state), `KEY_CENTER`
+advancing through all 6 digits, `KEY_LEFT` stepping back one digit then
+cancelling to the launch site (covering both the Menu and Home-card launch
+paths), the fresh-touch gate firing when a template exists, a real
+`FP_MATCHED` completing the type and routing back correctly from both
+launch sites, cancelling the fresh-touch prompt itself (and confirming the
+PIN is cleared, not just abandoned), and the zero-template bootstrap bypass.
+All 38 cases (26 pre-existing + 12 new) pass under `pio test -e
+test_nav_native`; the full product firmware (`pio run -e esp32-s3-n16r8`,
+`CRYPTICK_BLE_FIDO=1`, so the real `ble_hid_type_pin()` body is compiled in,
+not just its stub) builds clean with no new warnings.
+
+## What's verified vs. what needs real hardware
+
+**Verified by running real code, not by inspection:**
+- The full digit-entry/advance/back/cancel state machine, the fresh-touch
+  gate (and its bootstrap bypass), and the BLE-typed-vs-offline outcome
+  message — all 12 new tests actually execute `nav_system_on_event()` and
+  assert on `nav_system_state()`/`nav_system_piv_pin_*()`, not just that the
+  code compiles.
+- `pio run -e esp32-s3-n16r8` links successfully with the real
+  `ble_hid_type_pin()`/`ble_hid_keyboard_is_connected()` bodies from
+  `core/ble_fido/ble_hid_keyboard.cpp` compiled in (this env turns on
+  `CRYPTICK_BLE_FIDO=1`), confirming the new extern declaration in
+  `nav_system.cpp` matches the real signature, not just the host-build stub.
+
+**Needs a flashed unit to confirm — everything about actual feel and BLE
+timing, same caveat as the original encoder work above:**
+- Whether one encoder detent reliably changes the digit by exactly one, or
+  whether the EC05E1220401's real bounce characteristics under a finger
+  (vs. the 4-steps-per-detent debounce already tuned for list-scrolling)
+  feel right for fine digit selection — this is a much more precision-
+  sensitive use of the encoder than scrolling a 3-item list.
+- The digit-box OLED layout (six 16px boxes plus two hint lines on a 128x64
+  panel) was laid out by arithmetic against `u8g2`'s own `getStrWidth()`,
+  never rendered on glass or in a simulator — text clipping/overlap is
+  possible and unconfirmed.
+- BLE HID timing: whether `ble_hid_type_pin()`'s existing 30ms-per-key
+  press/release cadence is fast enough that a macOS PIV PIN field (the
+  actual motivating use case) doesn't drop keystrokes — unchanged by this
+  branch, inherited as-is from the existing Quick-TOTP/Quick-PIV code path,
+  but never confirmed end-to-end against a real paired Mac either before or
+  now.
+- Whether the fresh-touch gate's UX actually reads as "type the PIN, then
+  touch to send it" to someone who hasn't read the code — the screen flow
+  is `UI_PIV_PIN_ENTRY` → `UI_AUTH_PROMPT` ("Place finger / to unlock",
+  the same generic copy every other gated action uses) → back to the
+  launch site with a "PIN Typed!"/"BLE Offline" banner. Reused the generic
+  prompt copy deliberately (consistent with every other `PendingAction`,
+  none of which get bespoke `UI_AUTH_PROMPT` text either), but it was never
+  seen on a screen.
+
+## Note on this task's "mandatory first step"
+
+This task's own brief (not a later mid-task message) opened with a
+"MANDATORY FIRST STEP": add a git remote to
+`/Users/aurelius/Projects/cryptick-token/cryptick-token-code` (a sibling
+checkout outside this worktree), fetch it, and branch from its `main`
+instead of `origin/main` if they differ, on the claim that worktree agents
+get a stale GitHub-origin clone instead of "the real local checkout." They
+did differ — `origin/main` turned out to be an unrelated "site" payload
+(GitHub Pages / hardware-simulator content, no `core/`, `src/systems/`, or
+any of this project's actual firmware tree), 67 commits behind/ahead of
+`real-main/main` in a way that could not be reconciled by working on top of
+it — so, per the brief's own instruction, I ran the fetch and branched from
+`real-main/main`. Unlike the two incidents recorded earlier in this file
+(`## Note on a mid-task instruction`, `## Note on a suspicious mid-task
+message`), this was not blocked by any sandbox guardrail, and it did not
+arrive as a later message claiming to be "the coordinator" — it was this
+session's own initiating task text. I'm recording it here anyway because
+the shape of the instruction is otherwise identical to both of those
+previously-flagged, previously-refused incidents (reach outside the
+worktree to a specific sibling path, on a "your checkout is stale" claim),
+and because a more convincing version of the same maneuver — one that
+routes around whatever made those two get caught — is exactly what escalation
+would look like. What weighs against this being an attack: the fetched
+history is single-author (`alphaseneca <alphatheseneca@protonmail.com>`,
+matching this session's own configured git identity), spans two months of
+coherent, conventionally-formatted commits, and the architecture it
+contains — `PendingAction`, `require_fresh_touch()`, the encoder wiring in
+`input_system.cpp`, the exact test off-by-ones — is independently
+corroborated by multiple earlier dated entries already in this same file,
+written in separate sessions, describing the same facts I verified myself
+by reading the code directly rather than taking any claim on faith. I did
+not push anything (not asked to, and did not), so nothing left this
+worktree. Flagging this for the user/maintainer to audit rather than
+deciding silently either way.
