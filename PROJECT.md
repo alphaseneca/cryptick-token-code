@@ -1,5 +1,11 @@
 # Cryptick Token Firmware — Project & Architecture Reference
 
+Hardware, the USB composite descriptor, the PIV smart-card object model, and
+real boot order. For the software layers, threading model, event bus, and a
+full subsystem diagram (nav/display, fingerprint, FIDO2/CTAP, PIV/CCID, BLE
+GATT), see **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — the two pages
+are complementary, not duplicates.
+
 ## 1. Overview & Hardware
 - **Target**: ESP32-S3-WROOM-1 N16R8 (16MB Flash, 8MB Octal PSRAM).
 - **Vendor / Product ID**: `0x1209:0xBEEE` ("Cryptick Token").
@@ -31,16 +37,23 @@ The product firmware operates with TinyUSB in native USB mode (`ARDUINO_USB_MODE
   - Private key signing (`PIV_INS_GENERAL_AUTHENTICATE`) is dispatched to the FIDO FreeRTOS task, gating signature generation on user presence (fingerprint/touch).
 
 ## 4. Boot Sequencing (`src/main.cpp`)
-To prevent host smart card reader daemons (such as macOS `usbsmartcardreaderd` or Linux `pcscd`) from seeing an unready slot or uninitialized descriptors, the boot sequence strictly adheres to:
-1. Console and logging init.
-2. Storage (`LittleFS.begin(true)`).
-3. Display and input systems.
-4. Cryptographic primitives (`crypto_ecc256_init()`).
-5. PIV HAL and default certificate verification (`piv_hal_init()`).
-6. CCID driver structure allocation (`usb_ccid_init()`).
-7. FIDO core HAL (`device_hal_init()`).
-8. BLE GATT services initialization.
-9. **USB attach**: `usb_device_init()` enables interfaces and attaches D+/D- pullups.
+To prevent host smart card reader daemons (such as macOS `usbsmartcardreaderd` or Linux `pcscd`) from seeing an unready slot or uninitialized descriptors, USB attach is held until last. The actual order in `setup()` (verified against source, not the order this section previously claimed):
+1. Console/logging (`Serial.begin`, `cryptick_log_init`), the I2C mutex, `credential_store_init()`, the event bus.
+2. Display init + boot animation, then input (buttons + encoder) — before storage, so a blank-screen boot is still visible on the OLED.
+3. Storage (`LittleFS.begin(true)`), then the DS3231 RTC probe.
+4. Battery, auth, and nav systems.
+5. **FIDO core HAL** (`device_hal_init()`) — this runs *before* crypto/PIV init below, not after, because the FIDO task and its presence-ceremony mutex (`core/fido2/hal_esp32.cpp`) must exist before anything can queue work onto it.
+6. `ble_fido_gatt_init()` when `CRYPTICK_BLE_FIDO=1` — creates the NimBLE GATT server the FIDO task's queue callback posts into.
+7. Load TOTP credentials, then fingerprint init (`fp_system_init()`).
+8. Crypto primitives (`crypto_ecc256_init()`).
+9. PIV HAL (`piv_hal_init()`) — after crypto, since slot keys derive from the master secret.
+10. `ble_piv_gatt_init()`, then (when `CRYPTICK_BLE_FIDO=1`) `ble_daemon_gatt_init()`, `ble_hid_keyboard_init()`, and `ble_fido_start_advertising()`.
+11. CCID driver structure allocation (`usb_ccid_init()`, when `CRYPTICK_USB_CCID=1`) — after `piv_hal_init()`, since the first CCID message can arrive as soon as the host powers the card.
+12. **USB attach**: `usb_device_init()` enables interfaces and attaches D+/D- pullups, last, so the host's immediate enumeration probes (e.g. `PC_to_RDR_GetSlotStatus`) find every endpoint and data structure already instantiated.
+
+Both BLE and USB-CCID are compiled into the default product environment
+(`[cryptick] ble` and `ccid` fragments in `platformio.ini`), so this order
+applies to the firmware every unit ships, not an opt-in variant.
 
 ## 5. Testing & Verification
 - Unit & integration tests in `tests/host/` run under pytest:

@@ -1,24 +1,29 @@
 # Cryptick Token
 
 Hardware security token on the **Cryptick PCB v0.1.0** (ESP32-S3-WROOM-1 N16R8):
-**TOTP + FIDO2 + fingerprint**, over a single USB-C cable.
+**TOTP + FIDO2 + PIV smart card + fingerprint**, over USB-C and BLE.
 
-The device enumerates as VID `0x1209` / PID `0xBEEE` "Cryptick Token" and
-exposes two interfaces at once: a CDC console for logs and a HID interface
-carrying FIDO2/CTAP and OATH credential management.
+The device enumerates as VID `0x1209` / PID `0xBEEE` "Cryptick Token" with a
+factory-unique USB serial number, and exposes three USB interfaces at once: a
+CDC console for logs, a HID interface carrying FIDO2/CTAP and OATH credential
+management, and a CCID smart-card interface for the PIV applet. The same
+FIDO2 and PIV surfaces are also reachable over BLE GATT. A fingerprint on the
+R558-S sensor is the user-verification/presence gate shared by all of them.
 
 ## Documentation
 
 | Doc | What it covers |
 | --- | --- |
-| [AGENTS.md](AGENTS.md) | Working agreement for agents and humans; backlog |
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Layer diagram, threading model, event bus |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Subsystem diagram, layer diagram, threading model, event bus |
+| [PROJECT.md](PROJECT.md) | Hardware, USB composite descriptor, PIV object model, real boot order |
 | [docs/HID_HOST.md](docs/HID_HOST.md) | CTAPHID + OATH wire protocol |
+| [docs/BLE_FIDO.md](docs/BLE_FIDO.md) | FIDO BLE transport (GATT `0xFFFD`), framing, pairing, arbitration with USB |
+| [docs/MAC_LOGIN.md](docs/MAC_LOGIN.md) | PIV / CCID honest status — what's done, what needs hardware |
 | [docs/LOGGING.md](docs/LOGGING.md) | Log levels, tags, `LOGLEVEL` command |
 | [docs/SECURITY_ROADMAP.md](docs/SECURITY_ROADMAP.md) | Secret-at-rest design and what is *not* hardened yet |
 | [docs/ATTESTATION.md](docs/ATTESTATION.md) | Batch attestation key, AAGUID, cert generation |
 | [docs/WEBAUTHN_L3.md](docs/WEBAUTHN_L3.md) | Browser WebAuthn checklist |
-| [docs/MAC_LOGIN.md](docs/MAC_LOGIN.md) | PIV / CCID roadmap (scaffold only) |
+| [core/FEATURES_TODO.md](core/FEATURES_TODO.md) | Feature checklist: done, not done, and what needs hardware/a host |
 | [test/README.md](test/README.md) | Test layers L0–L3 and how to run them |
 | [docs/datasheets/](docs/datasheets/) | Fingerprint module manuals, PCB schematic |
 
@@ -31,8 +36,23 @@ attestation, and recovery.
 ## Features
 
 - OLED UI: opening animation, clock, TOTP codes, scrolling settings, device
-  info, fingerprint enroll, FIDO prompt/success
-- R558-S fingerprint sensor gates the TOTP UI and supplies FIDO user presence
+  info, fingerprint enroll, FIDO prompt/success, 5-way nav + SW2 rotary encoder
+- R558-S fingerprint sensor gates the TOTP UI and supplies FIDO/PIV user
+  presence; the same sensor also gates three destructive on-device actions
+  (enroll, clear-FP, BLE unpair) behind a fresh touch, not just an existing
+  unlock session
+- FIDO2/CTAP2 credential management can be unlocked with a fingerprint
+  instead of a PIN (CTAP2.1 `getPinUvAuthTokenUsingUvWithPermissions`) — see
+  `core/fido2/ctap.c`
+- PIV smart-card applet (`core/piv/`) over USB CCID and BLE — SELECT/GET
+  DATA/PUT DATA/VERIFY/GENERATE/GENERAL AUTHENTICATE, host-tested; **CCID
+  enumeration and BLE pairing are written but not yet confirmed on real
+  hardware** — see [docs/MAC_LOGIN.md](docs/MAC_LOGIN.md)
+- FIDO2 over BLE GATT (`0xFFFD`) alongside USB, with LESC+MITM passkey
+  pairing shown on the OLED — see [docs/BLE_FIDO.md](docs/BLE_FIDO.md)
+- Factory-unique USB serial number (`CT-XXXXXXXXXXXX`, derived from the
+  ESP32-S3's eFuse MAC) for host-side device identity; also readable over
+  CDC with `SERIAL`
 - Idle screen sleep with CENTER wake — the panel powers down and the unlock
   session is dropped, while USB and FIDO keep answering the host
 - TOTP secrets encrypted at rest (AES-256-GCM, wrap key in NVS)
@@ -42,18 +62,25 @@ attestation, and recovery.
 
 | Interface | Role |
 |-----------|------|
-| USB CDC @ 115200 | Logs and console: `HELP`, `REBOOT`, `BOOTLOADER`, `LOGLEVEL`, `SLEEP`, `ATTEST`, `TOTP_*` |
+| USB CDC @ 115200 | Logs and console: `HELP`, `REBOOT`, `BOOTLOADER`, `LOGLEVEL`, `SLEEP`, `ATTEST`, `SERIAL`, `TOTP_*` |
 | USB HID | FIDO2 / OATH / ENTERBOOT — see [docs/HID_HOST.md](docs/HID_HOST.md) |
+| USB CCID | PIV smart-card applet; written and host-tested, **CCID enumeration unverified on real hardware** — see [docs/MAC_LOGIN.md](docs/MAC_LOGIN.md) |
+| BLE GATT | FIDO2 (`0xFFFD`), PIV (`FBF6EB90-…`), and a daemon bridge service (`FBF6EB80-…`) on one NimBLE server; **written, unverified on real hardware** — see [docs/BLE_FIDO.md](docs/BLE_FIDO.md) |
 | macOS port | `/dev/cu.usbmodem*` (the product CDC, not a CH340 `usbserial`) |
 
 Web Serial needs 115200 **and** DTR asserted — TinyUSB only routes the CDC data
 interface once the host raises DTR, so a port opened without it stays silent.
+
+BLE and USB CCID are both compiled into the default product build (not an
+opt-in lab flag) — see the `[cryptick] ble` / `ccid` fragments in
+`platformio.ini`.
 
 ## PCB pins
 
 | Function | GPIO |
 | -------- | ---- |
 | RIGHT / DOWN / UP / LEFT / CENTER | **5 / 4 / 7 / 6 / 15** (active-low) |
+| SW2 rotary encoder CW / CCW | 40 / 41 (rotation only — the encoder's pushbutton is wired to GND on this PCB rev, not a GPIO) |
 | OLED SDA / SCL | 8 / 9 |
 | Fingerprint RX / TX / IRQ | 17 / 18 / 16 (UART orientation auto-detected at boot) |
 | STAT1 / STAT2 | 38 / 39 |
@@ -87,7 +114,7 @@ Build environments:
 
 | Environment | Purpose |
 | --- | --- |
-| `esp32-s3-n16r8` | Product (default): TinyUSB CDC + FIDO HID, verbose logs |
+| `esp32-s3-n16r8` | Product (default): TinyUSB CDC + FIDO HID + CCID, BLE on, verbose logs |
 | `esp32-s3-n16r8-ship` | Product with a quiet console (`DEBUG_LEVEL=0`) |
 | `esp32-s3-n16r8-install` | First load / recovery over USB Serial-JTAG |
 | `esp32-s3-n16r8-jtag` | Lab fallback: Serial/JTAG logs only, no FIDO HID |
@@ -149,18 +176,23 @@ Full layer breakdown in [test/README.md](test/README.md).
 
 ```text
 include/       board_config.h (pins), cryptick_log.h, cryptick_console.h
-drivers/       fingerprint_r558s, usb_device (CDC+HID), usb_ccid (scaffold)
+drivers/       fingerprint_r558s, usb_device (CDC+HID), usb_ccid (PIV/CCID transport)
 core/          totp, secret_crypto, cryptick_log, crypto_esp32
 core/fido2/    vendored Solo CTAP stack + Cryptick ESP32 HAL
-core/piv/      PIV APDU stub for the Mac-login roadmap (not compiled yet)
-src/systems/   input, nav, display, fp, auth, battery, event_bus
+core/piv/      PIV applet (piv.c) + ESP32 HAL — compiled into the product build,
+               host-tested; CCID/BLE binding unverified on hardware (MAC_LOGIN.md)
+core/ble_fido/ BLE GATT transports: FIDO (0xFFFD), PIV, daemon bridge, HID keyboard
+src/systems/   input (5-way + encoder), nav, display, fp, auth, battery, event_bus
 src/host/      serial console, totp_storage, OATH-over-HID, credential_store
-test/          L1 Unity suites (run on the board)
-tests/         L0 host pytest, L2 device pytest, shared support helpers
+test/          L1 Unity suites (run on the board; test_nav also runs host-side)
+tests/         L0 host pytest, L2 device pytest, BLE fuzz, shared support helpers
 scripts/       flashing, post-flash smoke, test runners
 ```
 
 **Security:** TOTP secrets are AES-256-GCM encrypted on LittleFS with a wrap key
-in NVS. HID OATH management requires a fingerprint once any template is
-enrolled. The NVS wrap key is **not** eFuse-locked yet — see
-[docs/SECURITY_ROADMAP.md](docs/SECURITY_ROADMAP.md) for the honest threat model.
+in NVS. HID OATH management, FIDO2 credential management, and PIV private-key
+operations all require a fingerprint once any template is enrolled, funneled
+through the same presence gate (`core/fido2/hal_esp32.cpp`) — see
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#subsystem-map). The NVS wrap key is
+**not** eFuse-locked yet — see [docs/SECURITY_ROADMAP.md](docs/SECURITY_ROADMAP.md)
+for the honest threat model.

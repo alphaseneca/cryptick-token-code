@@ -1,8 +1,116 @@
 # Architecture — Cryptick Token (ESP32-S3 PCB v0.1.0)
 
-See **[AGENTS.md](../AGENTS.md)** for the product goal, backlog, and agent rules.
+Software layers, threading model, and the firmware-wide event bus. For the
+hardware/USB-descriptor/boot-sequence view (what gets initialized, in what
+order, and why), see **[PROJECT.md](../PROJECT.md)**. For the full wire
+protocols of the two BLE-adjacent and PIV subsystems sketched below, see
+**[BLE_FIDO.md](BLE_FIDO.md)** and **[MAC_LOGIN.md](MAC_LOGIN.md)** — this
+page cross-references them rather than repeating their detail.
 
-## Layers
+## Subsystem map
+
+Every box below is a real file or module; every arrow is a real call or
+queue hand-off, not an aspirational one. `core/fido2/ctap_request()` has
+exactly one caller — the FIDO FreeRTOS task on core 0 — and USB, BLE-FIDO,
+the BLE daemon bridge, and (via `piv_handle_apdu()`) USB-CCID and BLE-PIV are
+all **producers** into that one consumer, never second consumers of their
+own. See [Threading model](#threading-model) below for why that matters.
+
+```mermaid
+flowchart TD
+    USBHost(["USB host"])
+    BLEPeer(["BLE central"])
+
+    subgraph USBT["USB transport — drivers/usb_device.cpp, drivers/usb_ccid.cpp"]
+        CDC["CDC console<br/>src/host/serial_comm.cpp"]
+        HID["FIDO HID (CTAPHID)<br/>core/fido2/ctaphid.c"]
+        CCIDUSB["CCID bulk<br/>usb_ccid.cpp + ccid_proto.c"]
+    end
+
+    subgraph BLET["BLE GATT transport — core/ble_fido/ble_gatt_esp32.cpp (one NimBLE server)"]
+        BFIDO["FIDO service 0xFFFD<br/>ble_fido.c"]
+        BDaemon["Daemon Bridge FBF6EB80…<br/>ble_daemon_gatt_esp32.cpp"]
+        BPIV["PIV service FBF6EB90…<br/>ble_piv_gatt_esp32.cpp"]
+    end
+
+    subgraph OATHG["OATH over HID — src/host/"]
+        OATHHID["cryptick_oath_hid.cpp"]
+        OATHOps["oath_ops.cpp"]
+        TOTPStore["totp_storage.cpp /<br/>credential_store.h"]
+    end
+
+    subgraph FIDOCORE["FIDO2 / CTAP core — core/fido2/ (FIDO task, core 0)"]
+        CTAP["ctap_request() — ctap.c"]
+        U2F["u2f_request() — u2f.c"]
+    end
+
+    subgraph PIVA["PIV / CCID applet — core/piv/"]
+        PIVC["piv_handle_apdu() — piv.c"]
+        PIVHal["piv_hal_esp32.cpp"]
+    end
+
+    Presence{{"ctap_user_presence_test_ex()<br/>core/fido2/hal_esp32.cpp<br/>_up_mutex: one ceremony at a time"}}
+
+    subgraph UIN["Nav / display — src/systems/ (Arduino loop, core 1)"]
+        InputSys["input_system.cpp<br/>5-way + SW2 rotary encoder"]
+        EventBus["event_bus.cpp"]
+        Nav["nav_system.cpp<br/>require_fresh_touch()"]
+        Disp["display_system.cpp"]
+    end
+
+    FPSys["fp_system.cpp"]
+    FPDrv["drivers/fingerprint_r558s.cpp<br/>R558-S over UART"]
+
+    USBHost --> CDC
+    USBHost --> HID
+    USBHost --> CCIDUSB
+    BLEPeer --> BFIDO
+    BLEPeer --> BDaemon
+    BLEPeer --> BPIV
+
+    CDC -->|OATH / UNPAIR / SERIAL cmds| OATHOps
+    HID -->|CTAPHID_CBOR, MSG| CTAP
+    HID -->|MSG U2F| U2F
+    HID -->|vendor 0x63| OATHHID
+    OATHHID --> OATHOps
+    OATHOps --> TOTPStore
+    OATHOps -.->|oath_ensure_uv| Presence
+    OATHOps -.->|"CDC path only: drives nav directly<br/>(same loop, no FIDO task hop)"| Nav
+
+    CCIDUSB -->|FIDO task queue| PIVC
+    BFIDO -->|fido_ble_submit_request| CTAP
+    BDaemon -->|daemon_ble_submit_request| CTAP
+    BPIV -->|FIDO task queue| PIVC
+
+    CTAP --> Presence
+    U2F --> Presence
+    PIVC --> PIVHal
+    PIVHal -.->|ctap_user_presence_test| Presence
+
+    Presence --> FPSys
+    Nav -.->|"CMD_FP_MATCH_AUTH — a 2nd,<br/>unserialized ceremony, see note below"| FPSys
+    FPSys --> FPDrv
+
+    InputSys --> EventBus
+    EventBus --> Nav
+    EventBus --> Disp
+    FPSys -->|EVT_FP| EventBus
+    CTAP -.->|"via main.cpp loop():<br/>device_take_ui_label / _fido_ui_request"| Nav
+    Nav -.-> Disp
+```
+
+**The one gap this diagram makes visible:** `nav_system`'s on-device menu
+ceremony (enroll, clear-FP, BLE-unpair — `require_fresh_touch()`) and the
+HAL's `ctap_user_presence_test_ex()` ceremony are two *different* mechanisms
+driving the same single `fp_system` sensor singleton, and nothing serializes
+them against each other the way `_up_mutex` serializes concurrent
+`ctap_user_presence_test_ex()` callers. A CDC `OATH PUT` self-service wait
+(blocks the main loop, polls the sensor directly) could in principle overlap
+a menu ceremony the user triggered a loop iteration earlier, misattributing
+one touch to the other. This is a known, narrow, pre-existing race — not
+fixed here — flagged for whoever owns `fp_system`/`nav_system` next.
+
+## Layers (quick reference)
 
 ```text
 USB host ── CDC console ── src/host/serial_comm
@@ -11,10 +119,13 @@ USB host ── CDC console ── src/host/serial_comm
                         └── src/host/oath_ops ── src/host/totp_storage ── LittleFS
 
 R558-S UART ── drivers/fingerprint_r558s ── src/systems/fp_system
-5-way GPIO  ── input_system ── event_bus ── nav_system ── display_system
+5-way + encoder GPIO ── input_system ── event_bus ── nav_system ── display_system
 BQ25185 STAT ── battery_system ──────────────────────────  display_system
 DS3231 I2C  ── set_synced_utc ── soft clock (+ RTC if present) ── core/totp
 ```
+
+This is the same OATH/TOTP/UI slice as the diagram above, in plain text. For
+PIV/CCID and BLE, see the subsystem map above — this shorthand predates both.
 
 Charge **FULL** is `CHARGE_DONE`: STAT1/STAT2 both high (BQ25185 "charge done") *and* VIN still present. This PCB has no VBUS GPIO, so USB mount stands in for VIN — otherwise HIGH/HIGH is indistinguishable from unplugged sleep, which is why the old 10 s sticky never showed FULL when you plugged in an already-full cell. Unplug clears it back to the idle half-bar.
 
@@ -64,7 +175,9 @@ Rules that follow from this:
   mutex is taken with a zero timeout, so a second ceremony is refused (returns
   `0`, the caller reports a UV failure) rather than parked behind a 29s finger
   wait. Any future transport must feed this same gate rather than adding a
-  second presence flag.
+  second presence flag. This mutex does **not** cover `nav_system`'s own
+  on-device menu ceremony (`require_fresh_touch()`) — see the gap called out
+  under [Subsystem map](#subsystem-map) above.
 
 - The `credentials` lock is recursive because the OATH handlers hold it across
   helpers in `oath_ops` that lock again. Use the `CredentialLock` RAII guard so

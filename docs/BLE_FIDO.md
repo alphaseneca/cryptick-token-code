@@ -45,6 +45,8 @@ wrong gives you state corruption and a user-presence confusion bug.
 | `core/ble_fido/ble_fido.h` | Wire format, UUIDs, commands, error codes, bounds |
 | `core/ble_fido/ble_fido.c` | Reassembly and response fragmentation. Freestanding C — no NimBLE, no FreeRTOS |
 | `core/ble_fido/ble_gatt_esp32.cpp` | NimBLE glue: GATT table, pairing, advertising |
+| `core/ble_fido/ble_daemon.h` / `ble_daemon_gatt_esp32.cpp` | Daemon Bridge GATT service (`FBF6EB80-…`) — a private tunnel carrying CTAP messages between `cryptick-daemon` and the token. Same framing as this page, a sibling service on the same NimBLE server, and a fourth producer into the one `ctap_request()` consumer (`daemon_ble_submit_request()`, `core/fido2/hal_esp32.cpp`) |
+| `core/ble_fido/ble_hid_keyboard.h/.cpp` | A separate BLE HID-keyboard service used to type a PIN (e.g. the PIV PIN) into a paired host. Output-only; does not read `fidoControlPoint` and carries no CTAP traffic |
 | `tests/host/test_ble_fido_framing.py` | Unit layer: compiles the framing and drives it through `ctypes` |
 | `tests/conformance/ble_fido_v1.json` | Shared corpus, replayed by both this repo and the daemon |
 | `tests/host/test_ble_fido_conformance.py` | Replays that corpus against the C |
@@ -230,7 +232,7 @@ BLE is not yet a drop-in replacement for the USB cable. Only CTAP2 crosses it.
 | OATH / TOTP management | `CTAPHID_CRYPTICK_OATH` (`0x63`) | **no** |
 | Bootloader entry | `CTAPHID_ENTERBOOT` (`0x51`) | **no** |
 | Console / logs | USB CDC | no |
-| PIV (Mac login) | USB CCID — itself still a stub | no |
+| PIV (Mac login) | USB CCID — written, unverified on hardware | **written, unverified on hardware** — `FBF6EB90-…` service, framing shared with 0xFFFD, not advertised |
 
 The OATH and bootloader gaps are structural, not an oversight. Both are
 **vendor CTAPHID commands**, dispatched inside `ctaphid.c` and never reaching
