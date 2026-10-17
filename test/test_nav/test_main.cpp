@@ -87,6 +87,17 @@ void test_menu_to_settings(void)
     inject_key(KEY_CENTER);
     TEST_ASSERT_EQUAL(UI_MENU, nav_system_state());
 
+    /*
+     * Off-by-one (really off-by-two once you count it out): this was written
+     * when MenuItem was just { MENU_TOTP = 0, MENU_SETTINGS = 1 }, so one
+     * KEY_DOWN from TOTP landed on Settings. MENU_PIV and MENU_BLE were
+     * later inserted ahead of MENU_SETTINGS (now index 3, not 1), so a single
+     * KEY_DOWN now lands on PIV instead — nothing caught that because
+     * test_nav had never actually been executed (see [env:test_nav_native]
+     * in platformio.ini). Three presses walk TOTP → PIV → BLE → Settings.
+     */
+    inject_key(KEY_DOWN);
+    inject_key(KEY_DOWN);
     inject_key(KEY_DOWN); /* Settings */
     inject_key(KEY_CENTER);
     TEST_ASSERT_EQUAL(UI_SETTINGS, nav_system_state());
@@ -101,8 +112,12 @@ void test_settings_enroll_flow_via_bus(void)
     g_fp_count = 0;
 
     inject_key(KEY_CENTER);
+    /* Same off-by-one as test_menu_to_settings: Settings is index 3 now that
+     * MENU_PIV and MENU_BLE sit between it and TOTP, not index 1. */
     inject_key(KEY_DOWN);
-    inject_key(KEY_CENTER); /* Settings */
+    inject_key(KEY_DOWN);
+    inject_key(KEY_DOWN); /* Settings */
+    inject_key(KEY_CENTER);
     TEST_ASSERT_EQUAL(UI_SETTINGS, nav_system_state());
 
     /* SET_ENROLL is index 0 */
@@ -139,6 +154,43 @@ void test_auth_prompt_match_opens_totp(void)
     TEST_ASSERT_EQUAL(UI_TOTP, nav_system_state());
 }
 
+/*
+ * Regression for the nav/HAL fingerprint-ceremony race: a host FIDO/OATH
+ * request (nav_system_set_fido_ui(1), normally bridged from
+ * core/fido2/hal_esp32.cpp's up_test_locked() via _fido_ui_request in
+ * src/main.cpp's loop()) arriving while the on-device TOTP-unlock prompt is
+ * already open used to silently replace UI_AUTH_PROMPT with UI_FIDO_PROMPT
+ * and restart the match as CMD_FP_MATCH_FIDO — so the very next touch, which
+ * the user believed was approving the on-device TOTP view, would instead
+ * confirm the unrelated host ceremony (or vice versa). nav_owns_ceremony()
+ * in nav_system.cpp now defers any incoming request while a nav-owned
+ * ceremony (UI_AUTH_PROMPT / UI_FP_ENROLL / UI_FP_CLEAR_CONFIRM) is open, so
+ * the state and the eventual match must both stay with the original prompt.
+ */
+void test_fido_ui_request_deferred_during_auth_prompt(void)
+{
+    bus_init();
+    auth_system_init();
+    nav_system_init();
+    nav_system_set_account_count(1);
+    auth_system_set_fingerprint_enabled(true);
+    auth_system_clear();
+
+    inject_key(KEY_CENTER);
+    inject_key(KEY_CENTER); /* MENU_TOTP at index 0 */
+    TEST_ASSERT_EQUAL(UI_AUTH_PROMPT, nav_system_state());
+
+    /* A host ceremony's presence request must not steal this prompt. */
+    nav_system_set_fido_ui(1);
+    TEST_ASSERT_EQUAL(UI_AUTH_PROMPT, nav_system_state());
+
+    /* The touch the user actually gives must still resolve the ORIGINAL
+     * (TOTP-unlock) ceremony, not an unrelated one that hijacked the UI. */
+    inject_fp(FP_MATCHED, 1, 100);
+    TEST_ASSERT_EQUAL(UI_TOTP, nav_system_state());
+    TEST_ASSERT_TRUE(auth_system_is_authenticated());
+}
+
 void test_enroll_no_sensor(void)
 {
     bus_init();
@@ -147,7 +199,11 @@ void test_enroll_no_sensor(void)
     g_fp_ready = false;
 
     inject_key(KEY_CENTER);
+    /* Same off-by-one as test_menu_to_settings: Settings is index 3 now that
+     * MENU_PIV and MENU_BLE sit between it and TOTP, not index 1. */
     inject_key(KEY_DOWN);
+    inject_key(KEY_DOWN);
+    inject_key(KEY_DOWN); /* Settings */
     inject_key(KEY_CENTER);
     inject_key(KEY_CENTER); /* Enroll */
     TEST_ASSERT_EQUAL(UI_AUTH_ERROR, nav_system_state());
@@ -444,6 +500,7 @@ void setup()
     RUN_TEST(test_menu_to_settings);
     RUN_TEST(test_settings_enroll_flow_via_bus);
     RUN_TEST(test_auth_prompt_match_opens_totp);
+    RUN_TEST(test_fido_ui_request_deferred_during_auth_prompt);
     RUN_TEST(test_enroll_no_sensor);
     RUN_TEST(test_idle_enters_sleep);
     RUN_TEST(test_only_center_wakes_and_press_is_consumed);
