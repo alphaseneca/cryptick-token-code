@@ -700,8 +700,22 @@ static int up_test_locked(uint32_t delay_ms, int allow_uv_cache) {
     _last_status_1_or_2_ms = millis();
 
     const bool self_service = !device_on_fido_task();
-    if (self_service)
-        device_presence_fp_begin();
+    if (self_service && !device_presence_fp_begin()) {
+        /*
+         * nav_system (or an in-progress enrollment) already owns the sensor
+         * — see the MatchOwner comment in fp_system.cpp. Stealing it here
+         * used to let one physical touch silently confirm both this wait
+         * and whatever nav_system ceremony was already open, or silently
+         * strand nav's "place finger" screen with no sensor polling left
+         * behind it once this wait's own cleanup ran. Bail out exactly like
+         * the _up_mutex-busy refusal above, instead of either of those.
+         */
+        CLOG_W("HAL", "UP refused: fingerprint sensor owned by nav_system");
+        _fido_ui_request = 0;
+        _is_processing = false;
+        _uv_cache_until_ms = 0;
+        return 0;
+    }
 
     CLOG_I("HAL", "UP Wait: place enrolled finger (%lu ms) self_svc=%d",
            (unsigned long)delay_ms, self_service ? 1 : 0);

@@ -38,7 +38,28 @@ enum MatchMode : uint8_t {
     MATCH_FIDO
 };
 
+/*
+ * Which of the two independent ceremony drivers currently owns the sensor.
+ *
+ * fp_system is a single physical sensor reached from two unsynchronized
+ * places: nav_system's own async, event-bus-driven ceremonies (below,
+ * CMD_FP_MATCH_AUTH/FIDO — _matchMode non-OFF while one is open) and the
+ * HAL's self-service presence wait (device_presence_fp_begin/poll/end(),
+ * core/fido2/hal_esp32.cpp's up_test_locked(), used whenever a presence test
+ * is requested from a context that blocks the Arduino loop directly, e.g. a
+ * CDC `OATH PUT`/`TOTP_DEL`/`SETTIME` command). Nothing used to stop them
+ * colliding: device_presence_fp_begin() unconditionally overwrote _matchMode,
+ * so one physical touch could silently confirm two unrelated ceremonies at
+ * once (the HAL wait *and* whatever nav_system prompt happened to still be
+ * open), and a HAL wait that started while nav owned the sensor would
+ * silently strand nav's "place finger" screen with no sensor polling left
+ * behind it. This tag is what device_presence_fp_begin() checks before
+ * taking over, so it can refuse instead of stealing — see its definition.
+ */
+enum MatchOwner : uint8_t { OWNER_NONE = 0, OWNER_NAV, OWNER_HAL_PRESENCE };
+
 static MatchMode _matchMode = MATCH_OFF;
+static MatchOwner _matchOwner = OWNER_NONE;
 static bool _enrolling = false;
 static unsigned long _lastUiLog = 0;
 static unsigned long _lastMatchPoll = 0;
@@ -69,6 +90,7 @@ static void stop_match(const char *why)
         CLOG_I("FP", "match stop (%s)", why ? why : "-");
     _matchMode = MATCH_OFF;
     _lastMatchPoll = 0;
+    _matchOwner = OWNER_NONE;
 }
 
 static bool try_sensor_at(int esp_rx, int esp_tx)
@@ -226,19 +248,28 @@ void *fp_system_driver(void) { return _ready ? (void *)&_finger : nullptr; }
  * Presence helpers for HAL: when Arduino loop is blocked (CDC OATH UV),
  * ctap_user_presence_test self-services GenImg/Search on the main core.
  * FIDO task must NOT call these (UART would race with main-loop match).
+ *
+ * Refuse rather than steal: see the MatchOwner comment above _matchOwner's
+ * declaration for why. The caller (up_test_locked() in hal_esp32.cpp) must
+ * treat a `false` return exactly like any other failed/refused presence
+ * test — it must not retry by force, and it must not have touched any UI
+ * state it now needs to unwind differently.
  */
-extern "C" void device_presence_fp_begin(void)
+extern "C" bool device_presence_fp_begin(void)
 {
     if (!_ready || _count == 0)
-        return;
-    if (_enrolling) {
-        _finger.enrollAbort();
-        _enrolling = false;
+        return false;
+    if (_enrolling || (_matchMode != MATCH_OFF && _matchOwner != OWNER_HAL_PRESENCE)) {
+        CLOG_W("FP", "presence refused: sensor busy (mode=%u enrolling=%d)",
+               (unsigned)_matchMode, _enrolling ? 1 : 0);
+        return false;
     }
     _matchMode = MATCH_FIDO;
+    _matchOwner = OWNER_HAL_PRESENCE;
     _lastMatchPoll = 0;
     CLOG_I("FP", "match START (FIDO) — GenImg until match/stop");
     _finger.setLed(0x01);
+    return true;
 }
 
 extern "C" void device_presence_fp_end(void)
@@ -256,6 +287,7 @@ extern "C" int device_presence_fp_poll(void)
     if (_matchMode == MATCH_OFF) {
         /* After NO_MATCH path may stop; keep re-arming while UP is open. */
         _matchMode = MATCH_FIDO;
+        _matchOwner = OWNER_HAL_PRESENCE;
         _lastMatchPoll = 0;
     }
 
@@ -300,6 +332,7 @@ void fp_system_on_cmd(const BusEvent &e)
             _enrolling = false;
         }
         _matchMode = MATCH_AUTH;
+        _matchOwner = OWNER_NAV;
         _lastMatchPoll = 0; /* first GenImg ASAP */
         CLOG_I("FP", "match START (TOTP auth) — GenImg until match/stop");
         _finger.setLed(0x01);
@@ -310,6 +343,7 @@ void fp_system_on_cmd(const BusEvent &e)
             _enrolling = false;
         }
         _matchMode = MATCH_FIDO;
+        _matchOwner = OWNER_NAV;
         _lastMatchPoll = 0;
         CLOG_I("FP", "match START (FIDO) — GenImg until match/stop");
         _finger.setLed(0x01);
@@ -369,7 +403,7 @@ uint16_t fp_system_template_count(void) { return 0; }
 bool fp_system_match_active(void) { return false; }
 void *fp_system_driver(void) { return nullptr; }
 void fp_system_on_cmd(const BusEvent &) {}
-extern "C" void device_presence_fp_begin(void) {}
+extern "C" bool device_presence_fp_begin(void) { return false; }
 extern "C" void device_presence_fp_end(void) {}
 extern "C" int device_presence_fp_poll(void) { return 0; }
 

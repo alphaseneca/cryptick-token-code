@@ -212,8 +212,18 @@ void device_set_time_utc(uint32_t utc);
 /**
  * Fingerprint presence when caller blocks the Arduino loop (CDC OATH UV).
  * FIDO task path leaves matching to main-loop nav; main-core path self-services.
+ *
+ * fp_system is one sensor shared by this self-service path and nav_system's
+ * own independent, bus-driven ceremonies (CMD_FP_MATCH_AUTH/FIDO, enrollment).
+ * device_presence_fp_begin() claims the sensor for this path and returns
+ * false, touching no state, if nav_system (or an enrollment) already owns
+ * it — the caller must treat that exactly like a refused/failed presence
+ * test (see up_test_locked() in hal_esp32.cpp), never retry by force. This
+ * is what stops one physical touch from silently satisfying two unrelated
+ * ceremonies, or a host command from silently killing a prompt the user is
+ * still looking at on the device.
  */
-void device_presence_fp_begin(void);
+bool device_presence_fp_begin(void); /* true = claimed, false = refused (sensor busy) */
 void device_presence_fp_end(void);
 int device_presence_fp_poll(void); /* 1=match, 0=wait */
 

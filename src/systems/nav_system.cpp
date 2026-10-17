@@ -312,10 +312,55 @@ void nav_system_set_fido_label(const char *label)
 }
 const char *nav_system_enroll_message(void) { return _enrollMsg; }
 
+/*
+ * True while nav_system itself is mid-ceremony for a fresh touch it started
+ * for its own reason — on-device TOTP unlock (UI_AUTH_PROMPT), an enroll in
+ * progress (UI_FP_ENROLL), or the Clear-FP confirmation (UI_FP_CLEAR_CONFIRM).
+ * See nav_system_set_fido_ui()'s guard below for why this matters.
+ */
+static bool nav_owns_ceremony(void)
+{
+    return _state == UI_AUTH_PROMPT || _state == UI_FP_ENROLL ||
+           _state == UI_FP_CLEAR_CONFIRM;
+}
+
 void nav_system_set_fido_ui(int8_t req)
 {
     CLOG_D("NAV", "fido_ui req=%d (was %d state=%u)", (int)req, (int)_lastFidoReq,
            (unsigned)_state);
+
+    /*
+     * Race: this function is the HAL's only way to ask nav for a touch-prompt
+     * (via the host FIDO/OATH ceremony in core/fido2/hal_esp32.cpp's
+     * up_test_locked(), bridged through _fido_ui_request in src/main.cpp's
+     * loop()), but nav_system can *already* be mid-ceremony for a reason
+     * entirely its own — see nav_owns_ceremony() above. Before this guard,
+     * an incoming req unconditionally overwrote whatever nav was already
+     * waiting on: req==1 replaced it with UI_FIDO_PROMPT and restarted the
+     * match as CMD_FP_MATCH_FIDO (see fp_system.cpp's MatchOwner comment —
+     * this is the nav-vs-nav-via-FIDO-task side of that same sensor-sharing
+     * problem), and req==0's unconditional cmd_fp(CMD_FP_MATCH_STOP) could
+     * kill nav's own in-progress match outright. Either way, the single
+     * physical touch the user was about to give *their* prompt would
+     * instead resolve — or silently drop — an unrelated host ceremony, with
+     * nothing on screen to show two different things had been conflated.
+     *
+     * Deferring costs nothing the host ceremony doesn't already pay:
+     * up_test_locked() bounds its own wait with CRYPTICK_FIDO_UP_TIMEOUT_MS
+     * regardless of whether the token ever shows a prompt for it, exactly
+     * as if the user had simply not been looking at the device — which, as
+     * far as that host ceremony is concerned, they were not: they were
+     * looking at nav's own prompt instead. This mirrors how hal_esp32.cpp's
+     * own _up_mutex already refuses a second concurrent
+     * ctap_user_presence_test_ex() caller rather than letting it piggyback
+     * on the first one's touch.
+     */
+    if (nav_owns_ceremony()) {
+        CLOG_W("NAV", "fido_ui req=%d deferred: nav owns ceremony state=%u",
+               (int)req, (unsigned)_state);
+        return;
+    }
+
     /*
      * The host can ask for user presence while the screen is dark. Waking here
      * is what makes "Place finger" visible — without it the token would look
@@ -450,9 +495,18 @@ static void begin_enroll_now(void)
 static void start_enroll(void)
 {
     if (!fp_system_ready()) {
+        /*
+         * set_state() clears _enrollMsg on every transition (so a stale
+         * banner from the previous screen never bleeds into the next one),
+         * so the "No sensor" banner this screen is about to show must be
+         * written *after* the transition, not before, or it is wiped before
+         * nav_system_tick()'s UI_AUTH_ERROR branch ever reads it — that
+         * branch uses the exact string "No sensor" to decide whether to
+         * return to Settings or drop the session back to the clock.
+         */
+        set_state(UI_AUTH_ERROR);
         strncpy(_enrollMsg, "No sensor", sizeof(_enrollMsg) - 1);
         _authErrorStart = millis();
-        set_state(UI_AUTH_ERROR);
         return;
     }
     /*
@@ -577,12 +631,22 @@ void nav_system_on_event(const BusEvent &e)
             }
         } else if (e.kind == FP_ENROLL_DONE) {
             if (_state == UI_FP_ENROLL) {
+                /*
+                 * set_state() clears _enrollMsg on every transition, so the
+                 * "Stored" banner the Settings screen is about to show has
+                 * to be written after the transition, not before, or it is
+                 * wiped before nav_system_tick()'s 2s banner timer ever
+                 * gets to display it.
+                 */
+                set_state(UI_SETTINGS);
                 strncpy(_enrollMsg, "Stored", sizeof(_enrollMsg) - 1);
                 _enrollMsgStart = now;
-                set_state(UI_SETTINGS);
             }
         } else if (e.kind == FP_ENROLL_FAIL) {
             if (_state == UI_FP_ENROLL || e.a == 0xFE) {
+                /* Same ordering fix as FP_ENROLL_DONE above: transition
+                 * first, then write the banner the new screen should show. */
+                set_state(UI_SETTINGS);
                 if (e.a == 0x0A || e.a == 0x08)
                     strncpy(_enrollMsg, "Mismatch", sizeof(_enrollMsg) - 1);
                 else if (e.a == 0x1F)
@@ -602,7 +666,6 @@ void nav_system_on_event(const BusEvent &e)
                 else
                     strncpy(_enrollMsg, "Enroll fail", sizeof(_enrollMsg) - 1);
                 _enrollMsgStart = now;
-                set_state(UI_SETTINGS);
             }
         }
         return;
