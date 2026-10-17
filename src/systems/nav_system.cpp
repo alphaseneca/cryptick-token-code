@@ -15,13 +15,13 @@ void ctaphid_cancel_request(void);
 void ble_fido_clear_all_bonds(void);
 void ble_fido_restart_advertising(void);
 void ble_fido_cancel_pairing(void);
-bool ble_hid_type_piv_pin(void);
+bool ble_hid_type_pin(const char *pin);
 bool ble_hid_type_current_totp(int account_idx);
 #else
 static inline void ble_fido_clear_all_bonds(void) {}
 static inline void ble_fido_restart_advertising(void) {}
 static inline void ble_fido_cancel_pairing(void) {}
-static inline bool ble_hid_type_piv_pin(void) { return false; }
+static inline bool ble_hid_type_pin(const char *pin) { (void)pin; return false; }
 static inline bool ble_hid_type_current_totp(int account_idx) { (void)account_idx; return false; }
 #endif
 }
@@ -55,9 +55,10 @@ enum BleMenuItem {
  * What UI_AUTH_PROMPT is being asked to authorize. TOTP viewing is the
  * original, low-stakes case: a session (auth_system_is_authenticated())
  * is enough, so enter_totp() only routes here when there is no session yet.
- * The other three are trust-state changes (new fingerprint template, wiping
- * every template, wiping every BLE bond) and must NOT be satisfiable by an
- * existing session — see require_fresh_touch() below.
+ * The others are trust-state changes (new fingerprint template, wiping every
+ * template, wiping every BLE bond, auto-typing the PIV PIN into the host)
+ * and must NOT be satisfiable by an existing session — see
+ * require_fresh_touch() below.
  */
 enum PendingAction : uint8_t {
     PENDING_NONE = 0,
@@ -65,7 +66,15 @@ enum PendingAction : uint8_t {
     PENDING_CLEAR_CONFIRM,
     PENDING_ENROLL,
     PENDING_BLE_UNPAIR,
+    PENDING_PIV_PIN_TYPE,
 };
+
+/*
+ * PIV PINs are commonly 6-8 digits (FIPS 201 / NIST SP 800-73); 6 matches the
+ * previous hardcoded demo PIN ("123456") and keeps the entry screen a fixed,
+ * easy-to-lay-out width of digit boxes instead of a variable-length field.
+ */
+#define PIV_PIN_LEN 6
 
 static UiState _state = UI_CLOCK;
 static int _homeCard = 0; // 0 = Clock, 1 = Quick PIV, 2 = Quick TOTP
@@ -93,6 +102,18 @@ static char _fidoLabel[64] = "FIDO";
 static char _enrollMsg[24] = "";
 static int8_t _lastFidoReq = 0;
 static PendingAction _pendingAction = PENDING_NONE;
+
+/*
+ * UI_PIV_PIN_ENTRY scratch state. _pivPinReturnState remembers which of the
+ * two launchers (Home "Quick PIV Login" card vs Menu -> PIV Login PIN) this
+ * particular entry came from, so cancel and completion both land back where
+ * the user started — same per-launch-site routing require_fresh_touch()'s
+ * callers already need, just tracked directly instead of switching on
+ * _pendingAction (there is only one caller of this one).
+ */
+static uint8_t _pivPinDigit[PIV_PIN_LEN];
+static uint8_t _pivPinPos = 0;
+static UiState _pivPinReturnState = UI_MENU;
 
 /*
  * UI idle clock. Deliberately separate from the auth session in auth_system:
@@ -210,6 +231,9 @@ static void enter_sleep(void)
     _settingsIdx = 0;
     _accountIdx = 0;
     _pendingAction = PENDING_NONE;
+    /* A half-entered PIN is privileged too — do not let it survive sleep. */
+    for (int i = 0; i < PIV_PIN_LEN; i++) _pivPinDigit[i] = 0;
+    _pivPinPos = 0;
     _enrollMsg[0] = 0;
     set_state(UI_SLEEP);
 }
@@ -235,10 +259,13 @@ void nav_system_init(void)
 {
     _state = UI_CLOCK;
     _lastFidoReq = 0;
+    _homeCard = 0;
     _menuIdx = 0;
     _settingsIdx = 0;
     _accountIdx = 0;
     _pendingAction = PENDING_NONE;
+    for (int i = 0; i < PIV_PIN_LEN; i++) _pivPinDigit[i] = 0;
+    _pivPinPos = 0;
     _authErrorNoSensor = false;
     _enrollMsg[0] = 0;
     _lastActivityMs = millis();
@@ -313,6 +340,15 @@ void nav_system_ble_menu_label(int idx, char *out, size_t cap)
 }
 int nav_system_account_index(void) { return _accountIdx; }
 int nav_system_account_count(void) { return _accountCount; }
+
+int nav_system_piv_pin_len(void) { return PIV_PIN_LEN; }
+int nav_system_piv_pin_pos(void) { return (int)_pivPinPos; }
+uint8_t nav_system_piv_pin_digit(int i)
+{
+    if (i < 0 || i >= PIV_PIN_LEN) return 0;
+    return _pivPinDigit[i];
+}
+
 uint8_t nav_system_enroll_step(void) { return _enrollStep; }
 bool nav_system_enroll_remove(void) { return _enrollRemove; }
 const char *nav_system_fido_label(void) { return _fidoLabel; }
@@ -457,8 +493,9 @@ static void enter_menu(void)
 
 /*
  * Security gate for destructive/trust-changing actions (new enrollment,
- * wiping all fingerprints, wiping all BLE bonds): always demands a brand
- * new sensor match, never an existing auth_system session.
+ * wiping all fingerprints, wiping all BLE bonds, auto-typing the PIV PIN):
+ * always demands a brand new sensor match, never an existing auth_system
+ * session.
  *
  * CMD_FP_MATCH_AUTH resets fp_system's poll window (_lastMatchPoll = 0,
  * see fp_system.cpp), so this always requires a finger placed *after* this
@@ -473,6 +510,51 @@ static void require_fresh_touch(PendingAction action)
     _pendingAction = action;
     set_state(UI_AUTH_PROMPT);
     cmd_fp(CMD_FP_MATCH_AUTH);
+}
+
+/*
+ * PIV PIN entry launcher, shared by the Home "Quick PIV Login" card and the
+ * Menu -> "PIV Login PIN" row — same sharing the old static display used
+ * (see event_bus.h's UI_PIV_PIN_ENTRY comment): only where to return
+ * afterwards differs, not the ceremony itself, so that is the one thing
+ * tracked per launch (_pivPinReturnState). Always restarts at digit 0 = 0
+ * rather than remembering the last attempt — a half-entered PIN is exactly
+ * the kind of stale state require_fresh_touch() above refuses to trust for
+ * a security-relevant action, and it means a cancelled attempt never leaks
+ * into the next one.
+ */
+static void enter_piv_pin_entry(UiState returnState, unsigned long now)
+{
+    for (int i = 0; i < PIV_PIN_LEN; i++) _pivPinDigit[i] = 0;
+    _pivPinPos = 0;
+    _pivPinReturnState = returnState;
+    set_state(UI_PIV_PIN_ENTRY);
+    auth_system_record_activity(now);
+}
+
+/*
+ * Actually types the PIN once a touch (or the zero-template bootstrap
+ * bypass, mirrored from start_enroll()/start_clear()/BLE-unpair below) has
+ * cleared it to go. Shared by the FP_MATCHED/PENDING_PIV_PIN_TYPE dispatch
+ * and the bootstrap path so there is exactly one place that builds the PIN
+ * string, calls BLE HID, and clears the digits back out of RAM — same
+ * "transition first, then write the banner" ordering set_state() forces
+ * everywhere else (see the FP_ENROLL_DONE/FAIL comment below): set_state()
+ * unconditionally zeroes _enrollMsg, so it must run before, not after.
+ */
+static void commit_piv_pin_type(unsigned long now)
+{
+    char pin[PIV_PIN_LEN + 1];
+    for (int i = 0; i < PIV_PIN_LEN; i++) pin[i] = (char)('0' + _pivPinDigit[i]);
+    pin[PIV_PIN_LEN] = 0;
+    bool typed = ble_hid_type_pin(pin);
+    memset(pin, 0, sizeof(pin));
+    for (int i = 0; i < PIV_PIN_LEN; i++) _pivPinDigit[i] = 0;
+
+    UiState returnState = _pivPinReturnState;
+    set_state(returnState);
+    strncpy(_enrollMsg, typed ? "PIN Typed!" : "BLE Offline", sizeof(_enrollMsg) - 1);
+    _enrollMsgStart = now;
 }
 
 static void enter_totp(unsigned long now)
@@ -646,6 +728,9 @@ void nav_system_on_event(const BusEvent &e)
 #endif
                     set_state(UI_BLE_MENU);
                     break;
+                case PENDING_PIV_PIN_TYPE:
+                    commit_piv_pin_type(now);
+                    break;
                 case PENDING_TOTP:
                 default:
                     _accountIdx = 0;
@@ -791,14 +876,7 @@ void nav_system_on_event(const BusEvent &e)
             if (_homeCard == 0) {
                 enter_menu();
             } else if (_homeCard == 1) {
-                /* Quick PIV PIN typing */
-                if (ble_hid_type_piv_pin()) {
-                    strncpy(_enrollMsg, "PIN Typed!", sizeof(_enrollMsg) - 1);
-                } else {
-                    strncpy(_enrollMsg, "BLE Offline", sizeof(_enrollMsg) - 1);
-                }
-                _enrollMsgStart = now;
-                publish_ui();
+                enter_piv_pin_entry(UI_CLOCK, now);
             } else if (_homeCard == 2) {
                 /* Quick TOTP code typing */
                 if (ble_hid_type_current_totp(_accountIdx)) {
@@ -834,7 +912,7 @@ void nav_system_on_event(const BusEvent &e)
             set_state(UI_CLOCK);
         } else if (key == KEY_CENTER) {
             if (_menuIdx == MENU_TOTP) enter_totp(now);
-            else if (_menuIdx == MENU_PIV) set_state(UI_PIV_PIN);
+            else if (_menuIdx == MENU_PIV) enter_piv_pin_entry(UI_MENU, now);
             else if (_menuIdx == MENU_BLE) enter_ble(now);
             else if (_menuIdx == MENU_SETTINGS) enter_settings(now);
         }
@@ -938,17 +1016,48 @@ void nav_system_on_event(const BusEvent &e)
             set_state(UI_SETTINGS);
         break;
 
-    case UI_PIV_PIN:
-        if (key == KEY_LEFT) {
-            set_state(UI_MENU);
-        } else if (key == KEY_CENTER) {
-            if (ble_hid_type_piv_pin()) {
-                strncpy(_enrollMsg, "PIN Typed!", sizeof(_enrollMsg) - 1);
-            } else {
-                strncpy(_enrollMsg, "BLE Offline", sizeof(_enrollMsg) - 1);
-            }
-            _enrollMsgStart = now;
+    case UI_PIV_PIN_ENTRY:
+        /*
+         * KEY_UP/KEY_DOWN here are, for most presses, the encoder ticks
+         * remapped at the top of this function — scrolling the highlighted
+         * digit is the literal "scroll the encoder to set the PIN" ceremony
+         * the product asked for. The physical 5-way UP/DOWN do the exact
+         * same thing, same as every list screen in this file already lets
+         * either source scroll it.
+         */
+        if (key == KEY_UP) {
+            _pivPinDigit[_pivPinPos] = (uint8_t)((_pivPinDigit[_pivPinPos] + 1) % 10);
             publish_ui();
+        } else if (key == KEY_DOWN) {
+            _pivPinDigit[_pivPinPos] = (uint8_t)((_pivPinDigit[_pivPinPos] + 9) % 10);
+            publish_ui();
+        } else if (key == KEY_LEFT) {
+            /* LEFT is "back" everywhere else in this file (go up one level);
+             * here that is back one digit while mid-entry, and only drops
+             * out to wherever this ceremony was launched from once there is
+             * no earlier digit left to back up into. */
+            if (_pivPinPos > 0) {
+                _pivPinPos--;
+                publish_ui();
+            } else {
+                set_state(_pivPinReturnState);
+            }
+        } else if (key == KEY_CENTER) {
+            if (_pivPinPos + 1 < PIV_PIN_LEN) {
+                _pivPinPos++;
+                publish_ui();
+            } else if (fp_system_template_count() > 0) {
+                /* The key new piece: a typed-but-unconfirmed PIN cannot be
+                 * sent without a fresh touch, same ceremony enroll/clear/
+                 * BLE-unpair already use for trust-changing actions. */
+                require_fresh_touch(PENDING_PIV_PIN_TYPE);
+            } else {
+                /* Bootstrap: no fingerprint enrolled yet to touch-confirm
+                 * against — same zero-template bypass start_enroll() /
+                 * start_clear() / BLE-unpair already use below, so a
+                 * factory-fresh unit is not locked out of its own PIV PIN. */
+                commit_piv_pin_type(now);
+            }
         }
         break;
 
@@ -987,6 +1096,12 @@ void nav_system_on_event(const BusEvent &e)
                 break;
             case PENDING_BLE_UNPAIR:
                 set_state(UI_BLE_MENU);
+                break;
+            case PENDING_PIV_PIN_TYPE:
+                /* A cancelled touch abandons the typed PIN too — it must
+                 * not linger for some later, unrelated completion. */
+                for (int i = 0; i < PIV_PIN_LEN; i++) _pivPinDigit[i] = 0;
+                set_state(_pivPinReturnState);
                 break;
             case PENDING_TOTP:
             default:

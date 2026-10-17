@@ -27,6 +27,16 @@ int nav_system_ble_menu_index(void);
 int nav_system_ble_menu_count(void);
 void nav_system_ble_menu_label(int idx, char *out, size_t cap);
 
+/**
+ * PIV PIN entry (UI_PIV_PIN_ENTRY). Digit count, the position the encoder is
+ * currently scrolling, and the value (0-9) at a given position — rendered by
+ * display_system as a row of digit boxes, the one at nav_system_piv_pin_pos()
+ * drawn selected the same way draw_list_row() draws a selected row.
+ */
+int nav_system_piv_pin_len(void);
+int nav_system_piv_pin_pos(void);
+uint8_t nav_system_piv_pin_digit(int i);
+
 /*
  * Idle sleep. This powers the OLED down and drops the unlock session; the MCU
  * and USB stay up so the token keeps answering the host. See UI_SLEEP_TIMEOUT_SEC

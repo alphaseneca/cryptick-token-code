@@ -53,7 +53,16 @@ enum UiState : uint8_t {
     UI_DEVICE_INFO,  /* Settings → Info */
     UI_BLE_PAIRING,  /* 6-digit LESC passkey; typed on the host, not a finger */
     UI_BLE_MENU,     /* Top-level Bluetooth status and controls */
-    UI_PIV_PIN       /* PIV Login PIN display */
+    /*
+     * PIV PIN entry: the encoder (remapped to KEY_UP/KEY_DOWN, see
+     * nav_system.cpp) scrolls the highlighted digit 0-9, CENTER advances to
+     * the next one and, on the last, starts a fresh-touch confirm
+     * (UI_AUTH_PROMPT) before the PIN is auto-typed over BLE HID — see
+     * nav_system.cpp's enter_piv_pin_entry()/require_fresh_touch(). Used to
+     * be a static "PIN: 123456" display typed on a single CENTER press with
+     * no confirmation; replaced so a typed PIN always costs a real touch.
+     */
+    UI_PIV_PIN_ENTRY
 };
 
 enum FpEventKind : uint8_t {
