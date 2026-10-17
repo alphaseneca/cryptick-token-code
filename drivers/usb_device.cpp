@@ -4,6 +4,7 @@
 #include <string.h>
 #include <Arduino.h>
 #include "cryptick_console.h"
+#include "esp_mac.h"
 
 /*
  * Product USB:
@@ -16,6 +17,29 @@
  *  3) HID: CTAPHID ENTERBOOT → same
  *  4) CH340 UART esptool if wired
  */
+
+/*
+ * Factory-unique device identity. esp_efuse_mac_get_default() reads the
+ * 6-byte base MAC burned into eFuse at the factory (BLK0 MAC_FACTORY on
+ * ESP32-S3) — immutable, unique per chip, and already how Espressif derives
+ * the WiFi/BT MAC, so it needs no provisioning step of our own. Shared (not
+ * inside the CRYPTICK_USB_STACK branches below) so it is available to every
+ * build variant, including the CDC "SERIAL" debug command on non-product
+ * builds where TinyUSB itself may be off.
+ */
+static char _device_serial_number[20] = "";
+
+const char *usb_device_serial_number(void)
+{
+    if (!_device_serial_number[0]) {
+        uint8_t mac[6] = {0};
+        esp_efuse_mac_get_default(mac);
+        snprintf(_device_serial_number, sizeof(_device_serial_number),
+                 "CT-%02X%02X%02X%02X%02X%02X",
+                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    }
+    return _device_serial_number;
+}
 
 #if defined(CRYPTICK_USB_STACK) && CRYPTICK_USB_STACK
 
@@ -141,7 +165,8 @@ void usb_device_init(void)
     USB.productName(USB_PRODUCT);
     USB.VID(CRYPTICK_USB_VID);
     USB.PID(CRYPTICK_USB_PID);
-    USB.serialNumber("CRYPTICK");
+    /* Factory-unique, not a fixed brand string — see usb_device_serial_number(). */
+    USB.serialNumber(usb_device_serial_number());
 
     /*
      * Descriptor order for product composite (Arduino-ESP32 TinyUSB):
@@ -179,8 +204,9 @@ void usb_device_init(void)
         usb_ccid_mount_ok();
 
     CLOG_I("USB", "TinyUSB product CDC+HID");
-    CLOG_I("USB", "VID=0x%04X PID=0x%04X mounted=%d cdc=%d",
+    CLOG_I("USB", "VID=0x%04X PID=0x%04X SN=%s mounted=%d cdc=%d",
                        CRYPTICK_USB_VID, CRYPTICK_USB_PID,
+                       usb_device_serial_number(),
                        (tud_inited() && tud_mounted()) ? 1 : 0,
                        _cdc ? 1 : 0);
     CLOG_I("USB", "host: 1209:BEEE CDC@115200 + FIDO HID%s",

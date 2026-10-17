@@ -22,6 +22,16 @@ void usb_device_enter_bootloader(void);
 void usb_device_poll_bootloader(void);
 /** True when TinyUSB stack mounted to host (always false if stack off) */
 bool usb_device_mounted(void);
+/**
+ * Factory-unique device identity, derived at boot from the ESP32-S3's burned-in
+ * eFuse base MAC (esp_efuse_mac_get_default) — never random or hardcoded.
+ * Formatted "CT-XXXXXXXXXXXX" (12 uppercase hex chars = the 6 MAC bytes in
+ * order, no separators). In the product USB build (ARDUINO_USB_MODE=0) this
+ * exact string is also programmed as the USB iSerialNumber string descriptor
+ * (see usb_device_init()). Computed once on first call; same string every boot
+ * on a given chip.
+ */
+const char *usb_device_serial_number(void);
 bool usb_hid_read_report(uint8_t buffer[64]);
 /**
  * Reliable HID IN: wait for endpoint free, submit one 64-byte report, wait for

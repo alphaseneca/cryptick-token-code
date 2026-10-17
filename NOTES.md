@@ -662,3 +662,165 @@ visual weight/legibility against the real 0.96" SSD1306 glass, and whether
 - `src/systems/display_system.cpp`, new `display_icons.h` — icon system,
   ASCII font-glyph fix, BLE menu layout unification, overlap fix.
 - `tests/host/test_piv_apdu.py` — two new regression tests for (4a).
+
+---
+
+# Notes
+
+## 2026-10-17 — Real USB serial number (eFuse MAC), for host-side device identity
+
+### What changed
+
+The product USB build previously called `USB.serialNumber("CRYPTICK")` — a fixed
+string, identical on every unit, in `drivers/usb_device.cpp`
+(`usb_device_init()`, `ARDUINO_USB_MODE == 0` branch). It compiled and
+enumerated fine, which is why a descriptor-table grep for
+`iSerialNumber|serial_number|SERIAL_NUMBER` found nothing: the string isn't a
+literal in a descriptor table, it's set at runtime through Arduino-ESP32's
+`USB` API, under its camelCase name (`serialNumber`), which that grep's
+pattern didn't match.
+
+It is now a **factory-unique identifier** derived from the ESP32-S3's
+burned-in eFuse base MAC, computed once per boot:
+
+- `drivers/usb_device.cpp` / `drivers/usb_device.h` add
+  `const char *usb_device_serial_number(void)`. It calls
+  `esp_efuse_mac_get_default(uint8_t mac[6])` (declared in `esp_mac.h`, part
+  of IDF `esp_hw_support` — the same call `ESP.getEfuseMac()` and
+  Arduino-ESP32's own `USB.serialNumber("__MAC__")` sentinel use) and formats
+  the 6 bytes as `"CT-%02X%02X%02X%02X%02X%02X"`.
+- `usb_device_init()` now calls `USB.serialNumber(usb_device_serial_number())`
+  instead of the hardcoded string, before `USB.begin()`.
+- The helper lives outside the `CRYPTICK_USB_STACK` / `ARDUINO_USB_MODE`
+  `#if` branches so it compiles and is callable in every build variant
+  (product, ship, install, jtag lab fallback, stack-off), not only the one
+  branch that owns the TinyUSB descriptor.
+
+This is read from eFuse at every boot, not stored anywhere — same chip, same
+string, every time; a reflash does not change it.
+
+### Exact format
+
+```
+CT-XXXXXXXXXXXX
+```
+
+- `CT-` literal prefix (3 ASCII chars).
+- `XXXXXXXXXXXX` = 12 uppercase hex characters (`0-9A-F`), no separators —
+  the chip's 6-byte eFuse base MAC, bytes printed in order (`mac[0]…mac[5]`,
+  same order IDF/esptool print the WiFi/BT MAC in).
+- Fixed length, 15 ASCII characters total. Regex: `^CT-[0-9A-F]{12}$`.
+- Example: `CT-A1B2C3D4E5F6`.
+
+This is **not** the BLE address. The BLE stack still randomizes its own
+address on every advertisement (`NimBLEDevice::setOwnAddrType(BLE_OWN_ADDR_RANDOM)`
+in `core/ble_fido/ble_gatt_esp32.cpp`, untouched by this change). The two are
+deliberately independent: USB serial is the one durable hardware anchor;
+BLE address is deliberately not.
+
+### Where it surfaces
+
+1. **USB Device Descriptor, `iSerialNumber` string (standard USB string index
+   `0x03`)** — this is the real anchor, and the one the task asked to verify
+   end-to-end:
+   - `USB.serialNumber(name)` (Arduino-ESP32 `cores/esp32/USB.cpp`) stores the
+     string.
+   - `USB.begin()` → `tinyusb_init()` → `tinyusb_apply_device_config()`
+     (`cores/esp32/esp32-hal-tinyusb.c`) copies it into the static buffer
+     `USB_DEVICE_SERIAL`.
+   - The device descriptor is built with `.iSerialNumber = 0x03`
+     (`esp32-hal-tinyusb.c`), and the string-descriptor array serves
+     `USB_DEVICE_SERIAL` at index 3 (`// 3: Serials, should use chip ID`).
+   - `tud_descriptor_string_cb()` answers `GET_DESCRIPTOR(STRING, 3)` with
+     this value, UTF-16 encoded — exactly what `lsusb -v` (Linux),
+     `system_profiler SPUSBDataType` (macOS), or Windows Device Manager
+     print as the device's Serial Number.
+   - One serial per **composite device**, not per interface: the CDC
+     interface and the FIDO HID interface enumerate under the same VID:PID
+     (`0x1209:0xBEEE`) and the same single device descriptor, so both expose
+     the identical serial string — a host only has to read it once.
+2. **CDC debug console, new `SERIAL` command** (alias `SN`) —
+   `src/host/serial_comm.cpp`: prints `OK SERIAL CT-XXXXXXXXXXXX` on the
+   existing 115200 CDC console (listed in `HELP`). This is a convenience
+   echo of the same string for a human (or a script) at a terminal; it is
+   not a new protocol and carries no more authority than the descriptor
+   itself — added because the existing "device info" commands (`ATTEST`,
+   `LOGLEVEL`, `SLEEP`, …) already follow this exact `OK <CMD> <value>`
+   pattern, so this was a one-line, in-character fit.
+3. **Not added to the OLED "Device info" screen**
+   (`src/systems/display_system.cpp`, `draw_device_info()`,
+   `UI_DEVICE_INFO`): deliberately skipped. That screen is a 128×64 panel
+   already filled by its title plus 4 fixed-position text lines
+   (`y = 25, 35, 45, 55`) with no vertical room left before the bottom edge
+   (`SCREEN_HEIGHT = 64`, `include/board_config.h`) — a 5th line would clip
+   off-panel, and a 15-character string doesn't fit the remaining horizontal
+   budget either without trimming something else that's already there. The
+   CDC `SERIAL` command covers the "inspect it directly" need without
+   reworking that screen's layout.
+
+### Availability by build variant
+
+Only present when the firmware actually owns the USB device descriptor:
+
+| Env | `CRYPTICK_USB_STACK` | `ARDUINO_USB_MODE` | Serial number present? |
+|---|---|---|---|
+| `esp32-s3-n16r8` (product, default) | 1 | 0 | **Yes** — `CT-XXXXXXXXXXXX`, VID:PID `1209:BEEE` |
+| `esp32-s3-n16r8-ship` | 1 | 0 | **Yes** — same as above |
+| `esp32-s3-n16r8-install` | 1 | 0 | **Yes** — same as above |
+| `esp32-s3-n16r8-jtag` (lab fallback) | 1 | 1 | **No** — enumerates as Espressif's own USB Serial/JTAG bridge, VID `303A`; we never own that descriptor |
+| stack off (`CRYPTICK_USB_STACK` unset) | 0 | — | **No** — no native USB descriptors at all (UART0 console only) |
+
+The CDC `SERIAL` console command, by contrast, works on every variant that
+has *any* console Stream (it calls `usb_device_serial_number()` directly,
+which only needs the eFuse read, not TinyUSB) — so it's available even on
+the JTAG lab build and stack-off build, where the USB descriptor itself
+doesn't carry one.
+
+### What `cryptick-token-daemon`'s device-identity store would need
+
+(Firmware-only change — the daemon repo is untouched. This is what a
+follow-up daemon-side change, e.g. a `crates/daemon/src/devices.rs` identity
+module, needs to actually read to replace its current best-effort
+identifier. As of this writing `crates/daemon/src/devices.rs` does not yet
+exist in `cryptick-token-daemon@main` — this section is written for whoever
+adds it.)
+
+- **What to read:** the USB Device Descriptor's `iSerialNumber` string
+  (standard USB string descriptor, index `3`) of the composite device
+  enumerating as **VID `0x1209`, PID `0xBEEE`**. Any standard host
+  USB/HID enumeration API surfaces this without opening a transfer pipe:
+  - Rust: `hidapi::HidApi::device_list()` →
+    `HidDeviceInfo::serial_number()` on the entry matching
+    `vendor_id() == 0x1209 && product_id() == 0xBEEE` (works whether you
+    match on the CDC or the FIDO HID top-level interface — same descriptor,
+    same string either way); or `nusb`/`rusb`'s device descriptor
+    `serial_number_string()`.
+  - Linux (what `hidapi`/`nusb` read under the hood): `udev`
+    `ID_SERIAL_SHORT` / sysfs `.../serial` on the USB device node.
+  - macOS: IOKit `kUSBSerialNumberString` property on the `IOUSBHostDevice`
+    (same thing `system_profiler SPUSBDataType` prints as "Serial Number").
+  - Windows: `SetupDiGetDeviceProperty` /
+    `DEVPKEY_Device_InstanceId`'s serial segment, or `HidD_GetSerialNumberString`.
+- **Exact format to parse:** ASCII, `^CT-[0-9A-F]{12}$`, 15 characters,
+  e.g. `CT-A1B2C3D4E5F6`. The 12 hex characters are the chip's 6-byte eFuse
+  MAC, bytes in order, uppercase, no delimiters. Treat the whole 15-char
+  string as the opaque identity key — there's no need to parse out the MAC
+  bytes unless the daemon wants to cross-reference them against something
+  else (e.g. the same chip's WiFi/BT MAC, which is derived from the same
+  eFuse value and will match `XXXXXXXXXXXX` exactly, minus colons).
+- **Stability guarantee:** fixed per physical unit for the unit's whole
+  life — recomputed from eFuse on every boot, not stored in NVS, so a
+  factory-reset, credential wipe, or reflash never changes it. Safe to use
+  as a permanent primary key with no migration path needed on the firmware
+  side.
+- **Scope/caveat:** this identity is only observable while the device is
+  connected over **USB** in a build that owns the descriptor (see table
+  above — the default product build does). It is not carried over BLE at
+  all today. If the daemon's primary transport for a given session is BLE
+  (its address is randomized by design and cannot serve as identity — see
+  `core/ble_fido/ble_gatt_esp32.cpp`), correlating "this BLE peer" with "this
+  USB serial" requires its own pairing/provisioning step done while the
+  device is plugged in over USB at least once (e.g., record the USB serial
+  at pairing time, alongside whatever BLE bonding identity is already
+  tracked). That correlation logic is exactly the follow-up work this note
+  is written for and is out of scope here.

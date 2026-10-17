@@ -214,7 +214,7 @@ void processSerialCommands(Stream &serial, std::vector<TOTPCredential> &credenti
                 serial.println("UART console (CH340). Flash: pio run -t upload --upload-port <port>");
                 serial.println("Stuck ROM: esptool.py --port <PORT> run --after hard_reset");
 #endif
-                serial.println("Recovery: BOOTLOADER | REBOOT | HELP | LOGLEVEL [0-5] | ATTEST");
+                serial.println("Recovery: BOOTLOADER | REBOOT | HELP | LOGLEVEL [0-5] | ATTEST | SERIAL");
                 serial.println("Display: SLEEP [sec|NOW|OFF] | WAKE   (screen only; USB stays up)");
                 serial.println("TOTP (LittleFS, same as HID OATH):");
                 serial.println("  TOTP_LIST | OATH LIST");
@@ -331,6 +331,10 @@ void processSerialCommands(Stream &serial, std::vector<TOTPCredential> &credenti
                 serial.printf("attest_cert_der_bytes=%d (self-signed Cryptick Token batch)\n",
                               device_attestation_cert_der_get_size());
                 serial.println("docs/ATTESTATION.md — not FIDO MDS / public CA");
+            }
+            else if (name == "SERIAL" || name == "SN")
+            {
+                serial.printf("OK SERIAL %s\n", usb_device_serial_number());
             }
             else if (name == "DATE" || name == "SETTIME")
             {
