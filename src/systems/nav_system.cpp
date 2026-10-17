@@ -14,11 +14,13 @@ void ctaphid_cancel_request(void);
 #if CRYPTICK_BLE_FIDO
 void ble_fido_clear_all_bonds(void);
 void ble_fido_restart_advertising(void);
+void ble_fido_cancel_pairing(void);
 bool ble_hid_type_piv_pin(void);
 bool ble_hid_type_current_totp(int account_idx);
 #else
 static inline void ble_fido_clear_all_bonds(void) {}
 static inline void ble_fido_restart_advertising(void) {}
+static inline void ble_fido_cancel_pairing(void) {}
 static inline bool ble_hid_type_piv_pin(void) { return false; }
 static inline bool ble_hid_type_current_totp(int account_idx) { (void)account_idx; return false; }
 #endif
@@ -26,11 +28,19 @@ static inline bool ble_hid_type_current_totp(int account_idx) { (void)account_id
 
 enum MenuItem { MENU_TOTP = 0, MENU_PIV = 1, MENU_BLE = 2, MENU_SETTINGS = 3, MENU_COUNT = 4 };
 
+/*
+ * SET_TIME used to be its own row ("Clock: RTC OK" / "Clock: Soft (Sync!)")
+ * but pointed at draw_device_info(), which has never shown date/time/RTC
+ * content — there is no on-device clock-sync flow, only the USB-console
+ * SETTIME / OATH SET_TIME commands (see src/host/serial_comm.cpp). Rather
+ * than build a from-scratch date/time entry UI for the 5-way nav just to
+ * give that row somewhere honest to go, the clock status is folded into
+ * Device Info (see draw_device_info()) and the row is dropped.
+ */
 enum SettingsItem {
     SET_ENROLL = 0,
     SET_CLEAR,
     SET_SLEEP,
-    SET_TIME,
     SET_INFO,
     SET_ITEM_COUNT
 };
@@ -65,6 +75,16 @@ static int _bleMenuIdx = 0;
 static int _accountIdx = 0;
 static int _accountCount = 0;
 static unsigned long _authErrorStart = 0;
+/*
+ * Which UI_AUTH_ERROR this is, independent of _enrollMsg: set_state()
+ * (below) unconditionally zeroes _enrollMsg on every transition, including
+ * the one that enters UI_AUTH_ERROR itself — so the "did we get here via
+ * 'No sensor'?" check has to live in its own flag, not the message text,
+ * or it always reads back empty by the time leave_auth_error() runs. See
+ * NOTES.md: this also silently broke the "No sensor" message from ever
+ * being drawn at all (same root cause, left unfixed — out of scope here).
+ */
+static bool _authErrorNoSensor = false;
 static unsigned long _fidoSuccessStart = 0;
 static unsigned long _enrollMsgStart = 0;
 static uint8_t _enrollStep = 1;
@@ -189,6 +209,7 @@ static void enter_sleep(void)
     _menuIdx = 0;
     _settingsIdx = 0;
     _accountIdx = 0;
+    _pendingAction = PENDING_NONE;
     _enrollMsg[0] = 0;
     set_state(UI_SLEEP);
 }
@@ -217,6 +238,8 @@ void nav_system_init(void)
     _menuIdx = 0;
     _settingsIdx = 0;
     _accountIdx = 0;
+    _pendingAction = PENDING_NONE;
+    _authErrorNoSensor = false;
     _enrollMsg[0] = 0;
     _lastActivityMs = millis();
     _fidoHoldUntilMs = 0;
@@ -260,12 +283,6 @@ void nav_system_settings_label(int idx, char *out, size_t cap)
         else
             snprintf(out, cap, "Sleep: %us", (unsigned)_sleepTimeoutSec);
         break;
-    case SET_TIME: {
-        extern bool g_rtc_ok __attribute__((weak));
-        bool ok = (&g_rtc_ok != nullptr) ? g_rtc_ok : false;
-        snprintf(out, cap, "Clock: %s", ok ? "RTC OK" : "Soft (Sync!)");
-        break;
-    }
     case SET_INFO:
         snprintf(out, cap, "Device info");
         break;
@@ -560,6 +577,22 @@ static void start_clear(void)
     set_state(UI_FP_CLEAR_CONFIRM);
 }
 
+/*
+ * Shared by the UI_AUTH_ERROR timeout (nav_system_tick()) and its early
+ * LEFT/CENTER dismiss (nav_system_on_event()) so the two paths can't drift:
+ * "No sensor" came from Settings → Enroll, so return there; every other
+ * error came from an unlock attempt, so drop the session and go to the clock.
+ */
+static void leave_auth_error(void)
+{
+    if (_authErrorNoSensor) {
+        set_state(UI_SETTINGS);
+    } else {
+        auth_system_clear();
+        set_state(UI_CLOCK);
+    }
+}
+
 void nav_system_on_event(const BusEvent &e)
 {
     unsigned long now = millis();
@@ -616,6 +649,7 @@ void nav_system_on_event(const BusEvent &e)
                  * destructive action armed for some later, unrelated match. */
                 _pendingAction = PENDING_NONE;
                 _authErrorStart = now;
+                _authErrorNoSensor = false;
                 strncpy(_enrollMsg, "No match", sizeof(_enrollMsg) - 1);
                 set_state(UI_AUTH_ERROR);
             }
@@ -710,8 +744,13 @@ void nav_system_on_event(const BusEvent &e)
 
     _lastActivityMs = now;
 
-    if (_state == UI_AUTH_ERROR)
+    if (_state == UI_AUTH_ERROR) {
+        /* Same early-dismiss courtesy as UI_FIDO_SUCCESS below, instead of
+         * forcing the user to sit through the full AUTH_ERROR_DISPLAY_MS. */
+        if (key == KEY_CENTER || key == KEY_LEFT)
+            leave_auth_error();
         return;
+    }
 
     if (_state == UI_FIDO_SUCCESS) {
         if (key == KEY_CENTER || key == KEY_LEFT) {
@@ -723,7 +762,17 @@ void nav_system_on_event(const BusEvent &e)
 
     switch (_state) {
     case UI_CLOCK:
-        /* Scrolling rotary encoder navigates Quick Cards on Home screen */
+        /*
+         * RIGHT always means "next card", same as DOWN — it used to also
+         * cycle _accountIdx while parked on the Quick-TOTP card (card 2),
+         * with no on-screen sign that RIGHT had changed jobs. Account
+         * cycling now lives only on the full TOTP list screen (UI_TOTP),
+         * where UP/DOWN already do it and have no competing meaning.
+         * There is no rotary encoder wired into input_system yet
+         * (ENCODER_CW_PIN/ENCODER_CCW_PIN are unset in board_config.h, and
+         * nothing maps encoder ticks to InputKey) — once it is, this is the
+         * state that benefits: plain UP/DOWN already walk the cards here.
+         */
         if (key == KEY_CENTER) {
             if (_homeCard == 0) {
                 enter_menu();
@@ -746,18 +795,11 @@ void nav_system_on_event(const BusEvent &e)
                 _enrollMsgStart = now;
                 publish_ui();
             }
-        } else if (key == KEY_DOWN) {
+        } else if (key == KEY_DOWN || key == KEY_RIGHT) {
             _homeCard = (_homeCard + 1) % 3;
             publish_ui();
         } else if (key == KEY_UP) {
             _homeCard = (_homeCard + 2) % 3;
-            publish_ui();
-        } else if (key == KEY_RIGHT) {
-            if (_homeCard == 2 && _accountCount > 0) {
-                _accountIdx = (_accountIdx + 1) % _accountCount;
-            } else {
-                _homeCard = (_homeCard + 1) % 3;
-            }
             publish_ui();
         } else if (key == KEY_LEFT) {
             if (_homeCard != 0) {
@@ -871,8 +913,6 @@ void nav_system_on_event(const BusEvent &e)
                 start_clear();
             } else if (_settingsIdx == SET_SLEEP) {
                 cycle_sleep_preset();
-            } else if (_settingsIdx == SET_TIME) {
-                set_state(UI_DEVICE_INFO);
             } else if (_settingsIdx == SET_INFO) {
                 set_state(UI_DEVICE_INFO);
             }
@@ -919,9 +959,26 @@ void nav_system_on_event(const BusEvent &e)
         if (key == KEY_LEFT) {
             cmd_fp(CMD_FP_MATCH_STOP);
             auth_system_clear();
-            /* Cancelled fresh-touch request: nothing pending survives this. */
+            /*
+             * Cancel returns to whichever screen asked for this unlock,
+             * not a hardcoded UI_CLOCK — see PendingAction above. Mirrors
+             * the FP_MATCHED success dispatch's per-action routing.
+             */
+            PendingAction pending = _pendingAction;
             _pendingAction = PENDING_NONE;
-            set_state(UI_CLOCK);
+            switch (pending) {
+            case PENDING_CLEAR_CONFIRM:
+            case PENDING_ENROLL:
+                set_state(UI_SETTINGS);
+                break;
+            case PENDING_BLE_UNPAIR:
+                set_state(UI_BLE_MENU);
+                break;
+            case PENDING_TOTP:
+            default:
+                set_state(UI_MENU);
+                break;
+            }
         }
         break;
 
@@ -930,6 +987,38 @@ void nav_system_on_event(const BusEvent &e)
             ctaphid_cancel_request();
             cmd_fp(CMD_FP_MATCH_STOP);
             _lastFidoReq = 0;
+            set_state(UI_CLOCK);
+        } else if (key == KEY_CENTER) {
+            /* Button-press presence, same ceremony FP_MATCHED triggers —
+             * gives the "OK = Confirm" hint in draw_fido_prompt() a real
+             * action instead of leaving CENTER unlabeled and inert. */
+            ctaphid_confirm_user_presence();
+            cmd_fp(CMD_FP_MATCH_STOP);
+            set_state(UI_FIDO_PROCESSING);
+        }
+        break;
+
+    case UI_FIDO_PROCESSING:
+        /* Same manual escape hatch as UI_FIDO_PROMPT: this state is usually
+         * brief (CTAP keepalive/timeout clears it), but a hung host should
+         * not leave the user with no way out. */
+        if (key == KEY_LEFT) {
+            ctaphid_cancel_request();
+            cmd_fp(CMD_FP_MATCH_STOP);
+            _lastFidoReq = 0;
+            set_state(UI_CLOCK);
+        }
+        break;
+
+    case UI_BLE_PAIRING:
+        /* Every other waiting/prompt screen lets LEFT back out; this one
+         * declines the in-progress pairing instead of leaving the user
+         * stuck looking at a passkey with no cancel. */
+        if (key == KEY_LEFT) {
+            ble_fido_cancel_pairing();
+            cmd_fp(CMD_FP_MATCH_STOP);
+            _lastFidoReq = 0;
+            nav_system_set_fido_label("FIDO");
             set_state(UI_CLOCK);
         }
         break;
@@ -945,20 +1034,8 @@ void nav_system_tick(unsigned long nowMs)
         return;
 
     if (_state == UI_AUTH_ERROR) {
-        if (nowMs - _authErrorStart >= (unsigned long)AUTH_ERROR_DISPLAY_MS) {
-            /*
-             * "No sensor" is raised from Settings → Enroll, so go back there.
-             * Every other error came from an unlock attempt: drop the session
-             * and fall back to the clock.
-             */
-            if (strcmp(_enrollMsg, "No sensor") == 0) {
-                set_state(UI_SETTINGS);
-            } else {
-                auth_system_clear();
-                set_state(UI_CLOCK);
-            }
-            _enrollMsg[0] = 0;
-        }
+        if (nowMs - _authErrorStart >= (unsigned long)AUTH_ERROR_DISPLAY_MS)
+            leave_auth_error();
         return;
     }
     if (_state == UI_FIDO_SUCCESS) {
