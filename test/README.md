@@ -6,6 +6,7 @@ Four layers. **CI always runs L0 + product `pio run`.** Device L2 is bench-local
 |-------|------|------|------|
 | **L0** | Host pure | `pytest tests/host` | Every commit / CI |
 | **L1** | On-device Unity | `pio test -e test_*` | Board; or compile-only in `scripts/run_all_tests.sh` |
+| **L1 (native)** | `test_nav` on the host | `pio test -e test_nav_native` | Every commit / CI — no board, and it actually *runs* (see `[env:test_nav_native]` in `platformio.ini`) |
 
 | **L2** | Hardware integration | `pytest tests/device --device` | Product USB `1209:BEEE` attached |
 | **L3** | Acceptance | Manual + scripts | Release / WebAuthn |
@@ -20,7 +21,11 @@ pytest tests/host -q
 # Full bench install (adds pyserial + hidapi + fido2 for L2/L3)
 pip install -r tests/requirements.txt
 
-# L0 + L1 compile + L2 (skips if no board)
+# test_nav, host-run — no board, no ESP32 toolchain download
+pip install -U platformio
+pio test -e test_nav_native
+
+# L0 + L1 compile + L1 (native) + L2 (skips if no board)
 chmod +x scripts/run_all_tests.sh
 ./scripts/run_all_tests.sh
 

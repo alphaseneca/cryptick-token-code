@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 #
 # Run every automated layer that can run on this machine:
-#   L0 host pytest    — always
-#   L1 Unity compile  — when PlatformIO is installed (no board needed)
-#   L2 device pytest  — skips itself when no board is attached
+#   L0 host pytest       — always
+#   L1 Unity compile     — when PlatformIO is installed (no board needed)
+#   L1 Unity test_nav    — same suite, native: actually executes (no board)
+#   L2 device pytest     — skips itself when no board is attached
 #
 # Pass --device to make L2 a hard failure instead of a skip.
 set -euo pipefail
@@ -35,6 +36,14 @@ if command -v pio >/dev/null 2>&1; then
   done
 else
   echo "pio not installed — skipping L1 compile"
+fi
+
+echo
+echo "=== L1 Unity test_nav (native — actually runs, no board needed) ==="
+if command -v pio >/dev/null 2>&1; then
+  pio test -e test_nav_native
+else
+  echo "pio not installed — skipping test_nav_native"
 fi
 
 echo

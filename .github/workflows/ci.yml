@@ -50,6 +50,18 @@ jobs:
       - name: Install PlatformIO
         run: pip install -U platformio
 
+      # test_nav is the one L1 suite with a `platform = native` counterpart
+      # ([env:test_nav_native] in platformio.ini): it compiles with the
+      # runner's own gcc/g++ (no ESP32 toolchain, no board) and the resulting
+      # binary actually executes every TEST_ASSERT_* in test/test_nav, unlike
+      # the "L1 Unity compile" step below, which only proves the suite still
+      # compiles. Off-by-one bugs sat in test/test_nav/test_main.cpp
+      # undetected for exactly that reason — nothing had ever run it. Placed
+      # before the ESP32 toolchain steps so a nav regression fails fast and
+      # cheaply, without waiting on those.
+      - name: L1 Unity test_nav (native — actually runs)
+        run: pio test -e test_nav_native
+
       - name: Cache PlatformIO toolchains
         uses: actions/cache@v4
         with:
