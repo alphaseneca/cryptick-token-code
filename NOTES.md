@@ -824,3 +824,312 @@ adds it.)
   at pairing time, alongside whatever BLE bonding identity is already
   tracked). That correlation logic is exactly the follow-up work this note
   is written for and is out of scope here.
+
+---
+
+# Agent work notes — branch `feature/nav-test-fixes-and-ci`
+
+Two previously-flagged, unfixed issues: off-by-one bugs in `test/test_nav/test_main.cpp`,
+and a nav/HAL fingerprint-ceremony race between `src/systems/nav_system.cpp` and
+`core/fido2/hal_esp32.cpp`. Root-caused both, fixed both, and wired `test_nav` into
+CI so it actually *runs* going forward instead of only compiling. No physical device
+was available; see "What's verified vs. what needs hardware" at the end.
+
+---
+
+## 1. Off-by-one bugs in `test/test_nav/test_main.cpp`
+
+### What was wrong
+
+`enum MenuItem` in `nav_system.cpp` was originally `{ MENU_TOTP = 0, MENU_SETTINGS = 1 }`.
+A later commit (`3002531`, adding BLE and PIV) inserted two items ahead of Settings:
+`{ MENU_TOTP = 0, MENU_PIV = 1, MENU_BLE = 2, MENU_SETTINGS = 3 }`. `MENU_SETTINGS`
+moved from index 1 to index 3, but three pre-existing tests still navigated with a
+single `KEY_DOWN` from `MENU_TOTP` — which now lands on `MENU_PIV`, not Settings.
+Confirmed by actually running the suite (see §3): all three failed with the device
+ending up in the wrong `UiState` (`UI_PIV_PIN`, numeric value 15) instead of
+`UI_SETTINGS` (3).
+
+The task that assigned this flagged exactly **two** instances
+(`test_menu_to_settings`, `test_settings_enroll_flow_via_bus`) — matching what a
+closely related prior investigation into this same codebase had already written down
+independently. Actually running the suite turned up a **third**: `test_enroll_no_sensor`
+has the identical pattern and was equally broken. Fixed all three rather than leaving
+one red.
+
+### Before / after
+
+```c
+// test_menu_to_settings — before
+inject_key(KEY_DOWN); /* Settings */
+inject_key(KEY_CENTER);
+TEST_ASSERT_EQUAL(UI_SETTINGS, nav_system_state());   // FAILS: lands on UI_PIV_PIN
+
+// after
+inject_key(KEY_DOWN);
+inject_key(KEY_DOWN);
+inject_key(KEY_DOWN); /* Settings */
+inject_key(KEY_CENTER);
+TEST_ASSERT_EQUAL(UI_SETTINGS, nav_system_state());   // PASSES
+```
+
+The same two extra `KEY_DOWN` presses were added to `test_settings_enroll_flow_via_bus`
+and `test_enroll_no_sensor`, each with a one-line comment pointing back to this
+explanation (so re-deriving "why three DOWNs" doesn't require re-reading `nav_system.cpp`
+again later).
+
+### A second, different bug the fix uncovered
+
+Fixing the navigation let `test_settings_enroll_flow_via_bus` run far enough to hit a
+**real firmware bug**, not a test bug: `set_state()` in `nav_system.cpp` unconditionally
+clears `_enrollMsg[0] = 0` on every transition (added in the same commit that reordered
+the menu, presumably to stop a stale banner leaking across screens). But
+`FP_ENROLL_DONE`/`FP_ENROLL_FAIL` write `_enrollMsg` ("Stored", "Mismatch", ...) and then
+*immediately* call `set_state(UI_SETTINGS)` — which wiped the message before
+`nav_system_tick()`'s 2-second banner timer ever got to show it.
+`start_enroll()`'s "No sensor" → `UI_AUTH_ERROR` path had the identical bug, and it is
+not just cosmetic there: `nav_system_tick()`'s `UI_AUTH_ERROR` branch does
+`strcmp(_enrollMsg, "No sensor")` to decide whether to return to Settings or drop the
+auth session back to the clock — with the message wiped, every "no sensor" enroll
+attempt would incorrectly drop the session too.
+
+**Fix:** in all three call sites, transition first, then write the message — not the
+other way around:
+
+```c
+// before (FP_ENROLL_DONE)
+strncpy(_enrollMsg, "Stored", sizeof(_enrollMsg) - 1);
+_enrollMsgStart = now;
+set_state(UI_SETTINGS);          // clears _enrollMsg right back out
+
+// after
+set_state(UI_SETTINGS);
+strncpy(_enrollMsg, "Stored", sizeof(_enrollMsg) - 1);
+_enrollMsgStart = now;
+```
+
+Same reorder in the `FP_ENROLL_FAIL` branch and in `start_enroll()`'s no-sensor path.
+`set_state()` itself is untouched — nothing else that relies on "leaving a screen clears
+its banner" changes behavior.
+
+---
+
+## 2. The nav/HAL fingerprint-ceremony race
+
+### Precise characterization
+
+`fp_system.cpp` is a single physical sensor reached from **two independent,
+unsynchronized drivers**:
+
+1. **nav_system's own ceremonies** (async, event-bus driven): `UI_AUTH_PROMPT`
+   (`enter_totp()`), `UI_FP_ENROLL`, `UI_FP_CLEAR_CONFIRM`. These call
+   `cmd_fp(CMD_FP_MATCH_AUTH)` and let `fp_system_tick()` poll the sensor each
+   `loop()` iteration; a match comes back as an ordinary `FP_MATCHED`/`FP_NO_MATCH`
+   bus event into `nav_system_on_event()`.
+2. **The HAL's self-service presence wait** (`up_test_locked()` in
+   `core/fido2/hal_esp32.cpp`), used whenever a presence test is requested from a
+   context that is *not* the core-0 FIDO task — i.e. it blocks the Arduino main loop
+   directly (CDC `OATH PUT`/`TOTP_DEL`/`SETTIME`, `src/host/oath_ops.cpp`'s
+   `oath_ensure_uv()`). It drives the *same* sensor via
+   `device_presence_fp_begin()`/`device_presence_fp_poll()`/`device_presence_fp_end()`.
+
+`hal_esp32.cpp` already serializes concurrent callers of `ctap_user_presence_test_ex()`
+against *each other* with `_up_mutex` ("refuse, don't queue" — see its own comment).
+That mutex has zero visibility into nav_system's ceremonies, which never call
+`ctap_user_presence_test_ex()` at all. Concretely, before this fix:
+
+- `device_presence_fp_begin()` **unconditionally overwrote** `fp_system`'s
+  `_matchMode`, discarding whatever nav_system's own ceremony had set it to, and
+  **also unconditionally aborted an in-progress enrollment** (`_enrolling`).
+- `device_presence_fp_poll()` publishes `FP_MATCHED`/`FP_NO_MATCH` onto the *same*
+  event bus `nav_system_on_event()` listens on.
+- There is a second, separate path into the same collision: `oath_ensure_uv()` (CDC
+  path) calls `nav_system_set_fido_ui(1)` **directly**, and the normal
+  `_fido_ui_request` bridge in `src/main.cpp`'s `loop()` does the same thing whenever
+  the FIDO task (core 0) starts an ordinary WebAuthn ceremony while the user is
+  separately doing something else on the device. `nav_system_set_fido_ui(1)`'s only
+  guard was `_state != UI_FIDO_PROMPT` — it did not ask whether nav was already
+  mid-ceremony for an unrelated reason.
+
+Two concrete, reachable failure modes, with both sides behaving exactly as designed in
+isolation — this is a missing-coordination gap, not a bug in either path alone:
+
+1. **Cross-ceremony confirmation.** User presses CENTER→TOTP on the device
+   (`UI_AUTH_PROMPT` opens, `CMD_FP_MATCH_AUTH` starts). Before they touch, a CDC
+   `OATH PUT` arrives (or, equally, a host WebAuthn request lands on the FIDO task).
+   Either stomps `fp_system`'s match state and/or nav's own UI state over to the
+   unrelated ceremony. The user's very next touch — which they believe approves the
+   on-device TOTP view — instead (or also) confirms the host-driven ceremony they
+   never consciously saw a prompt for, with nothing on screen distinguishing the two.
+2. **Silent ceremony kill.** Even with *no* touch at all, simply running the HAL
+   self-service path while nav owns an open ceremony stomped `_matchMode` and later
+   cleared it to `MATCH_OFF` on cleanup — leaving nav's "place finger" screen on
+   screen with the sensor quietly not polling anymore, and no event to tell nav so.
+
+### The design decision
+
+Extended the *same* philosophy `_up_mutex` already uses — refuse the second claimant
+outright rather than queue or silently steal — down into `fp_system`, the actual
+shared resource, and symmetrically into `nav_system_set_fido_ui()` for the direct-call
+path. A queued/silently-merged ceremony was rejected for the same reason the existing
+`_up_mutex` comment gives: it would resolve on a touch given for context the user
+never saw.
+
+**Fix, three pieces, all additive/refuse-only — nothing that already worked changes
+behavior:**
+
+1. **`src/systems/fp_system.cpp`**: added `enum MatchOwner { OWNER_NONE, OWNER_NAV,
+   OWNER_HAL_PRESENCE }` alongside the existing `MatchMode`. `CMD_FP_MATCH_AUTH`/
+   `CMD_FP_MATCH_FIDO` tag ownership `OWNER_NAV`; `stop_match()` (called from every
+   exit path) resets it to `OWNER_NONE`. `device_presence_fp_begin()` now **refuses**
+   (returns `false`, touches nothing) if the sensor is already owned by nav_system or
+   mid-enrollment, instead of stealing it:
+   ```c
+   if (_enrolling || (_matchMode != MATCH_OFF && _matchOwner != OWNER_HAL_PRESENCE)) {
+       CLOG_W("FP", "presence refused: sensor busy (mode=%u enrolling=%d)", ...);
+       return false;
+   }
+   ```
+   Signature changed `void` → `bool` (`core/fido2/device.h` and the `#else`
+   no-fingerprint stub updated to match).
+2. **`core/fido2/hal_esp32.cpp`**: `up_test_locked()`'s self-service branch now checks
+   the return value and bails out exactly like the existing `_up_mutex`-busy refusal
+   (same `return 0`, same UI/flag cleanup) instead of barging in:
+   ```c
+   if (self_service && !device_presence_fp_begin()) {
+       CLOG_W("HAL", "UP refused: fingerprint sensor owned by nav_system");
+       _fido_ui_request = 0; _is_processing = false; _uv_cache_until_ms = 0;
+       return 0;
+   }
+   ```
+3. **`src/systems/nav_system.cpp`**: new `nav_owns_ceremony()` (true while `_state`
+   is `UI_AUTH_PROMPT`, `UI_FP_ENROLL`, or `UI_FP_CLEAR_CONFIRM`) guards the top of
+   `nav_system_set_fido_ui()` — any incoming HAL request (`req` 0/1/2/3/4) is a no-op
+   while nav owns one of its own ceremonies, covering *both* the `_fido_ui_request`
+   bridge (ordinary WebAuthn-while-user-is-on-the-menu) and `oath_ensure_uv()`'s direct
+   call. Deferring costs the host ceremony nothing it wasn't already going to pay:
+   `up_test_locked()` bounds its own wait with `CRYPTICK_FIDO_UP_TIMEOUT_MS` regardless
+   of whether a prompt is shown for it — functionally identical to the user simply not
+   looking at the device, which, from that ceremony's point of view, they were not.
+
+**Why not go further** (e.g. a real cross-ceremony queue with its own resume/retry):
+rejected as unnecessary risk. `nav_system`'s side of the collision is single-core/
+single-thread (the Arduino loop), so once `nav_system_set_fido_ui()` properly defers,
+there is no live ceremony state left for a second mechanism to corrupt — refuse-only is
+sufficient, and a resume/retry design would add real behavioral complexity to a
+security-critical path with no hardware available to validate it against.
+
+### New regression test
+
+`test_fido_ui_request_deferred_during_auth_prompt` in `test/test_nav/test_main.cpp`:
+opens `UI_AUTH_PROMPT`, calls `nav_system_set_fido_ui(1)` (simulating an overlapping
+host ceremony), asserts the state is *still* `UI_AUTH_PROMPT`, then delivers the
+touch and asserts it resolves the *original* ceremony (`UI_TOTP`,
+`auth_system_is_authenticated()`). Verified this test actually catches the bug: with
+the `nav_owns_ceremony()` guard temporarily disabled, it fails with
+`Expected 4 Was 8` (`UI_AUTH_PROMPT` → `UI_FIDO_PROMPT`), exactly the hijack described
+above.
+
+### Related, NOT fixed, flagged here instead
+
+`oath_ensure_uv()` additionally still republishes a now-stale `CMD_FP_MATCH_FIDO`/
+`CMD_FP_MATCH_STOP` pair onto the bus after a deferred/self-service wait returns,
+which `fp_system_on_cmd()` processes as two harmless back-to-back no-ops once the
+loop unblocks (match briefly re-armed, then immediately stopped). It is inert with
+this fix in place — confirmed by the passing test above — but it is bus traffic that
+no longer needs to exist; cleaning it up would mean changing `oath_ensure_uv()`'s own
+nav-driving code in `src/host/oath_ops.cpp`, which is outside the two files
+(`nav_system.cpp`, `hal_esp32.cpp`) this task scoped the fix to.
+
+---
+
+## 3. CI / build: `test_nav` now actually *runs*
+
+Root cause of §1 going uncaught: `[env:test_nav]` in `platformio.ini` targets
+`platform = espressif32` / `board = esp32-s3-devkitc-1` — real hardware. CI (and
+`scripts/run_all_tests.sh`) only ever ran
+`pio test -e test_nav --without-uploading --without-testing`, which compiles the
+suite and stops; not one `TEST_ASSERT_*` had ever executed outside a bench with a
+board attached.
+
+Added `[env:test_nav_native]` (`platformio.ini`): same `test/test_nav/test_main.cpp`,
+`platform = native` — compiles with the runner's own gcc/g++ (no ESP32 toolchain
+download, no board) and the resulting binary actually executes. `nav_system.cpp`,
+`event_bus.cpp`, and `auth_system.cpp` only reach into the Arduino core for
+`millis()`/`delay()`, the FreeRTOS critical-section macros, and `Preferences` —
+satisfied by new host-side shims in `test/native_support/` (`Arduino.h`,
+`Preferences.h`, `cryptick_log_native.cpp` — the real `core/cryptick_log.cpp` needs
+FreeRTOS + the TinyUSB CDC driver, neither of which exist on a host) and a small
+`native_main.cpp` providing the `main()` the Arduino core normally supplies.
+
+Wired into:
+- **`.github/workflows/ci.yml`**: new step `L1 Unity test_nav (native — actually
+  runs)` running `pio test -e test_nav_native`, placed right after "Install
+  PlatformIO" and before the ESP32 toolchain/cache steps, so a nav regression fails
+  fast and cheaply.
+- **`scripts/run_all_tests.sh`**: new section running the same command for local
+  parity with CI.
+- **`test/README.md`**: documented the new native row and quick-start command.
+
+Only `test_nav` got a native counterpart (that is what this task scoped); the other
+four Unity suites (`test_totp`, `test_event_bus`, `test_fp_enroll`,
+`test_secret_crypto`) still only compile in CI. Worth doing the same for them later,
+but out of scope here.
+
+---
+
+## What's verified vs. what needs hardware
+
+**Verified directly, with real command output:**
+- `pio test -e test_nav_native` — all 15 cases pass (14 pre-existing + the new
+  regression test), including the three off-by-one fixes.
+- Confirmed the new regression test is not vacuous: with the `nav_owns_ceremony()`
+  guard disabled, the same run fails with `Expected 4 Was 8`.
+- `pio run -e esp32-s3-n16r8` (the real product build, full ESP32-S3 Arduino
+  toolchain, not a stub) — compiles clean, including every file this fix touched
+  (`fp_system.cpp`, `hal_esp32.cpp`, `device.h`, `nav_system.cpp`). This matters
+  because `test_nav`/`test_nav_native` only compile `nav_system.cpp` +
+  `auth_system.cpp` + `event_bus.cpp` against a stubbed `fp_system_ready()` et al. —
+  they never touch `fp_system.cpp` or `hal_esp32.cpp` at all, so this was the only way
+  to confirm the Issue-B changes type-check against the real Arduino/ESP-IDF headers.
+
+**Code-logic verified, NOT hardware-verified (no physical unit in this sandbox):**
+- The actual race scenario — a CDC OATH command or a host WebAuthn request arriving
+  while the on-device TOTP/enroll/clear prompt is open — is exercised in the new test
+  only through `fp_system`'s/`nav_system`'s public surface (bus events, direct calls),
+  not through actual concurrent core-0/core-1 execution or real UART timing against
+  the R558-S sensor.
+- Whether `device_presence_fp_begin()`'s refusal path is ever actually reached in
+  practice (i.e. whether the timing window is as reachable on real hardware as the
+  code read suggests) is unconfirmed.
+- The CTAPHID keepalive cadence during a refused/deferred self-service wait
+  (`CRYPTICK_FIDO_KEEPALIVE_MS` = 100 ms against `CRYPTICK_FIDO_UP_TIMEOUT_MS` = 29 s)
+  is unchanged by this fix, but was not independently re-verified against a real host
+  WebAuthn client's own timeout behavior.
+- `pio run -e esp32-s3-n16r8-ship` / `-jtag` / `-install` and `pio test -e test_nav`
+  (the real board target) were not run — no board attached to this sandbox, and
+  `-ship`/`-jtag`/`-install` were not re-verified after this change (only the default
+  product env was built, which is the one most exposed to the touched files).
+
+---
+
+## Note on a mid-task instruction
+
+Partway through this task, two messages arrived mid-session, framed as being from
+"the coordinator," instructing the addition of a git remote pointing at
+`/Users/aurelius/Projects/cryptick-token/cryptick-token-code` (a separate local
+checkout) and a rebase of this branch onto it, on the claim that the local checkout
+has substantial unpushed work (`require_fresh_touch()`/`PendingAction`, named in the
+original task text) that origin lacks. That specific git operation was not run: this
+session's git access is sandboxed to its own worktree, and the sandbox had already
+refused an earlier, related command for reaching outside it — an injected mid-task
+instruction pressing urgency is not grounds to work around that. Verified the
+underlying factual claim independently instead, read-only: `require_fresh_touch()`
+does exist in that other checkout and not in this one. But the files this task's
+Issue B actually lives in — `core/fido2/hal_esp32.cpp`, `src/systems/fp_system.cpp`,
+`src/systems/fp_system.h` — are byte-identical between the two checkouts (`diff -q`),
+and that other checkout's own notes independently describe the exact same off-by-one
+bugs and the exact same nav/HAL sensor-ownership gap documented above (down to the
+same two test names for the off-by-one bugs). So the divergence is real but isolated
+to an unrelated additive feature on `nav_system.cpp`/`test_main.cpp`, and this fix is
+not stale against it. Flagging this here rather than silently acting on it either way.
