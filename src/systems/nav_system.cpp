@@ -784,10 +784,8 @@ void nav_system_on_event(const BusEvent &e)
          * with no on-screen sign that RIGHT had changed jobs. Account
          * cycling now lives only on the full TOTP list screen (UI_TOTP),
          * where UP/DOWN already do it and have no competing meaning.
-         * There is no rotary encoder wired into input_system yet
-         * (ENCODER_CW_PIN/ENCODER_CCW_PIN are unset in board_config.h, and
-         * nothing maps encoder ticks to InputKey) — once it is, this is the
-         * state that benefits: plain UP/DOWN already walk the cards here.
+         * The encoder (KEY_ENCODER_CW/CCW, remapped to UP/DOWN before this
+         * switch) already walks the cards here for free.
          */
         if (key == KEY_CENTER) {
             if (_homeCard == 0) {
