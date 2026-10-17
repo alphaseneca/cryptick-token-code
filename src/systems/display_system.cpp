@@ -11,7 +11,6 @@
 #include "usb_device.h"
 #if CRYPTICK_BLE_FIDO
 #include "ble_fido.h"
-#include "ble_hid_keyboard.h"
 #endif
 #include <stdio.h>
 #include <string.h>
@@ -445,33 +444,68 @@ static void draw_clock(uint32_t utc)
 }
 
 /**
- * PIV PIN display, shared by the Home "Quick PIV Login" card and the Menu →
- * "PIV Login PIN" screen (draw_piv_pin below) — see finding #8: the two
- * entry points used to show different slot info, different button-hint
- * wording ("Auto-Type PIN" vs "Auto-type into host"), and different offline
- * copy for what is exactly the same action. Only the title differs now,
- * same as draw_settings()/draw_ble_menu() share draw_list_row().
+ * Home "Quick PIV Login" card: launches the same PIV PIN entry ceremony
+ * (UI_PIV_PIN_ENTRY — draw_piv_pin_entry() below, nav_system.cpp's
+ * enter_piv_pin_entry()) as Menu -> PIV Login PIN. There used to be a fixed
+ * demo PIN here that a single CENTER press auto-typed with no confirmation
+ * at all (draw_piv_pin_screen, shared verbatim with the Menu screen — see
+ * NOTES.md); replaced because the PIN is now chosen by hand on the entry
+ * screen, not fixed in advance, so there is no code value left to preview
+ * the way the Quick-TOTP card previews a live one. This is just a launcher.
  */
-static void draw_piv_pin_screen(const char *title)
+static void draw_piv_pin_launch_card(void)
 {
-    draw_title(title);
+    draw_title("Quick PIV Login");
     gfx.setFont(DisplayFont::Medium);
-    gfx.drawText(0, 24, "PIN: 123456");
+    gfx.drawText(0, 30, "Press OK to enter PIN");
     gfx.setFont(DisplayFont::Small);
-#if CRYPTICK_BLE_FIDO
-    if (ble_hid_keyboard_is_connected()) {
-        gfx.drawText(0, 38, "BLE: Connected to Mac");
-        gfx.drawText(0, 48, "Press [OK] to Auto-type");
-        gfx.drawText(0, 58, "PIN into Lock Screen");
-    } else {
-        gfx.drawText(0, 38, "BLE: Not Connected");
-        gfx.drawText(0, 48, "Pair Mac Bluetooth or");
-        gfx.drawText(0, 58, "type manually: 123456");
+    gfx.drawText(0, 48, "Then confirm with your");
+    gfx.drawText(0, 58, "fingerprint to send it");
+}
+
+/**
+ * PIV PIN entry (UI_PIV_PIN_ENTRY) — see nav_system.cpp's
+ * enter_piv_pin_entry() / commit_piv_pin_type(). Digit boxes reuse
+ * draw_list_row()'s selected-row look (filled box, inverted text) for the
+ * one currently being set, the same inversion idiom this file already uses
+ * for every other kind of selection instead of inventing a caret or
+ * underline just for this screen. The encoder is remapped to KEY_UP/
+ * KEY_DOWN by nav_system.cpp's global remap, so "Scroll" below is literally
+ * true for both the encoder and the 5-way UP/DOWN.
+ */
+static void draw_piv_pin_entry(void)
+{
+    draw_title("Enter PIV PIN");
+
+    int len = nav_system_piv_pin_len();
+    int pos = nav_system_piv_pin_pos();
+    const int boxW = 16, boxH = 20, y0 = 18;
+    int x0 = (128 - boxW * len) / 2;
+
+    gfx.setFont(DisplayFont::Medium);
+    for (int i = 0; i < len; i++) {
+        int x = x0 + i * boxW;
+        char ch[2] = { (char)('0' + nav_system_piv_pin_digit(i)), 0 };
+        int cw = gfx.textWidth(ch);
+        int tx = x + (boxW - cw) / 2;
+        int ty = y0 + boxH - 6;
+        if (i == pos) {
+            gfx.fillRect(x + 1, y0, boxW - 2, boxH);
+            gfx.setInverted(true);
+            gfx.drawText(tx, ty, ch);
+            gfx.setInverted(false);
+        } else {
+            gfx.drawRect(x + 1, y0, boxW - 2, boxH);
+            gfx.drawText(tx, ty, ch);
+        }
     }
-#else
-    gfx.drawText(0, 40, "NIST Default (Slot 9A)");
-    gfx.drawText(0, 52, "Enter manually on Mac");
-#endif
+
+    gfx.setFont(DisplayFont::Small);
+    const char *hint1 = "Scroll = digit  Left = back";
+    gfx.drawText((128 - gfx.textWidth(hint1)) / 2, 50, hint1);
+    const char *hint2 = (pos + 1 < len) ? "OK = next digit"
+                                        : "OK = confirm + touch";
+    gfx.drawText((128 - gfx.textWidth(hint2)) / 2, 60, hint2);
 }
 
 /**
@@ -518,7 +552,7 @@ static void draw_home(uint32_t utc)
 {
     int card = nav_system_home_card();
     if (card == 1) {
-        draw_piv_pin_screen("Quick PIV Login");
+        draw_piv_pin_launch_card();
     } else if (card == 2) {
         /* Quick TOTP Card */
         draw_status_bar(utc);
@@ -657,11 +691,6 @@ static void draw_enroll(void)
     int fill = (step >= 2 && !nav_system_enroll_remove()) ? 128 : (step == 1 ? 40 : 80);
     if (nav_system_enroll_remove() && step == 1) fill = 64;
     gfx.fillRect(0, 58, fill, 5);
-}
-
-static void draw_piv_pin(void)
-{
-    draw_piv_pin_screen("PIV Login PIN");
 }
 
 /*
@@ -808,8 +837,8 @@ static void render(void)
         draw_menu_list(items, 4, nav_system_menu_index());
         break;
     }
-    case UI_PIV_PIN:
-        draw_piv_pin();
+    case UI_PIV_PIN_ENTRY:
+        draw_piv_pin_entry();
         break;
     case UI_BLE_MENU:
         draw_ble_menu();
