@@ -502,6 +502,20 @@ static void enter_ble(unsigned long now)
 
 static void begin_enroll_now(void)
 {
+    /*
+     * start_enroll() already gates this on fp_system_ready() for its own
+     * call path, but the PENDING_ENROLL fresh-touch-confirm dispatch calls
+     * here directly with no prior check — if the sensor dropped out between
+     * the touch confirming and this running, that path needs the same
+     * no-sensor fallback instead of blindly issuing CMD_FP_ENROLL_START.
+     */
+    if (!fp_system_ready()) {
+        set_state(UI_AUTH_ERROR);
+        strncpy(_enrollMsg, "No sensor", sizeof(_enrollMsg) - 1);
+        _authErrorStart = millis();
+        _authErrorNoSensor = true;
+        return;
+    }
     _enrollStep = 1;
     _enrollRemove = false;
     _enrollMsg[0] = 0;
@@ -513,17 +527,19 @@ static void start_enroll(void)
 {
     if (!fp_system_ready()) {
         /*
-         * set_state() clears _enrollMsg on every transition (so a stale
-         * banner from the previous screen never bleeds into the next one),
-         * so the "No sensor" banner this screen is about to show must be
-         * written *after* the transition, not before, or it is wiped before
-         * nav_system_tick()'s UI_AUTH_ERROR branch ever reads it — that
-         * branch uses the exact string "No sensor" to decide whether to
-         * return to Settings or drop the session back to the clock.
+         * set_state() clears _enrollMsg and _authErrorNoSensor on every
+         * transition (so stale state from the previous screen never bleeds
+         * into the next one), so both the "No sensor" banner and the
+         * no-sensor flag must be written *after* the transition, not
+         * before, or set_state() wipes them before leave_auth_error() (the
+         * AUTH_ERROR_DISPLAY_MS timeout, and the early CENTER/LEFT dismiss)
+         * ever reads _authErrorNoSensor to decide whether to return to
+         * Settings or drop the session back to the clock.
          */
         set_state(UI_AUTH_ERROR);
         strncpy(_enrollMsg, "No sensor", sizeof(_enrollMsg) - 1);
         _authErrorStart = millis();
+        _authErrorNoSensor = true;
         return;
     }
     /*
