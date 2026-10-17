@@ -362,7 +362,11 @@ static void draw_device_info(void)
     u8g2.setFont(u8g2_font_5x7_tr);
 
     char line[36];
-    int y = 25;
+    /* 5 rows now fit under the title bar (y=14) with a 9px pitch — a 10px
+     * pitch starting at 25 (the 4-row layout) would push the 5th row past
+     * the 64px panel height. */
+    int y = 23;
+    const int step = 9;
 
     /*
      * Every line here carries at least one runtime value (template/account
@@ -375,17 +379,31 @@ static void draw_device_info(void)
              usb_device_mounted() ? "1209:BEEE host" : "not mounted");
     draw_str_ellipsis(0, y, line, 128);
 
-    y += 10;
+    y += step;
     snprintf(line, sizeof(line), "FP   %s  %u tpl",
              fp_system_ready() ? "ready" : "absent",
              (unsigned)fp_system_template_count());
     draw_str_ellipsis(0, y, line, 128);
 
-    y += 10;
+    y += step;
     snprintf(line, sizeof(line), "OATH %d accounts", nav_system_account_count());
     draw_str_ellipsis(0, y, line, 128);
 
-    y += 10;
+    /*
+     * Settings used to have a separate "Clock: RTC OK / Soft (Sync!)" row,
+     * but it pointed at this same screen, which never showed any clock
+     * content — folded in here instead of leaving that row's label
+     * pointing at nothing (see the SettingsItem comment in nav_system.cpp).
+     * There is no on-device sync action: SETTIME / OATH SET_TIME only come
+     * from the USB console (src/host/serial_comm.cpp).
+     */
+    y += step;
+    extern bool g_rtc_ok __attribute__((weak));
+    bool rtc_ok = (&g_rtc_ok != nullptr) ? g_rtc_ok : false;
+    snprintf(line, sizeof(line), "Clk  %s", rtc_ok ? "RTC OK" : "Soft (SETTIME/USB)");
+    u8g2.drawStr(0, y, line);
+
+    y += step;
     unsigned long up = millis() / 1000UL;
     uint16_t slp = nav_system_sleep_timeout_sec();
     if (slp)
@@ -416,33 +434,81 @@ static void draw_clock(uint32_t utc)
                     ICON_FINGERPRINT_H, fp_system_ready());
 }
 
+/**
+ * PIV PIN display, shared by the Home "Quick PIV Login" card and the Menu →
+ * "PIV Login PIN" screen (draw_piv_pin below) — see finding #8: the two
+ * entry points used to show different slot info, different button-hint
+ * wording ("Auto-Type PIN" vs "Auto-type into host"), and different offline
+ * copy for what is exactly the same action. Only the title differs now,
+ * same as draw_settings()/draw_ble_menu() share draw_list_row().
+ */
+static void draw_piv_pin_screen(const char *title)
+{
+    draw_title(title);
+    u8g2.setFont(u8g2_font_6x12_tr);
+    u8g2.drawStr(0, 24, "PIN: 123456");
+    u8g2.setFont(u8g2_font_5x7_tr);
+#if CRYPTICK_BLE_FIDO
+    if (ble_hid_keyboard_is_connected()) {
+        u8g2.drawStr(0, 38, "BLE: Connected to Mac");
+        u8g2.drawStr(0, 48, "Press [OK] to Auto-type");
+        u8g2.drawStr(0, 58, "PIN into Lock Screen");
+    } else {
+        u8g2.drawStr(0, 38, "BLE: Not Connected");
+        u8g2.drawStr(0, 48, "Pair Mac Bluetooth or");
+        u8g2.drawStr(0, 58, "type manually: 123456");
+    }
+#else
+    u8g2.drawStr(0, 40, "NIST Default (Slot 9A)");
+    u8g2.drawStr(0, 52, "Enter manually on Mac");
+#endif
+}
+
+/**
+ * Bottom row shared by the Home "Quick TOTP" card and the Menu → TOTP list
+ * screen (draw_totp below) — see finding #9: draw_totp had no button hint
+ * at all even though its KEY_CENTER does the same BLE-type action as the
+ * card, and the two disagreed on text-countdown vs progress-bar. Standardizing
+ * on the bar: it already existed on draw_totp, and a right-aligned "NNs"
+ * string has to fight the hint text for the same 128px-wide row, which the
+ * bar does not.
+ */
+static void draw_totp_bottom_row(uint32_t utc, int period)
+{
+    if (period <= 0) period = 30;
+    u8g2.setFont(u8g2_font_5x7_tr);
+    u8g2.drawStr(0, 58, "[OK] Type Code");
+    unsigned long rem = (unsigned long)period - (utc % (unsigned long)period);
+    int barW = (int)((128UL * rem) / (unsigned long)period);
+    u8g2.drawBox(0, 60, barW, 3);
+}
+
+/**
+ * Minimal page indicator for the 3-card Home carousel (finding #7): a
+ * filled square for the current card, hollow for the others. There is no
+ * row free across all three card layouts at the full screen width — card
+ * 1's button-hint box and card 2's bottom row both already span edge to
+ * edge — so this lives in the gap between the status/title bar and each
+ * card's own content, right of where the Quick-TOTP header is capped (see
+ * the narrowed ellipsis width below) to guarantee the column stays clear.
+ */
+static void draw_home_dots(int card)
+{
+    const int y = 15, x0 = 116, step = 4, size = 3;
+    for (int i = 0; i < 3; i++) {
+        int x = x0 + i * step;
+        if (i == card)
+            u8g2.drawBox(x, y, size, size);
+        else
+            u8g2.drawFrame(x, y, size, size);
+    }
+}
+
 static void draw_home(uint32_t utc)
 {
     int card = nav_system_home_card();
     if (card == 1) {
-        /* Quick PIV PIN Card */
-        draw_title("Quick PIV Login");
-        draw_icon_state(0, 19, icon_lock_bits, ICON_LOCK_W, ICON_LOCK_H, true);
-        u8g2.setFont(u8g2_font_6x12_tr);
-        u8g2.drawStr(16, 28, "PIN  123456");
-        u8g2.setFont(u8g2_font_5x7_tr);
-        u8g2.drawStr(16, 38, "Slot 9A - NIST PIV");
-#if CRYPTICK_BLE_FIDO
-        bool hidc = ble_hid_keyboard_is_connected();
-        if (hidc) {
-            u8g2.drawBox(0, 41, 128, 11);
-            u8g2.setDrawColor(0);
-            u8g2.drawStr(4, 49, "[OK] Auto-type PIN");
-            u8g2.setDrawColor(1);
-        } else {
-            u8g2.drawFrame(0, 41, 128, 11);
-            u8g2.drawStr(4, 49, "[OK] Auto-type PIN");
-        }
-        draw_icon_state(0, 52, icon_ble_bits, ICON_BLE_W, ICON_BLE_H, hidc);
-        draw_str_ellipsis(15, 61, hidc ? "Connected" : "Offline - pair to use", 113);
-#else
-        u8g2.drawStr(0, 50, "[OK] Type PIN");
-#endif
+        draw_piv_pin_screen("Quick PIV Login");
     } else if (card == 2) {
         /* Quick TOTP Card */
         draw_status_bar(utc);
@@ -462,23 +528,22 @@ static void draw_home(uint32_t utc)
             u8g2.setFont(u8g2_font_5x7_tr);
             u8g2.drawStr(0, 18, hdr);
             int hx = u8g2.getStrWidth(hdr);
-            draw_str_ellipsis(hx + 4, 18, c.label.length() ? c.label.c_str() : "Account", 124 - hx);
+            /* Capped short of 128 (not the 124 draw_totp's own header
+             * allows) so a long account label can't paint into the page
+             * dots' column at x>=116. */
+            draw_str_ellipsis(hx + 4, 18, c.label.length() ? c.label.c_str() : "Account", 112 - hx);
 
             u8g2.setFont(u8g2_font_logisoso22_tn);
             int cw = u8g2.getStrWidth(code.c_str());
             u8g2.drawStr((128 - cw) / 2, 46, code.c_str());
 
-            u8g2.setFont(u8g2_font_5x7_tr);
-            u8g2.drawStr(0, 58, "[OK] Type code");
-            int rem = 30 - (int)(utc % 30);
-            char rem_s[12];
-            snprintf(rem_s, sizeof(rem_s), "%02ds", rem);
-            int rw = u8g2.getStrWidth(rem_s);
-            u8g2.drawStr(128 - rw, 58, rem_s);
+            draw_totp_bottom_row(utc, c.period);
         }
     } else {
         draw_clock(utc);
     }
+
+    draw_home_dots(card);
 
     const char *msg = nav_system_enroll_message();
     if (msg && msg[0]) {
@@ -511,23 +576,26 @@ static void draw_totp(uint32_t utc)
     snprintf(header, sizeof(header), "%d/%d ",
              idx + 1, (int)_creds->size());
     u8g2.setFont(u8g2_font_5x7_tr);
-    u8g2.drawStr(0, 18, header);
+    u8g2.drawStr(0, 16, header);
     int hx = u8g2.getStrWidth(header);
-    draw_str_ellipsis(hx, 18,
+    draw_str_ellipsis(hx, 16,
                       c.label.length() ? c.label.c_str() : "Account",
                       128 - hx);
 
     const char *issuer = c.issuer.length() ? c.issuer.c_str() : "-";
-    draw_str_ellipsis(0, 28, issuer, 128);
+    draw_str_ellipsis(0, 25, issuer, 128);
 
+    /*
+     * Shifted up from the old baseline (54 → 48) to leave room below for
+     * the bottom-row hint added by finding #9 — draw_totp has an issuer
+     * line the Home quick-card doesn't, so it can't reuse the card's exact
+     * y-coordinates and still clear its own code digits.
+     */
     u8g2.setFont(u8g2_font_logisoso22_tn);
     int cw = u8g2.getStrWidth(code.c_str());
-    u8g2.drawStr((128 - cw) / 2, 54, code.c_str());
+    u8g2.drawStr((128 - cw) / 2, 48, code.c_str());
 
-    int period = c.period > 0 ? c.period : 30;
-    unsigned long rem = period - (utc % (unsigned long)period);
-    int barW = (int)((128 * rem) / period);
-    u8g2.drawBox(0, 60, barW, 3);
+    draw_totp_bottom_row(utc, c.period);
 }
 
 /**
@@ -583,80 +651,74 @@ static void draw_enroll(void)
 
 static void draw_piv_pin(void)
 {
-    draw_title("PIV Login PIN");
-    draw_icon_state(0, 18, icon_lock_bits, ICON_LOCK_W, ICON_LOCK_H, true);
-    u8g2.setFont(u8g2_font_6x12_tr);
-    u8g2.drawStr(16, 27, "PIN  123456");
-
-    u8g2.setFont(u8g2_font_5x7_tr);
-#if CRYPTICK_BLE_FIDO
-    bool hidc = ble_hid_keyboard_is_connected();
-    draw_icon_state(0, 36, icon_ble_bits, ICON_BLE_W, ICON_BLE_H, hidc);
-    draw_str_ellipsis(15, 44, hidc ? "Connected" : "Offline", 113);
-    draw_str_ellipsis(0, 58,
-                      hidc ? "[OK] Auto-type into host" : "Pair, or type 123456 by hand",
-                      128);
-#else
-    u8g2.drawStr(0, 40, "NIST default - Slot 9A");
-    u8g2.drawStr(0, 54, "Enter manually on host");
-#endif
+    draw_piv_pin_screen("PIV Login PIN");
 }
 
+/*
+ * draw_fido_prompt / draw_fido_processing below both name the CENTER button
+ * "OK" (finding #12 — "OK" is the majority usage elsewhere, so it is the
+ * one picked; the physical silkscreen/board_config.h name "CENTER" never
+ * appears on screen anywhere, including here).
+ */
 static void draw_fido_prompt(void)
 {
     const char *label = nav_system_fido_label();
+    bool custom = (label && label[0] && strcmp(label, "FIDO") != 0);
+    const char *headline = custom ? label : "WebAuthn / FIDO";
+    const char *sub = custom ? "Touch sensor to confirm" : "Place finger on sensor";
+
     draw_title("Confirm");
     u8g2.setFont(u8g2_font_6x12_tr);
-    if (label && label[0] && strcmp(label, "FIDO") != 0) {
-        int lw = u8g2.getStrWidth(label);
-        if (lw > 120)
-            draw_str_ellipsis(4, 32, label, 120);
-        else
-            u8g2.drawStr((128 - lw) / 2, 32, label);
+    int lw = u8g2.getStrWidth(headline);
+    if (lw > 120)
+        draw_str_ellipsis(4, 28, headline, 120);
+    else
+        u8g2.drawStr((128 - lw) / 2, 28, headline);
 
-        u8g2.setFont(u8g2_font_5x7_tr);
-        const char *sub = "Touch sensor to confirm";
-        int sw = u8g2.getStrWidth(sub);
-        u8g2.drawStr((128 - sw) / 2, 48, sub);
+    u8g2.setFont(u8g2_font_5x7_tr);
+    int sw = u8g2.getStrWidth(sub);
+    u8g2.drawStr((128 - sw) / 2, 40, sub);
 
-        const char *hint = "Left = Cancel";
-        int hw = u8g2.getStrWidth(hint);
-        u8g2.drawStr((128 - hw) / 2, 58, hint);
-    } else {
-        const char *m = "WebAuthn / FIDO";
-        int mw = u8g2.getStrWidth(m);
-        u8g2.drawStr((128 - mw) / 2, 32, m);
+    /*
+     * CENTER now also confirms presence (nav_system.cpp UI_FIDO_PROMPT
+     * KEY_CENTER), the same ceremony a fingerprint match triggers — this
+     * hint used to show only "Left = Cancel", the one place on this screen
+     * that never mentioned the OK/CENTER button at all (finding #12).
+     */
+    const char *hint1 = "OK = Confirm";
+    int h1w = u8g2.getStrWidth(hint1);
+    u8g2.drawStr((128 - h1w) / 2, 50, hint1);
 
-        u8g2.setFont(u8g2_font_5x7_tr);
-        const char *sub = "Place finger on sensor";
-        int sw = u8g2.getStrWidth(sub);
-        u8g2.drawStr((128 - sw) / 2, 48, sub);
-
-        const char *hint = "Left = Cancel";
-        int hw = u8g2.getStrWidth(hint);
-        u8g2.drawStr((128 - hw) / 2, 58, hint);
-    }
+    const char *hint2 = "Left = Cancel";
+    int h2w = u8g2.getStrWidth(hint2);
+    u8g2.drawStr((128 - h2w) / 2, 60, hint2);
 }
 
 static void draw_fido_processing(void)
 {
+    /*
+     * Always draw_title(...) now (finding #10) — this used to switch to the
+     * no-title-bar draw_message() chrome whenever the default "FIDO" label
+     * was active, so the exact same UiState rendered two different frames
+     * depending on data content instead of state. Sibling UI_FIDO_PROMPT /
+     * UI_FIDO_SUCCESS both always use draw_title(), so this now matches.
+     */
     const char *label = nav_system_fido_label();
-    if (label && label[0] && strcmp(label, "FIDO") != 0) {
-        draw_title("Processing");
-        u8g2.setFont(u8g2_font_6x12_tr);
-        int lw = u8g2.getStrWidth(label);
-        if (lw > 120)
-            draw_str_ellipsis(4, 32, label, 120);
-        else
-            u8g2.drawStr((128 - lw) / 2, 32, label);
+    bool custom = (label && label[0] && strcmp(label, "FIDO") != 0);
+    const char *headline = custom ? label : "Working…";
+    const char *sub = custom ? "Working… Please wait" : "Please wait";
 
-        u8g2.setFont(u8g2_font_5x7_tr);
-        const char *sub = "Working... please wait";
-        int sw = u8g2.getStrWidth(sub);
-        u8g2.drawStr((128 - sw) / 2, 48, sub);
-    } else {
-        draw_message("Working...", "Please wait");
-    }
+    draw_title("Processing");
+    u8g2.setFont(u8g2_font_6x12_tr);
+    int lw = u8g2.getStrWidth(headline);
+    if (lw > 120)
+        draw_str_ellipsis(4, 32, headline, 120);
+    else
+        u8g2.drawStr((128 - lw) / 2, 32, headline);
+
+    u8g2.setFont(u8g2_font_5x7_tr);
+    int sw = u8g2.getStrWidth(sub);
+    u8g2.drawStr((128 - sw) / 2, 48, sub);
 }
 
 static void draw_fido_success(void)
