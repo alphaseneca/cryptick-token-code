@@ -1,5 +1,9 @@
 # Cryptick — Mac login (PIV / smart card)
 
+Firmware/device-side status only. For the daemon-side CLI behavior and the
+Windows Hello / Linux PAM requirements (all three OSes in one place), see
+[`cryptick-token-daemon/docs/COMPUTER_LOGIN.md`](../../cryptick-token-daemon/docs/COMPUTER_LOGIN.md).
+
 ## Status (honest)
 
 | Item | State |
