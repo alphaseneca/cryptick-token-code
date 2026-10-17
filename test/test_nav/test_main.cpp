@@ -492,6 +492,208 @@ void test_ble_pairing_screen_lifecycle(void)
     TEST_ASSERT_EQUAL_STRING("FIDO", nav_system_fido_label());
 }
 
+/*
+ * Regression coverage for the UI/UX audit fixes (findings #1, #2, #4, #11
+ * are the directly-testable state-machine behaviors; #3/#5/#6 are included
+ * too since they are just as mechanically checkable).
+ *
+ * Settings is MENU_SETTINGS=3 in MenuItem and KEY_DOWN only advances the
+ * menu index by one, so reaching it from the default UI_MENU index (0)
+ * needs three KEY_DOWN presses (or one KEY_UP, which wraps 0-1 -> 3) — NOT
+ * the single KEY_DOWN the older tests above use. See NOTES.md: those older
+ * tests (test_menu_to_settings, test_settings_enroll_flow_via_bus,
+ * test_enroll_no_sensor) were already failing against pristine `main`
+ * before this branch touched anything, landing on UI_PIV_PIN instead of
+ * UI_SETTINGS — a pre-existing bug, left alone here since it is not one of
+ * the 12 findings.
+ */
+static void nav_to_settings(void)
+{
+    inject_key(KEY_CENTER); /* UI_CLOCK -> UI_MENU, idx MENU_TOTP(0) */
+    inject_key(KEY_DOWN);   /* -> MENU_PIV(1) */
+    inject_key(KEY_DOWN);   /* -> MENU_BLE(2) */
+    inject_key(KEY_DOWN);   /* -> MENU_SETTINGS(3) */
+    inject_key(KEY_CENTER); /* -> UI_SETTINGS */
+}
+
+void test_ble_pairing_left_cancels(void)
+{
+    /* Finding #1: UI_BLE_PAIRING had no case in the state-dispatch switch
+     * at all, so it fell to `default: break` — no key, including LEFT,
+     * did anything. Every sibling prompt lets LEFT cancel back out. */
+    reset_nav();
+    nav_system_set_fido_label("654321");
+    nav_system_set_fido_ui(4);
+    TEST_ASSERT_EQUAL(UI_BLE_PAIRING, nav_system_state());
+
+    inject_key(KEY_LEFT);
+    TEST_ASSERT_EQUAL(UI_CLOCK, nav_system_state());
+    TEST_ASSERT_EQUAL_STRING("FIDO", nav_system_fido_label());
+}
+
+void test_auth_prompt_cancel_returns_to_menu_for_totp(void)
+{
+    /* Finding #2: LEFT on UI_AUTH_PROMPT used to hardcode UI_CLOCK no
+     * matter which screen asked for the unlock. Entered via Menu -> TOTP,
+     * cancel must return to UI_MENU, not drop all the way home. */
+    reset_nav();
+    nav_system_set_account_count(1);
+    auth_system_set_fingerprint_enabled(true);
+    auth_system_clear();
+
+    inject_key(KEY_CENTER); /* UI_CLOCK -> UI_MENU */
+    TEST_ASSERT_EQUAL(UI_MENU, nav_system_state());
+    inject_key(KEY_CENTER); /* MENU_TOTP -> UI_AUTH_PROMPT (needs auth) */
+    TEST_ASSERT_EQUAL(UI_AUTH_PROMPT, nav_system_state());
+
+    inject_key(KEY_LEFT);
+    TEST_ASSERT_EQUAL(UI_MENU, nav_system_state());
+}
+
+void test_auth_prompt_cancel_returns_to_settings_for_clear(void)
+{
+    /* Same finding #2 bug, other caller: Settings -> Clear FP -> cancel
+     * must return to UI_SETTINGS, not UI_CLOCK. */
+    reset_nav();
+    g_fp_count = 1; /* template_count() > 0 so start_clear() needs auth */
+    auth_system_set_fingerprint_enabled(true);
+    auth_system_clear();
+
+    nav_to_settings();
+    TEST_ASSERT_EQUAL(UI_SETTINGS, nav_system_state());
+
+    inject_key(KEY_DOWN);   /* SET_ENROLL(0) -> SET_CLEAR(1) */
+    inject_key(KEY_CENTER); /* start_clear() -> UI_AUTH_PROMPT */
+    TEST_ASSERT_EQUAL(UI_AUTH_PROMPT, nav_system_state());
+
+    inject_key(KEY_LEFT);
+    TEST_ASSERT_EQUAL(UI_SETTINGS, nav_system_state());
+}
+
+void test_auth_prompt_match_still_resumes_clear_confirm(void)
+{
+    /* The PendingAction refactor backing finding #2 must not disturb the
+     * existing successful-match path — only the cancel path changed. */
+    reset_nav();
+    g_fp_count = 1;
+    auth_system_set_fingerprint_enabled(true);
+    auth_system_clear();
+
+    nav_to_settings();
+    inject_key(KEY_DOWN);
+    inject_key(KEY_CENTER);
+    TEST_ASSERT_EQUAL(UI_AUTH_PROMPT, nav_system_state());
+
+    inject_fp(FP_MATCHED, 1, 100);
+    TEST_ASSERT_EQUAL(UI_FP_CLEAR_CONFIRM, nav_system_state());
+}
+
+void test_fido_processing_left_cancels(void)
+{
+    /* Finding #4: same dead-end gap as #1 for UI_FIDO_PROCESSING — no case
+     * in the switch, so a hung host left no manual way out. */
+    reset_nav();
+    nav_system_set_fido_ui(1);
+    TEST_ASSERT_EQUAL(UI_FIDO_PROMPT, nav_system_state());
+    nav_system_set_fido_ui(2);
+    TEST_ASSERT_EQUAL(UI_FIDO_PROCESSING, nav_system_state());
+
+    inject_key(KEY_LEFT);
+    TEST_ASSERT_EQUAL(UI_CLOCK, nav_system_state());
+}
+
+void test_fido_prompt_center_also_confirms(void)
+{
+    /* Judgment call alongside finding #12: CENTER now confirms presence on
+     * UI_FIDO_PROMPT too (same ceremony a fingerprint match triggers), so
+     * the new "OK = Confirm" hint is a real action, not decoration. */
+    reset_nav();
+    nav_system_set_fido_ui(1);
+    TEST_ASSERT_EQUAL(UI_FIDO_PROMPT, nav_system_state());
+
+    inject_key(KEY_CENTER);
+    TEST_ASSERT_EQUAL(UI_FIDO_PROCESSING, nav_system_state());
+}
+
+void test_auth_error_left_dismisses_immediately(void)
+{
+    /* Finding #11: UI_AUTH_ERROR used to swallow every key, including
+     * LEFT, for the full AUTH_ERROR_DISPLAY_MS wait — unlike the
+     * comparable UI_FIDO_SUCCESS transient screen, which already lets
+     * CENTER/LEFT dismiss early. */
+    reset_nav();
+    nav_system_set_account_count(1);
+    auth_system_set_fingerprint_enabled(true);
+    auth_system_clear();
+
+    inject_key(KEY_CENTER);
+    inject_key(KEY_CENTER);
+    TEST_ASSERT_EQUAL(UI_AUTH_PROMPT, nav_system_state());
+
+    inject_fp(FP_NO_MATCH);
+    TEST_ASSERT_EQUAL(UI_AUTH_ERROR, nav_system_state());
+
+    inject_key(KEY_LEFT);
+    TEST_ASSERT_EQUAL(UI_CLOCK, nav_system_state());
+}
+
+void test_auth_error_center_dismisses_to_settings_for_no_sensor(void)
+{
+    /* Same finding #11 fix, other branch: "No sensor" came from Settings
+     * -> Enroll, so an early dismiss must return there, same as the
+     * AUTH_ERROR_DISPLAY_MS timeout path already does. */
+    reset_nav();
+    g_fp_ready = false;
+
+    nav_to_settings();
+    TEST_ASSERT_EQUAL(UI_SETTINGS, nav_system_state());
+    inject_key(KEY_CENTER); /* SET_ENROLL -> start_enroll() -> no sensor */
+    TEST_ASSERT_EQUAL(UI_AUTH_ERROR, nav_system_state());
+
+    inject_key(KEY_CENTER);
+    TEST_ASSERT_EQUAL(UI_SETTINGS, nav_system_state());
+}
+
+void test_home_right_always_advances_card(void)
+{
+    /* Finding #5: RIGHT now always means "next card", the same as DOWN,
+     * on every Home card. */
+    reset_nav();
+    TEST_ASSERT_EQUAL(0, nav_system_home_card());
+
+    inject_key(KEY_RIGHT);
+    TEST_ASSERT_EQUAL(1, nav_system_home_card());
+    inject_key(KEY_RIGHT);
+    TEST_ASSERT_EQUAL(2, nav_system_home_card());
+    inject_key(KEY_RIGHT);
+    TEST_ASSERT_EQUAL(0, nav_system_home_card());
+}
+
+void test_home_right_no_longer_cycles_account_on_totp_card(void)
+{
+    /* Findings #5/#6: RIGHT used to cycle _accountIdx while parked on the
+     * Quick-TOTP card (card 2) instead of advancing the card, with no
+     * on-screen sign it had changed jobs. Account cycling now lives only
+     * on the full TOTP list screen (UI_TOTP). */
+    reset_nav();
+    nav_system_set_account_count(3);
+    nav_system_set_home_card(2);
+    TEST_ASSERT_EQUAL(0, nav_system_account_index());
+
+    inject_key(KEY_RIGHT);
+    TEST_ASSERT_EQUAL(0, nav_system_home_card()); /* wrapped 2 -> 0 */
+    TEST_ASSERT_EQUAL(0, nav_system_account_index());
+}
+
+void test_settings_dropped_the_set_time_alias_row(void)
+{
+    /* Finding #3: SET_TIME and SET_INFO used to both point at
+     * draw_device_info(), which never showed any clock content. Collapsed
+     * to one row — Settings now has 4 items, not 5. */
+    reset_nav();
+    TEST_ASSERT_EQUAL(4, nav_system_settings_count());
+}
+
 void setup()
 {
     delay(1500);
@@ -511,6 +713,17 @@ void setup()
     RUN_TEST(test_ble_pairing_screen_lifecycle);
     RUN_TEST(test_sleep_drops_unlock_session);
     RUN_TEST(test_settings_labels_cover_every_item);
+    RUN_TEST(test_ble_pairing_left_cancels);
+    RUN_TEST(test_auth_prompt_cancel_returns_to_menu_for_totp);
+    RUN_TEST(test_auth_prompt_cancel_returns_to_settings_for_clear);
+    RUN_TEST(test_auth_prompt_match_still_resumes_clear_confirm);
+    RUN_TEST(test_fido_processing_left_cancels);
+    RUN_TEST(test_fido_prompt_center_also_confirms);
+    RUN_TEST(test_auth_error_left_dismisses_immediately);
+    RUN_TEST(test_auth_error_center_dismisses_to_settings_for_no_sensor);
+    RUN_TEST(test_home_right_always_advances_card);
+    RUN_TEST(test_home_right_no_longer_cycles_account_on_totp_card);
+    RUN_TEST(test_settings_dropped_the_set_time_alias_row);
     UNITY_END();
 }
 
