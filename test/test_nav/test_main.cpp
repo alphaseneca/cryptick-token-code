@@ -356,6 +356,13 @@ static void goto_ble_menu(void)
     inject_key(KEY_CENTER); /* UI_MENU -> UI_BLE_MENU */
 }
 
+static void goto_piv_pin_entry_from_menu(void)
+{
+    inject_key(KEY_CENTER); /* UI_CLOCK -> UI_MENU, idx 0 (TOTP) */
+    inject_key(KEY_DOWN);   /* idx 1 (PIV) */
+    inject_key(KEY_CENTER); /* UI_MENU -> UI_PIV_PIN_ENTRY, return=UI_MENU */
+}
+
 void test_enroll_requires_fresh_touch_when_templates_exist(void)
 {
     reset_nav();
@@ -694,6 +701,209 @@ void test_settings_dropped_the_set_time_alias_row(void)
     TEST_ASSERT_EQUAL(4, nav_system_settings_count());
 }
 
+/*
+ * Encoder-driven PIV PIN entry ceremony (replaces the old static "PIN:
+ * 123456" display — see event_bus.h's UI_PIV_PIN_ENTRY comment and NOTES.md).
+ * Covers: digit entry, encoder increment/decrement (via the KEY_ENCODER_CW/
+ * CCW -> KEY_DOWN/KEY_UP remap every other list screen already relies on),
+ * completion, the fresh-touch gate before the PIN is ever typed, and
+ * cancel/back behavior at every step.
+ */
+void test_piv_pin_entry_launch_from_menu_starts_at_zero(void)
+{
+    reset_nav();
+    goto_piv_pin_entry_from_menu();
+    TEST_ASSERT_EQUAL(UI_PIV_PIN_ENTRY, nav_system_state());
+    TEST_ASSERT_EQUAL(6, nav_system_piv_pin_len());
+    TEST_ASSERT_EQUAL(0, nav_system_piv_pin_pos());
+    for (int i = 0; i < nav_system_piv_pin_len(); i++)
+        TEST_ASSERT_EQUAL(0, nav_system_piv_pin_digit(i));
+}
+
+void test_piv_pin_entry_up_down_scroll_digit_and_wrap(void)
+{
+    reset_nav();
+    goto_piv_pin_entry_from_menu();
+
+    inject_key(KEY_UP);
+    inject_key(KEY_UP);
+    inject_key(KEY_UP);
+    TEST_ASSERT_EQUAL(3, nav_system_piv_pin_digit(0));
+
+    inject_key(KEY_DOWN);
+    TEST_ASSERT_EQUAL(2, nav_system_piv_pin_digit(0));
+
+    /* Wraps 0 -> 9 going down a digit, and 9 -> 0 going up. */
+    inject_key(KEY_DOWN);
+    inject_key(KEY_DOWN);
+    TEST_ASSERT_EQUAL(0, nav_system_piv_pin_digit(0));
+    inject_key(KEY_DOWN);
+    TEST_ASSERT_EQUAL(9, nav_system_piv_pin_digit(0));
+    inject_key(KEY_UP);
+    TEST_ASSERT_EQUAL(0, nav_system_piv_pin_digit(0));
+}
+
+void test_piv_pin_entry_encoder_ticks_scroll_digit_same_as_up_down(void)
+{
+    /* The product ask was literally "scroll the encoder" to set the PIN —
+     * this is the one test that goes through KEY_ENCODER_CW/CCW instead of
+     * the 5-way, to prove the global remap at the top of
+     * nav_system_on_event() reaches this new state the same as every list
+     * screen that came before it. */
+    reset_nav();
+    goto_piv_pin_entry_from_menu();
+
+    inject_key(KEY_ENCODER_CW); /* -> KEY_DOWN: digit 0 -> 9 */
+    TEST_ASSERT_EQUAL(9, nav_system_piv_pin_digit(0));
+    inject_key(KEY_ENCODER_CCW); /* -> KEY_UP: digit 9 -> 0 */
+    inject_key(KEY_ENCODER_CCW); /* -> KEY_UP: digit 0 -> 1 */
+    TEST_ASSERT_EQUAL(1, nav_system_piv_pin_digit(0));
+}
+
+void test_piv_pin_entry_center_advances_through_all_digits(void)
+{
+    reset_nav();
+    goto_piv_pin_entry_from_menu();
+
+    int len = nav_system_piv_pin_len();
+    for (int i = 0; i < len - 1; i++) {
+        TEST_ASSERT_EQUAL(i, nav_system_piv_pin_pos());
+        inject_key(KEY_CENTER);
+    }
+    TEST_ASSERT_EQUAL(len - 1, nav_system_piv_pin_pos());
+    /* Still mid-entry on the last digit — not yet gated or typed. */
+    TEST_ASSERT_EQUAL(UI_PIV_PIN_ENTRY, nav_system_state());
+}
+
+void test_piv_pin_entry_left_steps_back_one_digit(void)
+{
+    reset_nav();
+    goto_piv_pin_entry_from_menu();
+
+    inject_key(KEY_CENTER); /* pos 0 -> 1 */
+    inject_key(KEY_CENTER); /* pos 1 -> 2 */
+    TEST_ASSERT_EQUAL(2, nav_system_piv_pin_pos());
+
+    inject_key(KEY_LEFT);
+    TEST_ASSERT_EQUAL_MESSAGE(1, nav_system_piv_pin_pos(),
+                               "LEFT mid-entry corrects one digit, like Backspace");
+    TEST_ASSERT_EQUAL(UI_PIV_PIN_ENTRY, nav_system_state());
+}
+
+void test_piv_pin_entry_left_on_first_digit_cancels_to_menu(void)
+{
+    reset_nav();
+    goto_piv_pin_entry_from_menu();
+    TEST_ASSERT_EQUAL(0, nav_system_piv_pin_pos());
+
+    inject_key(KEY_LEFT);
+    TEST_ASSERT_EQUAL_MESSAGE(UI_MENU, nav_system_state(),
+                               "LEFT with no earlier digit backs out to the launcher, same as every other screen");
+}
+
+void test_piv_pin_entry_left_on_first_digit_cancels_to_clock_from_home_card(void)
+{
+    /* Cancel must return to wherever THIS ceremony was launched from — the
+     * Home "Quick PIV Login" card, not always UI_MENU, mirroring
+     * UI_AUTH_PROMPT's own per-launch-site cancel routing. */
+    reset_nav();
+    nav_system_set_home_card(1);
+    inject_key(KEY_CENTER);
+    TEST_ASSERT_EQUAL(UI_PIV_PIN_ENTRY, nav_system_state());
+
+    inject_key(KEY_LEFT);
+    TEST_ASSERT_EQUAL(UI_CLOCK, nav_system_state());
+}
+
+void test_piv_pin_entry_completion_requires_fresh_touch_when_templates_exist(void)
+{
+    reset_nav();
+    g_fp_count = 1;
+    goto_piv_pin_entry_from_menu();
+
+    int len = nav_system_piv_pin_len();
+    for (int i = 0; i < len - 1; i++) inject_key(KEY_CENTER);
+    TEST_ASSERT_EQUAL(len - 1, nav_system_piv_pin_pos());
+
+    inject_key(KEY_CENTER); /* confirm the last digit */
+    TEST_ASSERT_EQUAL_MESSAGE(UI_AUTH_PROMPT, nav_system_state(),
+                               "A typed-but-unconfirmed PIN must require a fresh touch before it is sent");
+}
+
+void test_piv_pin_entry_fresh_touch_match_types_and_returns_to_menu(void)
+{
+    reset_nav();
+    g_fp_count = 1;
+    goto_piv_pin_entry_from_menu();
+
+    int len = nav_system_piv_pin_len();
+    for (int i = 0; i < len; i++) inject_key(KEY_CENTER);
+    TEST_ASSERT_EQUAL(UI_AUTH_PROMPT, nav_system_state());
+
+    inject_fp(FP_MATCHED, 1, 100);
+    TEST_ASSERT_EQUAL(UI_MENU, nav_system_state());
+    /* This host build has no BLE stack, so ble_hid_type_pin() always fails —
+     * "BLE Offline" is the correct, expected outcome here, same message the
+     * Quick-TOTP card already uses for the same reason. */
+    TEST_ASSERT_EQUAL_STRING("BLE Offline", nav_system_enroll_message());
+    /* The PIN must not linger in RAM once it has been used. */
+    TEST_ASSERT_EQUAL(0, nav_system_piv_pin_digit(0));
+}
+
+void test_piv_pin_entry_fresh_touch_match_returns_to_clock_from_home_card(void)
+{
+    reset_nav();
+    g_fp_count = 1;
+    nav_system_set_home_card(1);
+    inject_key(KEY_CENTER); /* -> UI_PIV_PIN_ENTRY, return=UI_CLOCK */
+
+    int len = nav_system_piv_pin_len();
+    for (int i = 0; i < len; i++) inject_key(KEY_CENTER);
+    TEST_ASSERT_EQUAL(UI_AUTH_PROMPT, nav_system_state());
+
+    inject_fp(FP_MATCHED, 1, 100);
+    TEST_ASSERT_EQUAL(UI_CLOCK, nav_system_state());
+}
+
+void test_piv_pin_entry_cancel_during_fresh_touch_returns_and_clears_digits(void)
+{
+    reset_nav();
+    g_fp_count = 1;
+    goto_piv_pin_entry_from_menu();
+
+    inject_key(KEY_UP); /* digit 0 = 1, so we can tell it got cleared */
+    int len = nav_system_piv_pin_len();
+    for (int i = 0; i < len; i++) inject_key(KEY_CENTER);
+    TEST_ASSERT_EQUAL(UI_AUTH_PROMPT, nav_system_state());
+
+    inject_key(KEY_LEFT); /* cancel the fresh-touch prompt itself */
+    TEST_ASSERT_EQUAL(UI_MENU, nav_system_state());
+
+    /* _menuIdx is still parked on PIV, so one more CENTER re-launches the
+     * ceremony — it must start clean, not leak the cancelled attempt. */
+    inject_key(KEY_CENTER);
+    TEST_ASSERT_EQUAL(UI_PIV_PIN_ENTRY, nav_system_state());
+    TEST_ASSERT_EQUAL(0, nav_system_piv_pin_digit(0));
+    TEST_ASSERT_EQUAL(0, nav_system_piv_pin_pos());
+}
+
+void test_piv_pin_entry_bootstrap_bypasses_fresh_touch(void)
+{
+    /* Same zero-template bypass start_enroll()/start_clear()/BLE-unpair use:
+     * a factory-fresh unit with no fingerprint enrolled yet cannot satisfy a
+     * fresh-touch gate, so it must not be locked out of its own PIV PIN. */
+    reset_nav();
+    g_fp_count = 0;
+    goto_piv_pin_entry_from_menu();
+
+    int len = nav_system_piv_pin_len();
+    for (int i = 0; i < len; i++) inject_key(KEY_CENTER);
+
+    TEST_ASSERT_EQUAL_MESSAGE(UI_MENU, nav_system_state(),
+                               "Bootstrap must skip UI_AUTH_PROMPT entirely and commit directly");
+    TEST_ASSERT_EQUAL_STRING("BLE Offline", nav_system_enroll_message());
+}
+
 void setup()
 {
     delay(1500);
@@ -724,6 +934,18 @@ void setup()
     RUN_TEST(test_home_right_always_advances_card);
     RUN_TEST(test_home_right_no_longer_cycles_account_on_totp_card);
     RUN_TEST(test_settings_dropped_the_set_time_alias_row);
+    RUN_TEST(test_piv_pin_entry_launch_from_menu_starts_at_zero);
+    RUN_TEST(test_piv_pin_entry_up_down_scroll_digit_and_wrap);
+    RUN_TEST(test_piv_pin_entry_encoder_ticks_scroll_digit_same_as_up_down);
+    RUN_TEST(test_piv_pin_entry_center_advances_through_all_digits);
+    RUN_TEST(test_piv_pin_entry_left_steps_back_one_digit);
+    RUN_TEST(test_piv_pin_entry_left_on_first_digit_cancels_to_menu);
+    RUN_TEST(test_piv_pin_entry_left_on_first_digit_cancels_to_clock_from_home_card);
+    RUN_TEST(test_piv_pin_entry_completion_requires_fresh_touch_when_templates_exist);
+    RUN_TEST(test_piv_pin_entry_fresh_touch_match_types_and_returns_to_menu);
+    RUN_TEST(test_piv_pin_entry_fresh_touch_match_returns_to_clock_from_home_card);
+    RUN_TEST(test_piv_pin_entry_cancel_during_fresh_touch_returns_and_clears_digits);
+    RUN_TEST(test_piv_pin_entry_bootstrap_bypasses_fresh_touch);
     UNITY_END();
 }
 
