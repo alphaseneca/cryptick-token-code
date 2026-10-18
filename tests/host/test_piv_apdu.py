@@ -1414,12 +1414,16 @@ def test_any_other_command_mid_chain_is_refused_then_recovers(card):
 
 # --- RESET APPLICATION ------------------------------------------------------
 #
-# Vendor INS 0xFB: a full factory reset, gated on both the PIN and PUK retry
-# counters already being at zero. SP 800-73 defines neither the instruction
-# nor the gate; the gate is the real-world convention every PIV
-# implementation that offers a full reset (YubiKey included) actually
-# enforces, so an unauthenticated party holding the device cannot wipe it and
-# install their own keys just by picking it up.
+# Vendor INS 0xFB: a full factory reset, gated on either (a) a verified PIN
+# this session, or (b) both the PIN and PUK retry counters already at zero.
+# SP 800-73 defines neither the instruction nor the gate. (a) is the common
+# case — an owner who still knows their PIN can reset directly, the same bar
+# GENERATE ASYMMETRIC KEY PAIR already accepts for an operation that likewise
+# destroys certificates already issued. (b) is the lockout-recovery case this
+# instruction exists for in the first place. Either way, an unauthenticated
+# party holding the device cannot wipe it and install their own keys just by
+# picking it up — see NOTES.md, "PIV factory reset", for the earlier, stricter
+# draft that required (b) unconditionally and why it was relaxed to add (a).
 
 
 def _block_pin(card: Card) -> None:
@@ -1448,21 +1452,60 @@ def test_reset_application_rejects_a_data_field(card):
     assert card.apdu(bytes([0x00, 0xFB, 0x00, 0x00, 0x01, 0xAA]))[0] == SW_WRONG_LENGTH
 
 
-def test_reset_application_requires_the_pin_blocked_too(card):
-    """PUK alone being blocked is not enough — an attacker who only managed
-    to exhaust the PUK (e.g. by guessing against it) must not get a reset
-    while the real PIN still works."""
+def test_reset_application_rejects_an_unverified_pin_with_nothing_blocked(card):
+    """Neither gate path is open on a fresh card: the PIN has not been
+    verified this session, and nothing is blocked. Physical possession
+    alone must never be enough."""
+    assert card.retries == 3
+    assert card.puk_retries == 3
+    assert card.reset_application() == SW_SECURITY
+
+
+def test_reset_application_requires_the_pin_blocked_too_when_unverified(card):
+    """PUK alone being blocked does not open the lockout-recovery path, and
+    the PIN was never verified either — an attacker who only managed to
+    exhaust the PUK (e.g. by guessing against it) must not get a reset
+    while the real PIN still works and was never presented."""
     _block_puk(card)
     assert card.retries == 3
     assert card.reset_application() == SW_SECURITY
 
 
-def test_reset_application_requires_the_puk_blocked_too(card):
-    """Symmetric case: PIN alone being blocked is not enough either — that
-    is exactly the ordinary "forgot my PIN" state RESET RETRY COUNTER
-    already exists to recover from the normal way."""
+def test_reset_application_requires_the_puk_blocked_too_when_unverified(card):
+    """Symmetric case: PIN alone being blocked (and therefore unverified)
+    does not open the lockout-recovery path either — that is exactly the
+    ordinary "forgot my PIN" state RESET RETRY COUNTER already exists to
+    recover from the normal way."""
     _block_pin(card)
     assert card.puk_retries == 3
+    assert card.reset_application() == SW_SECURITY
+
+
+def test_reset_application_succeeds_with_a_verified_pin_even_when_nothing_is_blocked(card):
+    """The common case: an owner who still knows their PIN can reset
+    directly, with neither counter anywhere near blocked."""
+    assert card.verify() == SW_OK
+    assert card.retries == 3
+    assert card.puk_retries == 3
+    assert card.reset_application() == SW_OK
+
+
+def test_reset_application_verified_pin_path_leaves_the_puk_untouched_as_a_precondition(card):
+    """The PIN-verified path must not secretly also require anything about
+    the PUK — it is a genuinely independent way to satisfy the gate, not a
+    disguised version of the lockout path."""
+    assert card.verify() == SW_OK
+    assert card.puk_retries == 3  # never touched
+    assert card.reset_application() == SW_OK
+
+
+def test_reset_application_fast_path_needs_current_verification_not_history(card):
+    """A PIN verified earlier and then un-verified by a later wrong attempt
+    must not leave a stale "was verified at some point" credential behind —
+    the same session-scoped lifetime _pin_verified already has everywhere
+    else (SELECT, a wrong PIN, etc.)."""
+    assert card.verify() == SW_OK
+    assert card.verify(b"999999") == PIV_SW_VERIFY_FAILED(2)  # clears it again
     assert card.reset_application() == SW_SECURITY
 
 

@@ -2253,3 +2253,69 @@ after a reset actually match the newly-rolled derived keys end to end —
 both follow from reading `piv_hal_esp32.cpp`'s existing, already-tested
 primitives rather than from a new code path unique to this pass, but
 neither has been exercised on a real device.
+
+## 2026-10-19 — RESET APPLICATION's gate, relaxed per explicit product direction
+
+The prior entry's "A judgement call flagged, not decided silently" section
+asked the device's owner to weigh in on whether a lockout-only gate
+(both PIN and PUK retry counters already at zero) was the right default.
+The owner's answer, in their own words: this device is for personal macOS
+login, not a fleet-management scenario, and requiring a deliberate
+6-attempt lockout before a reset is reachable at all is more friction than
+the threat model calls for — they want "proper security but not that
+hard."
+
+### What changed
+
+`reset_application()` now accepts *either* of two preconditions, not just
+one:
+
+1. **A verified PIN this session.** The common case: an owner who still
+   knows their PIN sends `VERIFY` and then `RESET APPLICATION` directly,
+   no deliberate lockout required. This is the same authorization bar
+   `GENERATE ASYMMETRIC KEY PAIR` already accepts for an operation that
+   likewise destroys the usability of certificates already issued — a
+   full reset asking for no more than that is consistency, not a new
+   weaker rule invented just for this instruction.
+2. **Both the PIN and PUK retry counters already at zero**, unchanged
+   from the prior entry — the genuine lockout-recovery case, for an owner
+   who has lost the PIN *and* the PUK and would otherwise have no way
+   back into the device at all.
+
+Either path still requires proving something the device checks — a thief
+who does not know the PIN gains nothing by holding the device, which was
+the actual security property the gate exists for. What changed is which
+proofs are accepted, not whether proof is required at all.
+
+### What did not change
+
+The reset's effects (wipe every data object, roll every slot's key,
+restore the PIN/PUK/ceilings to compile-time defaults, mint a fresh random
+management key) are identical regardless of which gate path was taken —
+only the precondition check at the top of `reset_application()` changed;
+the body is untouched.
+
+### Tests
+
+`tests/host/test_piv_apdu.py`'s "RESET APPLICATION" section gained 4 new
+cases covering the new path directly (a verified PIN resets with neither
+counter anywhere near blocked; the PUK is never touched as a precondition
+for that path; a PIN that was verified and then un-verified by a later
+wrong attempt loses the fast path, matching `_pin_verified`'s existing
+session-scoped lifetime everywhere else) and one new case pinning down the
+"neither path open" rejection explicitly (a fresh card with nothing
+verified and nothing blocked). The two existing "requires X blocked too"
+cases were renamed (`..._when_unverified`) rather than changed in
+substance — they already covered "PIN alone blocked, PUK untouched" and
+its mirror, and that is still correctly refused since the PIN was never
+verified in either case. `tests/host` is 355/355 (351 before this entry +
+4 new, with no regressions in the renamed two).
+
+### Daemon-side follow-up (same repo pass)
+
+`crates/piv/src/commands.rs`'s `reset_application()` doc comment and
+`crates/token-manager/src/cli/piv_cli.rs`'s `run_piv_reset` were updated
+in the same pass — see `cryptick-token-daemon`'s own NOTES.md entry of
+this same name for the CLI-side design (it now sends `VERIFY` itself when
+neither counter already reads zero, so a wrong PIN gets a specific
+"N attempts remaining" message instead of the bare device status word).

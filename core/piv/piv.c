@@ -1069,19 +1069,29 @@ static const uint8_t kResetSlots[] = {
  * No data field, no response data (ISO case 1) — P1 and P2 must both be
  * 0x00.
  *
- * Gated on *both* the PIN and PUK retry counters already being at zero.
- * SP 800-73 does not define this operation at all, so there is no spec
- * text to defer to here, but every real-world PIV implementation that
- * offers a full factory reset (YubiKey very much included) gates it
- * exactly this way: an unauthenticated party must not be able to wipe a
- * stranger's device and install their own keys and certificates just by
- * holding it, and "both secrets are already unusable" is the one
- * precondition checkable without knowing either of them. A caller who
- * still has a working PIN or PUK must go through CHANGE REFERENCE DATA /
- * RESET RETRY COUNTER instead — this instruction is the last resort once
- * neither of those is possible any more, not a shortcut around them. See
- * NOTES.md, "PIV factory reset", for why this gate is an engineering
- * judgement call worth flagging rather than an unambiguous spec reading.
+ * Gated on either of two preconditions:
+ *
+ *   1. A verified PIN (_pin_verified) — the common case. An owner who
+ *      still knows their PIN can reset directly: VERIFY, then this
+ *      instruction, no need to deliberately exhaust anything first. This
+ *      is the same bar GENERATE ASYMMETRIC KEY PAIR already accepts for
+ *      an operation that likewise destroys the usability of certificates
+ *      already issued, so a full reset asking for no more than that is
+ *      consistent rather than a new, stricter rule invented just for this
+ *      instruction.
+ *   2. Both the PIN and PUK retry counters already at zero — the
+ *      lockout-recovery case: an owner who has also lost the PIN (not
+ *      just forgotten it with the PUK still available — CHANGE REFERENCE
+ *      DATA / RESET RETRY COUNTER already recover that case) can still
+ *      get the device back to a known state instead of discarding it.
+ *
+ * Either path requires proving something the device itself checks —
+ * physical possession alone is never enough on its own, so a thief who
+ * does not know the PIN cannot wipe the device and install their own
+ * keys and certificates just by holding it. Revised from an earlier,
+ * stricter draft of this instruction that accepted only path 2: see
+ * NOTES.md, "PIV factory reset", for why that draft gated on lockout
+ * alone, and the later entry recording why it was relaxed to add path 1.
  *
  * Deliberately composed from existing, narrower HAL hooks rather than one
  * new coarse "wipe everything" hook: delete_object for every object tag
@@ -1117,7 +1127,8 @@ static int reset_application(uint8_t p1, uint8_t p2, size_t lc,
         !_hal->set_pin_puk_retries || !_hal->mgmt_key_reset_to_default)
         return put_sw(out, out_max, PIV_SW_INS_UNSUPPORTED);
 
-    if (_hal->pin_retries_get() > 0 || _hal->puk_retries_get() > 0)
+    int both_blocked = _hal->pin_retries_get() <= 0 && _hal->puk_retries_get() <= 0;
+    if (!_pin_verified && !both_blocked)
         return put_sw(out, out_max, PIV_SW_SECURITY_NOT_SATISFIED);
 
     int ok = 1;
