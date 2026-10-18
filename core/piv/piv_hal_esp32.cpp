@@ -600,61 +600,48 @@ int piv_set_pin_puk_retries(int pin_max, int puk_max)
 /* --- Management key (AES-192): admin authorisation, never signing -------- */
 
 /**
- * This unit's management key is a genuinely random 24 bytes, minted once
- * (the first time anything needs it) via the hardware TRNG and persisted —
- * not a formula applied to any public value. See NOTES.md, "PIV PUK and
- * management key support" for why: a *derivation* from this device's eFuse
- * MAC or GUID would be reproducible by anyone who already knows this
- * firmware is open about its own construction and can read that MAC off
- * the USB descriptor or the Daemon Bridge's own serial-number
- * characteristic — i.e. exactly as guessable as a single shared constant
- * once one unit's derivation is understood, which is the YubiKey default
- * management key's actual failure mode. True randomness with nothing to
- * invert is the one construction that does not inherit that problem.
+ * SP 800-73-5's well-known default management key: `0102030405060708`
+ * repeated three times — the same 24 bytes every unshipped PIV card,
+ * YubiKey included, presents until SET MANAGEMENT KEY changes them.
+ * Interpreted as AES-192 rather than legacy 3DES (this firmware has no DES;
+ * see NOTES.md), matching YubiKey firmware 5.7+'s own default algorithm for
+ * that identical key value.
+ *
+ * Deliberately the shared, publicly-known constant rather than a per-unit
+ * random or derived value: chosen for day-one interop with existing PIV
+ * provisioning tooling that already assumes it, the same convenience class
+ * as the PIN's "123456" and the PUK's "12345678" above. Like both of those,
+ * it is a starting point an operator is expected to rotate with SET
+ * MANAGEMENT KEY, not a secret.
  */
-static bool ensure_mgmt_key(void)
+static const uint8_t kDefaultMgmtKey[PIV_MGMT_KEY_LEN] = {
+    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+};
+
+/** True if an explicit SET MANAGEMENT KEY has ever stored a key — the same
+ *  have-stored test piv_pin_check/piv_puk_check use for their own defaults. */
+static bool mgmt_key_stored(uint8_t out[PIV_MGMT_KEY_LEN])
 {
     nvs_handle_t h;
-    if (nvs_open(kNvsNamespace, NVS_READONLY, &h) == ESP_OK) {
-        uint8_t existing[PIV_MGMT_KEY_LEN];
-        size_t len = sizeof(existing);
-        bool have = (nvs_get_blob(h, "mgmtkey", existing, &len) == ESP_OK &&
-                     len == sizeof(existing));
-        nvs_close(h);
-        if (have)
-            return true;
-    }
-
-    uint8_t key[PIV_MGMT_KEY_LEN];
-    esp_fill_random(key, sizeof(key));
-
-    if (nvs_open(kNvsNamespace, NVS_READWRITE, &h) != ESP_OK)
+    if (nvs_open(kNvsNamespace, NVS_READONLY, &h) != ESP_OK)
         return false;
-    esp_err_t err = nvs_set_blob(h, "mgmtkey", key, sizeof(key));
-    if (err == ESP_OK)
-        nvs_set_i32(h, "mgmtdefault", 1);
-    nvs_commit(h);
+    size_t len = PIV_MGMT_KEY_LEN;
+    bool have = (nvs_get_blob(h, "mgmtkey", out, &len) == ESP_OK &&
+                 len == PIV_MGMT_KEY_LEN);
     nvs_close(h);
-    memset(key, 0, sizeof(key));
-    if (err == ESP_OK)
-        CLOG_I("PIV", "minted a random factory-default management key");
-    return err == ESP_OK;
+    return have;
 }
 
 int piv_mgmt_key_crypt_block(const uint8_t *in16, uint8_t *out16)
 {
-    if (!in16 || !out16 || !ensure_mgmt_key())
+    if (!in16 || !out16)
         return 0;
 
     uint8_t key[PIV_MGMT_KEY_LEN];
-    nvs_handle_t h;
-    size_t len = sizeof(key);
-    if (nvs_open(kNvsNamespace, NVS_READONLY, &h) != ESP_OK)
-        return 0;
-    bool have = (nvs_get_blob(h, "mgmtkey", key, &len) == ESP_OK && len == sizeof(key));
-    nvs_close(h);
-    if (!have)
-        return 0;
+    if (!mgmt_key_stored(key))
+        memcpy(key, kDefaultMgmtKey, sizeof(key));
 
     mbedtls_aes_context ctx;
     mbedtls_aes_init(&ctx);
@@ -674,8 +661,6 @@ int piv_mgmt_key_set(const uint8_t *key, size_t len)
     if (nvs_open(kNvsNamespace, NVS_READWRITE, &h) != ESP_OK)
         return 0;
     esp_err_t err = nvs_set_blob(h, "mgmtkey", key, len);
-    if (err == ESP_OK)
-        nvs_set_i32(h, "mgmtdefault", 0);
     nvs_commit(h);
     nvs_close(h);
     CLOG_I("PIV", "management key changed");
@@ -684,15 +669,8 @@ int piv_mgmt_key_set(const uint8_t *key, size_t len)
 
 int piv_mgmt_key_is_default(void)
 {
-    if (!ensure_mgmt_key())
-        return 0;
-    nvs_handle_t h;
-    int32_t is_default = 1;
-    if (nvs_open(kNvsNamespace, NVS_READONLY, &h) == ESP_OK) {
-        nvs_get_i32(h, "mgmtdefault", &is_default);
-        nvs_close(h);
-    }
-    return is_default ? 1 : 0;
+    uint8_t existing[PIV_MGMT_KEY_LEN];
+    return mgmt_key_stored(existing) ? 0 : 1;
 }
 
 int piv_random_bytes(uint8_t *out, size_t len)

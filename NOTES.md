@@ -1905,62 +1905,44 @@ repo already named explicitly.
     potentially breaking change to an already-working, already-tested
     flow for no requested benefit.
 
-### The management-key default: a real decision, not a default I made silently
+### The management-key default: a real decision, made with the user, not defaulted to silently
 
-Real PIV cards — YubiKey very much included — ship a single, published,
-identical-on-every-unit default management key
-(`010203040506070801020304050607080102030405060708` is YubiKey's actual
-one). That is a well-known, real-world footgun: any deployment that never
-rotates it is one public constant away from full admin access, and because
-it is the *same* constant on every unit ever made, one leak (or one widely
-circulated blog post) compromises every unit whose owner hasn't rotated —
-not just one.
+This was flagged as an open product-security question before any of this
+was built, and resolved explicitly rather than guessed at: **the default
+management key is SP 800-73-5's published constant** —
+`0102030405060708` repeated three times (`010203040506070801020304050607
+08 0102030405060708`), the exact same 24 bytes every unshipped YubiKey
+ships too — **interpreted as AES-192, not legacy 3DES** (this firmware has
+no DES; see the AES-192-over-3DES rationale earlier in this entry), which
+also matches YubiKey firmware 5.7+'s own default algorithm for that
+identical value. `piv_hal_esp32.cpp`'s `kDefaultMgmtKey` holds it as a
+compile-time constant, used by `piv_mgmt_key_crypt_block()` exactly when
+nothing has been stored under NVS's `mgmtkey` key yet — the same
+have-we-stored-anything-yet test `piv_pin_check`/`piv_puk_check` already
+use for *their* SP 800-73 defaults (`123456`/`12345678`), just one level
+up: no first-use minting step, nothing generated, nothing to persist until
+an operator actually calls `SET MANAGEMENT KEY`.
 
-This device's default is instead **a genuinely random 24 bytes, minted
-once per physical unit** the first time anything needs it (`piv_hal_esp32.cpp`'s
-`ensure_mgmt_key()`, via `esp_fill_random()` — the same hardware TRNG the
-witness itself uses) and persisted in NVS alongside everything else this
-applet stores. `mgmt_key_is_default` lets a caller (or future CLI UX) tell
-whether a unit's key has ever been rotated away from that random default.
-
-Why not *derive* it from something already unique per unit — the eFuse
-MAC this device already uses for its USB serial and, as of the BLE device
-identity entry above, its Daemon Bridge serial-number characteristic too?
-Because that MAC is **public**: readable over USB with no authentication,
-and over BLE with nothing stronger than a bond. A derivation from it would
-only be as secret as the formula producing it — and this firmware's source
-is read, not guessed, by anyone auditing it (including this very file). A
-derived default would therefore degrade to *exactly* YubiKey's failure
-mode the moment the derivation is understood once: computable by anyone
-who can read a unit's public serial and has read this applet's source,
-which makes it no better than a single shared constant in practice. True
-randomness with nothing to invert is the one construction that does not
-inherit that problem — there is no formula to leak, because there isn't
-one.
-
-**The real, open trade-off this creates, flagged rather than decided
-silently:** a random default that nothing derives means there is currently
-no sanctioned way for a legitimate owner to *learn* their own unit's
-factory default management key short of already having changed it (at
-which point it is their own chosen value, not the question). Real products
-solve this by printing a unique default on something physical (a sticker,
-an insert card) at manufacturing time, or by a one-time "show me the
-current key, but only while it's still the factory default" command over
-a channel that implies physical possession (this device's existing CDC
-debug console, which already has exactly this shape for the `SERIAL`
-command, would be the natural place). **Neither exists yet** — this pass
-built the mechanism (storage, the APDU, the retry-free authentication, a
-swappable default) but deliberately did not invent a manufacturing/
-fulfillment process or a new CDC command on its own, since that is a
-product decision, not an engineering one, and bundling it into this pass
-would have meant guessing at a process nobody has described. Until
-something like that exists, the practical path for an owner today is:
-plug in over USB, read the factory-default key during initial setup
-through whatever "I'm setting this device up for the first time" flow
-`ctctl` grows, and rotate away from it immediately via
-`piv access change-management-key` — the same thing security guidance for
-a YubiKey's own well-known default already recommends, just with a unit-
-unique starting point instead of a universal one.
+The real trade-off was weighed, not avoided: a single published constant
+shared across every unit is a genuine, well-known PIV footgun (any
+deployment that never rotates it is one public constant away from full
+admin access on every unit at once, not just one). The alternative this
+pass originally built — a genuinely random 24 bytes minted per physical
+unit via the hardware TRNG — closes that specific hole, but trades it for
+a different, equally real one: there is no sanctioned way for a legitimate
+owner to *learn* their own unit's random factory default before ever
+rotating it away from it, short of inventing a manufacturing/fulfillment
+process (a printed sticker, a one-time CDC console command) this pass has
+no mandate to decide on its own. Put to the person who owns that
+trade-off rather than picked silently in either direction: **the published
+default, for day-one compatibility with existing PIV provisioning tooling
+that already assumes it** (`ctctl`'s own CLI included — see that repo's
+NOTES.md), the same way this device's PIN and PUK already default to their
+own SP 800-73 constants and expect the operator to rotate away from them
+with `piv access change-pin`/`change-puk`/`change-management-key`. The
+mechanism underneath (storage, the APDU, the retry-free mutual
+authentication) is unchanged by which default value it starts from, which
+is exactly why swapping the policy cost one file and no protocol changes.
 
 ### A real, pre-existing bug found and fixed while building this: the host
 ### PIV test harness was corrupting memory on every run
@@ -2057,9 +2039,6 @@ consistency, not by a real build.
 
 **Needs a flashed unit to confirm:** that AES-192 interop actually holds
 between firmware and daemon (both sides were written and tested
-independently against the same spec table, never against each other);
-that the random factory-default management key is genuinely distinct
-across two physical units (no second unit was available, same caveat the
-BLE identity entry above already recorded for the USB-serial-over-BLE
-characteristic); and the open manufacturing/fulfillment question above
-about how an owner is meant to learn their own unit's factory-default key.
+independently against the same spec table, never against each other) —
+including against real PIV tooling that already assumes the published
+default, which is the actual point of using it.
