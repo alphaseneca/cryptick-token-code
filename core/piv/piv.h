@@ -117,6 +117,15 @@ typedef struct {
     int (*set_object)(uint32_t tag, const uint8_t *data, size_t len);
 
     /**
+     * Remove a stored data object. Returns 1 if it is now absent (including
+     * when it was already absent — deleting a nonexistent object is a
+     * no-op success, not a failure). May be NULL, in which case a
+     * zero-length PUT DATA (the standard way to clear an object) answers
+     * `PIV_SW_INS_UNSUPPORTED` instead of silently doing nothing.
+     */
+    int (*delete_object)(uint32_t tag);
+
+    /**
      * Sign a 32-byte hash with the slot's private key, writing a DER
      * ECDSA-Sig-Value. Returns 1 on success.
      */

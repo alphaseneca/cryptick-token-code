@@ -934,6 +934,20 @@ int piv_handle_apdu(const uint8_t *cmd, size_t cmd_len, uint8_t *out, size_t out
             size_t vlen;
             if (!tlv_get_len(data, lc, &off, &vlen) || off + vlen > lc)
                 return put_sw(out, out_max, PIV_SW_WRONG_DATA);
+            if (vlen == 0) {
+                /*
+                 * SP 800-73's convention for clearing a data object: a
+                 * zero-length value deletes it. Routing this to set_object
+                 * instead would persist the bare "53 00" container as if it
+                 * were a 2-byte certificate -- present, but unparseable,
+                 * which is worse than either stored or absent.
+                 */
+                if (!_hal->delete_object)
+                    return put_sw(out, out_max, PIV_SW_INS_UNSUPPORTED);
+                if (!_hal->delete_object(tag))
+                    return put_sw(out, out_max, PIV_SW_WRONG_DATA);
+                return put_sw(out, out_max, PIV_SW_OK);
+            }
             if (!_hal->set_object(tag, data + container,
                                   (off + vlen) - container))
                 return put_sw(out, out_max, PIV_SW_WRONG_DATA);

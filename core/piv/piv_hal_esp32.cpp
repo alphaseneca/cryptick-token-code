@@ -76,6 +76,18 @@ int piv_set_object(uint32_t tag, const uint8_t *data, size_t len)
     return wrote == len ? 1 : 0;
 }
 
+int piv_delete_object(uint32_t tag)
+{
+    char path[32];
+    object_path(tag, path, sizeof(path));
+    if (!LittleFS.exists(path))
+        return 1; /* Already absent — deleting it is a no-op success. */
+    bool ok = LittleFS.remove(path);
+    if (ok)
+        CLOG_I("PIV", "object %06lx deleted", (unsigned long)tag);
+    return ok ? 1 : 0;
+}
+
 constexpr const char *kNvsNamespace = "piv";
 
 /**
@@ -439,6 +451,7 @@ int piv_user_presence(uint8_t slot)
 const piv_hal_t kPivHal = {
     piv_get_object,
     piv_set_object,
+    piv_delete_object,
     piv_sign_p256,
     piv_ecdh_p256,
     piv_pin_check,
