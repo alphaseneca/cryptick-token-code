@@ -240,6 +240,10 @@ void loop()
             ble_fido_start_advertising();
         }
     }
+    /* Connected-idle power-save (PROJECT.md §17). Cheap when there is
+     * nothing to do -- a couple of comparisons -- so no extra interval
+     * gating beyond the loop's own cadence; see ble_gatt_esp32.cpp. */
+    ble_fido_power_tick(now);
 #endif
 
     /*

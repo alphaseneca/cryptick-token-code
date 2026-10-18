@@ -1750,3 +1750,54 @@ change. `tests/host/test_piv_apdu.py` and three cases in
 of this pass's changes applied (confirmed via `git stash`) — pre-existing,
 unrelated to anything `core/fido2/` owns, and not touched here. Flagged
 separately rather than folded into this pass.
+
+---
+
+## 2026-10-18 — BLE connected-idle power-save tier
+
+Added a second connection-parameter tier to `core/ble_fido/ble_gatt_esp32.cpp`
+alongside the existing responsive one: once a connection sees neither an
+inbound control-point write nor an outbound notification for
+`CRYPTICK_BLE_CONN_IDLE_MS` (5000 ms), it drops to 500–1000 ms
+interval / latency 4 / 12000 ms supervision timeout (`CONN_IDLE_*`,
+same Bluetooth Core Spec Vol 3 Part C §9.3 constraint the responsive tier
+already cites), versus the 15–30 ms the responsive tier holds for an
+in-flight CTAP/PIV/OATH ceremony. Any control-point write or outbound
+notify (`mark_ble_activity()`) snaps the link back to the responsive tier
+immediately, before the ceremony's own 100 ms KEEPALIVE cadence
+(`CRYPTICK_FIDO_KEEPALIVE_MS`) resumes. `src/main.cpp`'s `loop()` drives it
+via `ble_fido_power_tick(now)`, a few comparisons unless a tier transition
+is actually due.
+
+Also investigated and found *unavailable*, not merely unimplemented: true
+CPU/BLE-controller sleep. The precompiled Arduino-ESP32 SDK this project's
+`platformio.ini` actually builds against for this board
+(`esp32s3/qio_opi/include/sdkconfig.h`) has `CONFIG_PM_ENABLE` and
+`CONFIG_FREERTOS_USE_TICKLESS_IDLE` both absent and
+`CONFIG_BT_CTRL_SLEEP_MODE_EFF=0` — `esp_pm_configure()` would return
+`ESP_ERR_NOT_SUPPORTED`, so nothing here calls it. Getting it back needs a
+custom sdkconfig, which `framework = arduino` doesn't take; flagged rather
+than attempted, since it's a build-system change with its own risk, well
+beyond a connection-parameter pass. Separately: `cores/esp32/main.cpp`'s
+`loopTask` has no yield of its own on this dual-core target
+(`yieldIfNecessary()` is unicore-only), so `loop()` never reaches the idle
+task on either core regardless of BLE state unless something inside it
+blocks — fixing that touches every subsystem `loop()` drives (nav, display,
+fingerprint, input, battery), not just this BLE slice, so flagged rather
+than changed here too.
+
+**Not build-verified this round:** PlatformIO is not installed in this
+sandbox (the same gap an earlier pass in this repo's history hit), so unlike
+the identity-characteristic entry above this change could not be confirmed
+with `pio run`. `tests/host`'s full non-PIV suite still passes unchanged,
+but that is expected rather than reassuring here — this is NimBLE GATT glue
+(`ble_gatt_esp32.cpp`'s connection-parameter tiers, `src/main.cpp`'s
+`loop()`), which, like the identity characteristic above, has no
+host-compilable test coverage of its own today. This needs a real
+`pio run -e esp32-s3-n16r8` (`CRYPTICK_BLE_FIDO=1`) before it's trusted to
+compile, and a flashed unit with a current meter to confirm the actual
+power delta on top of that; neither has been done. See
+`cryptick-token-daemon`'s PROJECT.md §17 for the daemon-side half of this
+same pass (bounded jittered reconnect backoff in
+`crates/transport-ble/src/backoff.rs`) and the fuller writeup — this entry
+intentionally doesn't repeat it.

@@ -258,6 +258,23 @@ void ble_fido_clear_all_bonds(void);
  */
 void ble_fido_cancel_pairing(void);
 
+/**
+ * Periodic power-management poll for the BLE connection (PROJECT.md §17
+ * "Power and connection behaviour"). Call from the main loop at any cadence
+ * finer than a few hundred ms; it is a few comparisons unless a tier
+ * transition is actually due, in which case it issues one
+ * updateConnParams() call.
+ *
+ * While connected and idle (no control-point write serviced and no
+ * fragment notified for CRYPTICK_BLE_CONN_IDLE_MS), downgrades the
+ * connection to a lower-power parameter set. Any control-point write or
+ * outbound notification immediately requests the responsive tier back —
+ * see ble_gatt_esp32.cpp's CONN_IDLE_* constants for the numbers and their
+ * justification. A no-op while disconnected or already in the tier the
+ * current idle state calls for.
+ */
+void ble_fido_power_tick(uint32_t now_ms);
+
 #ifdef __cplusplus
 }
 #endif

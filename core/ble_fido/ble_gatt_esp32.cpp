@@ -31,6 +31,7 @@
 #include <cryptick_log.h>
 #include <esp_random.h>
 #include <esp_mac.h>
+#include <esp_timer.h>
 #include <string.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -61,6 +62,24 @@ NimBLECharacteristic *g_control_point_len = nullptr;
 NimBLECharacteristic *g_revision = nullptr;
 static volatile bool g_connected = false;
 static char g_device_name[32] = CRYPTICK_BLE_DEVICE_NAME;
+
+/* Connected-idle power-save state (see CONN_IDLE_* above). g_conn_responsive
+ * tracks which connection-parameter tier was last *requested* -- the central
+ * may clamp or substitute (onConnParamsUpdate already logs what it actually
+ * accepted) -- not whether that request landed. */
+static bool g_conn_responsive = true;
+static uint32_t g_last_ble_activity_ms = 0;
+
+/* This file deliberately uses esp_timer rather than Arduino's millis() --
+ * it is not otherwise an Arduino.h consumer (NimBLE + FreeRTOS headers
+ * only). Same underlying clock as millis() either way: esp32-hal-misc.c
+ * implements millis() as esp_timer_get_time() / 1000, so this stays in
+ * lockstep with the `now_ms` ble_fido_power_tick() receives from
+ * src/main.cpp's loop() without pulling in a second clock source. */
+static inline uint32_t ble_now_ms(void)
+{
+    return (uint32_t)(esp_timer_get_time() / 1000);
+}
 
 /*
  * Advertising interval tiers.
@@ -118,6 +137,106 @@ constexpr uint16_t CONN_MAX_INTERVAL_UNITS = 24;         // 30.00 ms
 constexpr uint16_t CONN_LATENCY_EVENTS = 4;              // may skip up to 4 idle events
 constexpr uint16_t CONN_SUPERVISION_TIMEOUT_UNITS = 400; // 4000 ms
 
+/*
+ * Connected-idle power-save tier (PROJECT.md §17 "Power and connection
+ * behaviour"). The pair above is tuned for an in-flight CTAP/PIV/OATH
+ * ceremony; this device is a battery-powered key (BQ25185 + LiPo, no mains)
+ * that spends most of a *connected* session not in one -- CONN_MIN/MAX_
+ * INTERVAL_UNITS above means the radio wakes every 15-30 ms, minus what
+ * CONN_LATENCY_EVENTS lets it skip, for the entire time a host happens to
+ * hold the link open, including hours where nobody touches the device.
+ * That costs real current for no benefit once a transaction has finished.
+ *
+ * Units and the governing constraint are identical to the pair above
+ * (Bluetooth Core Spec Vol 3, Part C §9.3: connection interval in 1.25 ms
+ * units, supervision timeout in 10 ms units, and timeout must exceed
+ * (1 + latency) * interval_max * 2). Values chosen to keep that same
+ * one-connection-event-per-message intuition but at a cadence appropriate
+ * for a link nobody is currently using, the same way ADV_SLOW_*_UNITS above
+ * is to ADV_FAST_*_UNITS for advertising:
+ *
+ *   - 500-1000 ms interval: far outside anything a human perceives as
+ *     latency, but still inside what widely-deployed central stacks
+ *     actually honour -- unlike the multi-second range the spec's 4000 ms
+ *     ceiling permits, which several mainstream stacks silently clamp.
+ *   - Latency 4 (unchanged from the responsive tier): combined with the
+ *     larger interval this lets the radio go up to interval_max *
+ *     (latency + 1) = 5000 ms between forced listens, versus ~150 ms today
+ *     -- roughly a 30x reduction in how often the radio has to wake for a
+ *     link nothing is using.
+ *   - Supervision timeout 12000 ms: (1 + 4) * 1000 ms * 2 = 10000 ms is the
+ *     mandatory floor at this interval and latency; 12000 ms clears it with
+ *     margin (same style as the 4000 ms/300 ms margin on the responsive
+ *     tier above) without approaching the spec's 32000 ms ceiling, which
+ *     would leave a genuinely dead link undetected for too long.
+ *
+ * CRYPTICK_BLE_CONN_IDLE_MS is how long the link must see neither an
+ * inbound control-point write nor an outbound notification before it is
+ * considered idle enough to downgrade. 5000 ms is a judgement call, not a
+ * spec value: long enough that the gaps *within* one CTAP ceremony (a
+ * KEEPALIVE every CRYPTICK_FIDO_KEEPALIVE_MS=100 ms while waiting on a
+ * fingerprint, board_config.h) never trigger a downgrade mid-ceremony,
+ * short enough that the device starts saving power within a few seconds of
+ * a session actually ending.
+ */
+constexpr uint16_t CONN_IDLE_MIN_INTERVAL_UNITS = 400;        // 500.00 ms
+constexpr uint16_t CONN_IDLE_LATENCY_EVENTS = 4;              // up to ~5s doze
+constexpr uint16_t CONN_IDLE_MAX_INTERVAL_UNITS = 800;        // 1000.00 ms
+constexpr uint16_t CONN_IDLE_SUPERVISION_TIMEOUT_UNITS = 1200; // 12000 ms
+#ifndef CRYPTICK_BLE_CONN_IDLE_MS
+#define CRYPTICK_BLE_CONN_IDLE_MS 5000
+#endif
+
+/*
+ * What this file does NOT also do, and why: CPU/radio *sleep* (as opposed
+ * to the connection-parameter duty-cycle reduction above) was investigated
+ * and found unavailable in this exact build, not merely unimplemented.
+ * Checked on 2026-10-17 against the precompiled Arduino-ESP32 SDK this
+ * project's platformio.ini actually pulls in for the esp32s3 "qio_opi"
+ * variant (board esp32-s3-devkitc-1, N16R8 => quad flash + octal PSRAM):
+ *
+ *   ~/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32s3/
+ *     qio_opi/include/sdkconfig.h
+ *
+ * grep confirms CONFIG_PM_ENABLE and CONFIG_FREERTOS_USE_TICKLESS_IDLE are
+ * both *absent* (ESP-IDF Kconfig only emits a #define for an enabled bool
+ * option, so absence means off, not merely undocumented), and
+ * CONFIG_BT_CTRL_SLEEP_MODE_EFF is explicitly 0. That means:
+ *
+ *   - esp_pm_configure()'s automatic light sleep is compiled out of this
+ *     SDK build; calling it would return ESP_ERR_NOT_SUPPORTED. Nothing in
+ *     this file calls it, on the view that a call known in advance to fail
+ *     on the only SDK this firmware actually ships against is not a
+ *     feature, it is a comment pretending to be code -- the opposite of
+ *     this project's own citation discipline (PROJECT.md §20).
+ *   - The BLE controller's own modem-sleep (dozing the radio between
+ *     connection events independent of the host-level connection
+ *     parameters above) is compiled out too, for the same reason.
+ *
+ * Getting either back needs a custom sdkconfig, which PlatformIO's
+ * "framework = arduino" (this project's framework, platformio.ini) does
+ * not take -- only "framework = espidf" honours
+ * board_build.esp-idf.sdkconfig_path. That is a build-system change with
+ * its own risk (the Arduino compatibility layer is a separate, less-tested
+ * path through the same SDK), well beyond a connection/advertising power
+ * pass, so it is flagged here rather than attempted.
+ *
+ * Separately -- and this is the bigger one -- `setCpuFrequencyMhz()`
+ * *does* work in this SDK (it drives the clock tree directly via
+ * rtc_clk_cpu_freq_set_config_fast(), confirmed by reading
+ * cores/esp32/esp32-hal-cpu.c, with no CONFIG_PM_ENABLE dependency), but it
+ * only saves anything if the CPU actually reaches idle between useful
+ * work. Reading cores/esp32/main.cpp's loopTask: on a dual-core target
+ * (this board) `yieldIfNecessary()` compiles out entirely (it is
+ * `#if CONFIG_FREERTOS_UNICORE` only) and loopTask itself calls
+ * src/main.cpp's loop() back to back with no delay of its own. Unless
+ * loop() blocks somewhere, the core it runs on never reaches the idle task
+ * at all, BLE state notwithstanding -- so a correct fix would touch
+ * src/main.cpp's loop() for every subsystem it drives (nav, display,
+ * fingerprint, input, battery), not just the BLE slice this change owns.
+ * Flagged rather than changed here.
+ */
+
 /** GAP advertising interval only: name/UUID/appearance are set once, at
  *  init, since NimBLEAdvertising::addServiceUUID() appends rather than
  *  replacing — calling it again on every tier switch would grow the
@@ -144,6 +263,65 @@ void begin_advertising(bool fast)
            (unsigned)((fast ? ADV_FAST_MIN_UNITS : ADV_SLOW_MIN_UNITS) * 5 / 8),
            (unsigned)((fast ? ADV_FAST_MAX_UNITS : ADV_SLOW_MAX_UNITS) * 5 / 8),
            g_device_name);
+}
+
+/** This device accepts exactly one central at a time (the whole file tracks
+ *  "connected" as a single bool, not a set) -- so "the" connected peer's
+ *  handle is the first (only) entry NimBLE's own peer list holds. Same
+ *  pattern already used by ble_fido_clear_all_bonds()/ble_fido_cancel_pairing()
+ *  below. Returns false with nothing written to *out if nobody is connected. */
+bool current_conn_handle(uint16_t *out)
+{
+    if (!g_server || !g_connected)
+        return false;
+    for (const auto &conn_id : g_server->getPeerDevices()) {
+        *out = conn_id;
+        return true;
+    }
+    return false;
+}
+
+/** Request the responsive (CTAP/PIV/OATH-ceremony) connection-parameter
+ *  tier. Safe to call on every activity; NimBLE/the central only do real
+ *  work if something actually needs renegotiating. */
+void request_responsive_conn_params()
+{
+    uint16_t handle;
+    if (!current_conn_handle(&handle))
+        return;
+    g_server->updateConnParams(handle, CONN_MIN_INTERVAL_UNITS, CONN_MAX_INTERVAL_UNITS,
+                                CONN_LATENCY_EVENTS, CONN_SUPERVISION_TIMEOUT_UNITS);
+    if (!g_conn_responsive)
+        CLOG_I("BLE", "connected-idle power-save tier -> responsive (activity)");
+    g_conn_responsive = true;
+}
+
+/** Request the connected-idle power-save connection-parameter tier. Only
+ *  called from ble_fido_power_tick() once CRYPTICK_BLE_CONN_IDLE_MS has
+ *  elapsed with no control-point write or outbound notify. */
+void request_idle_conn_params()
+{
+    uint16_t handle;
+    if (!current_conn_handle(&handle))
+        return;
+    g_server->updateConnParams(handle, CONN_IDLE_MIN_INTERVAL_UNITS,
+                                CONN_IDLE_MAX_INTERVAL_UNITS,
+                                CONN_IDLE_LATENCY_EVENTS,
+                                CONN_IDLE_SUPERVISION_TIMEOUT_UNITS);
+    CLOG_I("BLE", "connected-idle power-save tier -> idle (%lums with no traffic)",
+           (unsigned long)CRYPTICK_BLE_CONN_IDLE_MS);
+    g_conn_responsive = false;
+}
+
+/** Record that the link just did something real (a serviced control-point
+ *  write, or a notification actually sent). Resets the idle clock and, if
+ *  the link had been downgraded, asks for the responsive tier back on the
+ *  spot rather than waiting for the next ble_fido_power_tick(). */
+void mark_ble_activity()
+{
+    g_last_ble_activity_ms = ble_now_ms();
+    if (!g_conn_responsive)
+        request_responsive_conn_params();
 }
 
 /*
@@ -179,6 +357,7 @@ int notify_fragment(const uint8_t *frag, uint16_t len)
         return 0;
     for (int retry = 0; retry < 5; retry++) {
         if (g_status->notify(frag, len)) {
+            mark_ble_activity();
             return 1;
         }
         if (!g_connected)
@@ -203,6 +382,12 @@ class ControlPointCallbacks : public NimBLECharacteristicCallbacks {
             ble_fido_send_error(BLE_FIDO_ERR_OTHER);
             return;
         }
+        /* A real, authenticated write is real activity, whatever it turns
+         * out to contain -- bring the link back to the responsive tier
+         * before (not after) handing the fragment to the framing layer, so
+         * the rest of this transaction's notifications go out at the
+         * snappy cadence rather than the one that just woke it up. */
+        mark_ble_activity();
         NimBLEAttValue val = chr->getValue();
         if (val.size() == 0 || val.size() > 0xFFFF)
             return;
@@ -225,7 +410,13 @@ class ServerCallbacks : public NimBLEServerCallbacks {
         ble_daemon_set_mtu(BLE_ATT_MTU_DFLT);
         CLOG_I("BLE", "connected handle=%u", (unsigned)info.getConnHandle());
 
-        /* See CONN_MIN_INTERVAL_UNITS above for the numbers and why. */
+        /* Every fresh connection starts in the responsive tier and with a
+         * clean idle clock, whatever tier the *previous* connection ended
+         * up in -- see CONN_MIN_INTERVAL_UNITS above for the numbers and
+         * why, and CONN_IDLE_MIN_INTERVAL_UNITS for the power-save tier
+         * ble_fido_power_tick() may drop to later if this one goes idle. */
+        g_conn_responsive = true;
+        g_last_ble_activity_ms = ble_now_ms();
         server->updateConnParams(info.getConnHandle(), CONN_MIN_INTERVAL_UNITS,
                                   CONN_MAX_INTERVAL_UNITS, CONN_LATENCY_EVENTS,
                                   CONN_SUPERVISION_TIMEOUT_UNITS);
@@ -507,6 +698,15 @@ void ble_fido_clear_all_bonds(void)
     CLOG_I("BLE", "All BLE bonds cleared. Restarting device for fresh identity...");
     vTaskDelay(pdMS_TO_TICKS(100));
     esp_restart();
+}
+
+void ble_fido_power_tick(uint32_t now_ms)
+{
+    if (!g_connected || !g_conn_responsive)
+        return; /* nothing to downgrade, or already downgraded */
+    if ((uint32_t)(now_ms - g_last_ble_activity_ms) < (uint32_t)CRYPTICK_BLE_CONN_IDLE_MS)
+        return;
+    request_idle_conn_params();
 }
 
 void ble_fido_cancel_pairing(void)
