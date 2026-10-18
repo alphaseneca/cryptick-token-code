@@ -1144,12 +1144,21 @@ static int reset_application(uint8_t p1, uint8_t p2, size_t lc,
     if (!_hal->mgmt_key_reset_to_default())
         ok = 0;
 
+    /*
+     * Unconditional, not just on the success path: by the time any HAL
+     * hook above has run, this attempt may already have deleted objects,
+     * rolled keys, or erased the management key, whether or not every
+     * step succeeded. Returning WRONG_DATA while leaving _pin_verified/
+     * _mgmt_authenticated exactly as they were would make a real, partial
+     * wipe look like nothing happened; the comment below's invariant —
+     * "a freshly-reset device has nothing left to have verified or
+     * authenticated" — has to hold whenever a reset was attempted at all,
+     * not only when every step of it happened to succeed.
+     */
+    piv_reset();
+
     if (!ok)
         return put_sw(out, out_max, PIV_SW_WRONG_DATA);
-
-    /* A freshly-reset device has nothing left to have verified or
-     * authenticated, and nothing pending to chain or respond to. */
-    piv_reset();
     return put_sw(out, out_max, PIV_SW_OK);
 }
 

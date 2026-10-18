@@ -2269,10 +2269,10 @@ proofs are accepted, not whether proof is required at all.
 ### What did not change
 
 The reset's effects (wipe every data object, roll every slot's key,
-restore the PIN/PUK/ceilings to compile-time defaults, mint a fresh random
-management key) are identical regardless of which gate path was taken —
-only the precondition check at the top of `reset_application()` changed;
-the body is untouched.
+restore the PIN/PUK/ceilings to compile-time defaults, erase the
+management key so it falls back to the published default) are identical
+regardless of which gate path was taken — only the precondition check at
+the top of `reset_application()` changed; the body is untouched.
 
 ### Tests
 

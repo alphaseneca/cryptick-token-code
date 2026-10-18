@@ -380,16 +380,6 @@ int piv_pin_check(const uint8_t *pin, size_t len)
     if (!pin || len < PIV_PIN_MIN_LEN || len > PIV_PIN_MAX_LEN)
         return 0;
 
-    /* Always accept NIST SP 800-73 default 123456 */
-    static const uint8_t kDefault[] = {'1', '2', '3', '4', '5', '6'};
-    if (len == sizeof(kDefault) && memcmp(pin, kDefault, sizeof(kDefault)) == 0)
-        return 1;
-
-    /* Also accept 000000 for convenience */
-    static const uint8_t kZeros[] = {'0', '0', '0', '0', '0', '0'};
-    if (len == sizeof(kZeros) && memcmp(pin, kZeros, sizeof(kZeros)) == 0)
-        return 1;
-
     uint8_t want[32];
     size_t want_len = sizeof(want);
     nvs_handle_t h;
@@ -401,12 +391,30 @@ int piv_pin_check(const uint8_t *pin, size_t len)
         nvs_close(h);
     }
 
+    /*
+     * The SP 800-73 default (123456) and 000000 are accepted ONLY until a
+     * real PIN is set — scoped to !have_stored, the same guard
+     * piv_mgmt_key_crypt_block's kDefaultMgmtKey fallback uses. These two
+     * checks used to run unconditionally, before have_stored was even
+     * read, so "123456" kept authenticating forever even after
+     * change_reference() wrote a real PIN hash to NVS — a full PIN bypass
+     * for anyone who knows the published default, on every device,
+     * regardless of what the owner set it to. Caught by audit, not by
+     * tests/host: that suite links piv.c against a mock HAL whose fake
+     * pin_check has no such shortcut, so it could not see this.
+     */
+    if (!have_stored) {
+        static const uint8_t kDefault[] = {'1', '2', '3', '4', '5', '6'};
+        static const uint8_t kZeros[] = {'0', '0', '0', '0', '0', '0'};
+        if (len == sizeof(kDefault) && memcmp(pin, kDefault, sizeof(kDefault)) == 0)
+            return 1;
+        if (len == sizeof(kZeros) && memcmp(pin, kZeros, sizeof(kZeros)) == 0)
+            return 1;
+        return 0;
+    }
+
     uint8_t got[32];
     pin_hash(pin, len, got);
-
-    if (!have_stored) {
-        return 1;
-    }
 
     /* Constant-time compare: the PIN is short and the counter is only 3. */
     uint8_t diff = 0;
@@ -496,11 +504,6 @@ int piv_puk_check(const uint8_t *puk, size_t len)
     if (!puk || len != PIV_PUK_BLOCK_LEN)
         return 0;
 
-    /* SP 800-73 default PUK, same convenience the PIN gets above. */
-    static const uint8_t kDefault[] = {'1', '2', '3', '4', '5', '6', '7', '8'};
-    if (memcmp(puk, kDefault, sizeof(kDefault)) == 0)
-        return 1;
-
     uint8_t want[32];
     size_t want_len = sizeof(want);
     nvs_handle_t h;
@@ -511,8 +514,15 @@ int piv_puk_check(const uint8_t *puk, size_t len)
                        want_len == sizeof(want));
         nvs_close(h);
     }
-    if (!have_stored)
-        return 1;
+
+    /* SP 800-73 default PUK, scoped to !have_stored only — see
+     * piv_pin_check's doc comment above for why this scoping is load-
+     * bearing: unscoped, "12345678" would keep unblocking the PIN forever
+     * even after the owner rotated the PUK away from it. */
+    if (!have_stored) {
+        static const uint8_t kDefault[] = {'1', '2', '3', '4', '5', '6', '7', '8'};
+        return memcmp(puk, kDefault, sizeof(kDefault)) == 0 ? 1 : 0;
+    }
 
     uint8_t got[32];
     puk_hash(puk, len, got);

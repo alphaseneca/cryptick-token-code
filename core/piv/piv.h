@@ -305,25 +305,22 @@ typedef struct {
     int (*mgmt_key_set)(const uint8_t *key, size_t len);
 
     /**
-     * Non-zero if the stored management key is still the one this specific
-     * unit generated for itself (see NOTES.md, "a random default is a
-     * *different* commitment than no default") rather than one the owner
-     * has explicitly set with SET MANAGEMENT KEY. Lets the CLI warn the
-     * operator the way `ykman piv info` warns when the default is a known
-     * constant — and, unlike that known constant, costs an attacker nothing
-     * to learn here, since a leaked default on this device is one unit's
-     * problem, not every unit's.
+     * Non-zero if the stored management key is still SP 800-73-5's
+     * published default (see kDefaultMgmtKey in piv_hal_esp32.cpp) rather
+     * than one the owner has explicitly set with SET MANAGEMENT KEY. Lets
+     * the CLI warn the operator the same way it already does for an
+     * unrotated default PIN/PUK.
      */
     int (*mgmt_key_is_default)(void);
 
     /**
-     * Fill `out` with `len` cryptographically random bytes. Used for the
-     * mutual-authenticate witness and, on first use, to mint this unit's
-     * random factory-default management key. May be NULL only on a build
-     * that also leaves mgmt_key_crypt_block NULL, in which case GENERAL
-     * AUTHENTICATE against PIV_KEY_REF_MGMT answers
-     * PIV_SW_INS_UNSUPPORTED rather than signing with a key nothing ever
-     * seeded.
+     * Fill `out` with `len` cryptographically random bytes. Used only for
+     * the mutual-authenticate witness in GENERAL AUTHENTICATE against
+     * PIV_KEY_REF_MGMT — the management key itself is never randomly
+     * generated (see kDefaultMgmtKey's doc comment in piv_hal_esp32.cpp).
+     * May be NULL only on a build that also leaves mgmt_key_crypt_block
+     * NULL, in which case that GENERAL AUTHENTICATE path answers
+     * PIV_SW_INS_UNSUPPORTED rather than running with no witness source.
      */
     int (*random_bytes)(uint8_t *out, size_t len);
 
