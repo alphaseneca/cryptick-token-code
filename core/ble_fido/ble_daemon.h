@@ -21,6 +21,23 @@ extern "C" {
 #define BLE_DAEMON_UUID_STATUS            "FBF6EB82-7F39-41B1-A191-9527CC42F8BE"
 #define BLE_DAEMON_UUID_CONTROL_POINT_LEN "FBF6EB83-7F39-41B1-A191-9527CC42F8BE"
 #define BLE_DAEMON_UUID_VERSION           "FBF6EB84-7F39-41B1-A191-9527CC42F8BE"
+/*
+ * Factory-unique device identity, read-only, additive (PROJECT.md §19:
+ * "Non-standard secondary GATT service" is a dead end for exactly this kind
+ * of thing — so this rides the *existing* private Daemon Bridge service
+ * rather than standing up a second one). Value is the same ASCII string
+ * `usb_device_serial_number()` (drivers/usb_device.h) already programs into
+ * the USB iSerialNumber descriptor — "CT-XXXXXXXXXXXX", 15 ASCII chars,
+ * `^CT-[0-9A-F]{12}$" — so one physical unit carries one identity string
+ * regardless of which transport the host used to read it, with no separate
+ * BLE-side provisioning step. Gated encrypted+authenticated (matching
+ * daemonControlPoint's own gate): the BLE link address is randomized by
+ * design specifically to resist tracking, and a plain, bond-free read of a
+ * permanent serial would undo that for anyone who merely connects. A
+ * daemon that already bonds to transact CTAP pays no extra cost to read
+ * this once connected; see NOTES.md, "BLE device identity".
+ */
+#define BLE_DAEMON_UUID_SERIAL_NUMBER     "FBF6EB85-7F39-41B1-A191-9527CC42F8BE"
 
 #define BLE_DAEMON_MAX_MSG 7609
 

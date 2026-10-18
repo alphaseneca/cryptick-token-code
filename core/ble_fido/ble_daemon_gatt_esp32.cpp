@@ -16,6 +16,11 @@ extern "C" void ctaphid_cancel_request(void);
 #include <string.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+/* Same factory-unique identity string the USB build programs into
+ * iSerialNumber (drivers/usb_device.h) — see BLE_DAEMON_UUID_SERIAL_NUMBER's
+ * doc comment in ble_daemon.h for why it is reused verbatim here rather
+ * than inventing a second BLE-specific identity. */
+#include "usb_device.h"
 
 namespace {
 
@@ -23,6 +28,7 @@ NimBLECharacteristic *g_cp = nullptr;
 NimBLECharacteristic *g_status = nullptr;
 NimBLECharacteristic *g_cp_len = nullptr;
 NimBLECharacteristic *g_ver = nullptr;
+NimBLECharacteristic *g_serial = nullptr;
 
 uint8_t        g_msg[BLE_DAEMON_MAX_MSG];
 ble_fido_ctx_t g_ctx;
@@ -144,6 +150,31 @@ void ble_daemon_gatt_init(void)
     g_ver = svc->createCharacteristic(BLE_DAEMON_UUID_VERSION, NIMBLE_PROPERTY::READ);
     uint8_t ver = 0x01;
     g_ver->setValue(&ver, 1);
+
+    /*
+     * --- Device identity (additive) -----------------------------------
+     *
+     * Factory-unique serial, gated the same as daemonControlPoint
+     * (encrypted + authenticated) rather than left world-readable like
+     * daemonControlPointLength/daemonVersion above: those two carry no
+     * information that survives a reboot or means anything off this one
+     * connection, but a serial number is a permanent per-unit identifier,
+     * and this device already randomizes its BLE address specifically to
+     * resist being tracked by an address that doesn't change — a bond-free
+     * read of a permanent serial would reopen exactly that. A daemon that
+     * already has to bond to exchange CTAP over this same service pays
+     * nothing extra to read it once connected. See
+     * BLE_DAEMON_UUID_SERIAL_NUMBER's doc comment (ble_daemon.h) and
+     * NOTES.md, "BLE device identity".
+     */
+    g_serial = svc->createCharacteristic(
+        BLE_DAEMON_UUID_SERIAL_NUMBER,
+        NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::READ_ENC |
+            NIMBLE_PROPERTY::READ_AUTHEN);
+    {
+        const char *serial = usb_device_serial_number();
+        g_serial->setValue((const uint8_t *)serial, (uint16_t)strlen(serial));
+    }
 
     publish_control_point_length();
     svc->start();

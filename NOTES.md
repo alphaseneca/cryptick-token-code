@@ -1534,3 +1534,136 @@ by reading the code directly rather than taking any claim on faith. I did
 not push anything (not asked to, and did not), so nothing left this
 worktree. Flagging this for the user/maintainer to audit rather than
 deciding silently either way.
+
+---
+
+## 2026-10-17 — BLE device identity (Daemon Bridge service), completing the USB-side fix
+
+### Context
+
+The USB half of device identity landed earlier today (see "Real USB serial
+number (eFuse MAC), for host-side device identity" above): a factory-unique
+`"CT-XXXXXXXXXXXX"` string, read from the ESP32-S3's eFuse base MAC, is now
+the USB `iSerialNumber`. That note's own "What `cryptick-token-daemon`'s
+device-identity store would need" section flagged the gap explicitly: *"this
+identity is only observable while the device is connected over USB... It is
+not carried over BLE at all today."* This closes that gap — the task this
+time is daemon-facing multi-device support end to end, and BLE is the
+transport the daemon actually owns (PROJECT.md §1/§4: USB needs no daemon at
+all), so leaving BLE without any stable identity would have left the harder
+half of "I own two tokens" unsolved.
+
+### What changed
+
+A new, read-only, additive characteristic on the **existing** Daemon Bridge
+GATT service (`FBF6EB80-...`, `core/ble_fido/ble_daemon.h` /
+`ble_daemon_gatt_esp32.cpp`) — not the standard FIDO service (`0xFFFD`) and
+not a new service:
+
+- `BLE_DAEMON_UUID_SERIAL_NUMBER` = `FBF6EB85-7F39-41B1-A191-9527CC42F8BE`
+  (one past `daemonVersion`, `FBF6EB84`, in the same UUID block).
+- Its value is `usb_device_serial_number()`'s string verbatim — the exact
+  same `"CT-XXXXXXXXXXXX"` the USB descriptor already carries, not a second,
+  independently-derived identity. One physical unit now carries **one**
+  identity string across both transports with no pairing/provisioning step
+  to correlate them, which is strictly better than what the USB-only note
+  above anticipated ("correlating... requires its own pairing/provisioning
+  step... out of scope here") — reusing the same source made that
+  correlation step unnecessary rather than just easier.
+- `NIMBLE_PROPERTY::READ | READ_ENC | READ_AUTHEN` — gated the same as
+  `daemonControlPoint`, deliberately *not* left open like
+  `daemonControlPointLength`/`daemonVersion`. Those two carry nothing that
+  means anything off one connection; a serial number is a permanent per-unit
+  identifier, and `ble_fido_gatt_init()` already randomizes this device's
+  BLE address (`NimBLEDevice::setOwnAddrType(BLE_OWN_ADDR_RANDOM)`,
+  `ble_gatt_esp32.cpp`) specifically so it cannot be used to track the
+  device across sessions. A bond-free read of a permanent serial would undo
+  that for anyone who merely connects, without even pairing. Gating it
+  behind the same encrypted+authenticated bond `daemonControlPoint` already
+  requires costs the daemon nothing extra: it has to clear that same bar to
+  exchange CTAP over this service anyway.
+
+### Why the Daemon Bridge service, not `0xFFFD` or a new service
+
+PROJECT.md §19 (`cryptick-token-daemon`) lists "Non-standard secondary GATT
+service" as a settled dead end — *"adds a second untested door to the same
+key material for no benefit; one FIDO service, spec-compliant."* Read
+literally that is about not reopening a case already closed for *PIV*
+specifically, but the principle generalizes: stand up nothing new here.
+
+- **Not `0xFFFD`:** that service's characteristic set is exactly what CTAP2
+  §11.2's BLE transport section defines (`fidoControlPoint`, `fidoStatus`,
+  `fidoControlPointLength`, `fidoServiceRevisionBitfield` — four, no more).
+  `docs/BLE_FIDO.md`'s own framing is "One FIDO service, spec-compliant";
+  adding a fifth, non-CTAP characteristic there is exactly the kind of
+  surface a FIDO conformance test enumerating that service would flag, and
+  it would also be visible to every generic BLE FIDO client that pairs with
+  this device (Windows' native stack, `libfido2`, etc.) — none of which has
+  any use for it.
+- **Not a new service:** that is precisely what §19's entry warns against.
+- **The Daemon Bridge service, `FBF6EB80-...`:** already private,
+  non-standard, and exclusively `cryptick-daemon`'s — nothing else connects
+  to it. It is the one GATT surface that exists *specifically* for the
+  daemon to talk to this device, which is exactly who this identity is for.
+  Adding one characteristic there is additive to a service already outside
+  any spec's closed set, costs no new service discovery, and is invisible
+  to every BLE peer that isn't the daemon.
+
+### Where this does *not* touch
+
+`ble_gatt_esp32.cpp` (the FIDO `0xFFFD` service, advertising, and pairing)
+is **untouched** — this change lives entirely in `ble_daemon.h` and
+`ble_daemon_gatt_esp32.cpp`. That was deliberate, not incidental: another
+agent's task this round owns BLE power/reconnect behaviour
+(`configure_adv_interval`/`begin_advertising`) in that same first file
+concurrently, and touching it at all would have risked a collision over
+nothing this change needed. `core/fido2/ctap.c`'s protocol internals,
+`ble_fido.h`/`ble_fido.c`'s framing, and the PIV GATT service
+(`ble_piv_gatt_esp32.cpp`) are likewise untouched — this is an identity
+primitive bolted onto one existing service, not a protocol change.
+
+### Daemon-side follow-up (separate repo, done alongside this)
+
+`cryptick-token-daemon`'s `crates/daemon/src/transport.rs` now reads this
+characteristic right after a successful Daemon Bridge connection (both the
+organic reconnect path and `SelectDevice`'s hot-retarget path), validates it
+against the documented `^CT-[0-9A-F]{12}$` shape, and keys `devices.rs`'s
+known-devices store by it when present — falling back to the pre-existing
+best-effort BLE-address key, unchanged, when the characteristic is absent
+(older firmware) or the read fails for any reason (not yet bonded, ATT
+error, malformed bytes). See that repo's own notes/PROJECT.md §17 for the
+daemon-side detail; nothing above depends on reading further than this
+paragraph to understand the firmware half in isolation.
+
+### What's verified vs. what needs real hardware
+
+**Verified by building, not by inspection:** `pio run -e esp32-s3-n16r8`
+(the product env, `CRYPTICK_BLE_FIDO=1`) succeeds with this change, linking
+the new characteristic's creation and `usb_device_serial_number()` call
+cleanly; no new warnings beyond a pre-existing, unrelated
+`NimBLEService::start()` deprecation notice. `tests/host`'s full suite
+(306 cases) still passes unchanged — expected, since none of those cases
+cover the NimBLE GATT glue layer this change lives in (`ble_fido.c`'s
+freestanding framing is what they exercise, not `ble_daemon_gatt_esp32.cpp`;
+see `docs/BLE_FIDO.md`'s own "Files" table for that split). There is no
+host-compilable test for NimBLE service/characteristic wiring in this repo
+today, so this change has no automated coverage of its own — the same gap
+every other characteristic on this same service already has.
+
+**Needs a flashed unit (and a real `cryptick-daemon`) to confirm:**
+- That a central actually sees `READ | READ_ENC | READ_AUTHEN` behave as
+  intended: an unbonded `btleplug` read should fail at ATT with
+  Insufficient Authentication/Encryption (the same two codes
+  `transport-ble`'s `classify_att()` already recognizes for
+  `fidoControlPoint`), and a read **after** bonding should return the
+  15-byte ASCII string intact.
+- That two physically distinct units genuinely report two different
+  strings (the eFuse-MAC derivation is Espressif's, already relied on for
+  the USB serial, but this is the first time it's read back over BLE
+  specifically) — no second unit was available to confirm this side by
+  side.
+- That reading this characteristic does not perturb `ble_daemon_gatt_esp32.cpp`'s
+  existing reassembly/notify state (`g_ctx`) for the CTAP bridge sharing the
+  same service — it shouldn't, since it is a plain static-value
+  read-characteristic with no callback and no interaction with `g_ctx`, but
+  that reasoning is untested against real GATT traffic interleaving.
