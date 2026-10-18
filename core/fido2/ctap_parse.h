@@ -8,8 +8,12 @@
 #define _CTAP_PARSE_H
 
 
+// CTAP2_ERR_INVALID_CBOR (0x12) is "Error when parsing CBOR" in CTAP 2.1 §8.2,
+// which is exactly what a non-CborNoError return from tinycbor means. This
+// previously returned CTAP2_ERR_CBOR_PARSING (0x10), a name the 2019 SoloKeys
+// header invented: 0x10 is unassigned in CTAP 2.0, 2.1 and 2.2 alike.
 #define check_ret(r)    _check_ret(r,__LINE__, __FILE__);\
-                        if ((r) != CborNoError) return CTAP2_ERR_CBOR_PARSING;
+                        if ((r) != CborNoError) return CTAP2_ERR_INVALID_CBOR;
 
 #define check_retr(r)    _check_ret(r,__LINE__, __FILE__);\
                         if ((r) != CborNoError) return r;

@@ -308,7 +308,7 @@ int16_t bridge_to_wallet(uint8_t * keyh, uint8_t klen)
 
             if (memcmp(shasum, chksum, 4) != 0)
             {
-                ret = CTAP2_ERR_CREDENTIAL_NOT_VALID;
+                ret = CTAP2_ERR_INVALID_CREDENTIAL;
                 printf2(TAG_ERR,"Integrity fail for WalletReg\n");
                 dump_hex1(TAG_ERR, chksum, sizeof(chksum));
                 goto cleanup;

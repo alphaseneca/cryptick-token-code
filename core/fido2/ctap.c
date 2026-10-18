@@ -1009,9 +1009,23 @@ int ctap_authenticate_credential(struct rpId * rp, CTAP_credentialDescriptor * d
             crypto_sha256_final(rpIdHash);
             return u2f_authenticate_credential((struct u2f_key_handle *)&desc->credential.id, U2F_KEY_HANDLE_SIZE,rpIdHash);
         break;
+#ifdef ENABLE_U2F_EXTENSIONS
+        /*
+         * The one credential type accepted without verifying a MAC: the gate
+         * is is_extension_request()'s static 4-byte WALLET_TAG and a minimum
+         * length, so the derivation input on this path is attacker-chosen --
+         * the risk daemon PROJECT.md 15.9 identifies and the PIV label-length
+         * assertions in core/piv/piv_hal_esp32.cpp exist to bound.
+         *
+         * Guarded to match every other PUB_KEY_CRED_CUSTOM site. Without the
+         * extensions that consume it, this arm had no legitimate caller and
+         * only served to bless a forged credential id: no MAC *and* no rpId
+         * binding, unlike the two arms above.
+         */
         case PUB_KEY_CRED_CUSTOM:
             return is_extension_request(getAssertionState.customCredId, getAssertionState.customCredIdSize);
         break;
+#endif
         default:
         printf1(TAG_ERR, "PUB_KEY_CRED_UNKNOWN %x\r\n",desc->type);
         break;
@@ -1417,7 +1431,7 @@ static int8_t save_credential_list( uint8_t * clientDataHash,
         if (count > ALLOW_LIST_MAX_SIZE-1)
         {
             printf2(TAG_ERR, "ALLOW_LIST_MAX_SIZE Exceeded\n");
-            return CTAP2_ERR_TOO_MANY_ELEMENTS;
+            return CTAP2_ERR_LIMIT_EXCEEDED;
         }
 
         memmove(getAssertionState.clientDataHash, clientDataHash, CLIENT_DATA_HASH_SIZE);

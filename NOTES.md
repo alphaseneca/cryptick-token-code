@@ -1667,3 +1667,86 @@ every other characteristic on this same service already has.
   same service — it shouldn't, since it is a plain static-value
   read-characteristic with no callback and no interaction with `g_ctx`, but
   that reasoning is untested against real GATT traffic interleaving.
+
+---
+
+## 2026-10-18 — CTAP2 status-code audit against the real spec tables
+
+### Why
+
+`core/fido2/ctap_errors.h` traced back to the 2019 SoloKeys original, and six
+of its names were bound to values that appear in *neither* the CTAP 2.0 PS
+(2019-01-30) §8.2 table nor CTAP 2.1 PS (2021-06-15)/2.2 PS (2025-07-14) §8.2
+(identical to each other for this table). PROJECT.md §20's own rule is to
+verify constants against the specification, not against the other side's
+code — this header had never had that pass done.
+
+Two of the six were not just wrong, they were dangerous:
+`CTAP2_ERR_TOO_MANY_ELEMENTS` (0x17) and `CTAP2_ERR_EXTENSION_NOT_SUPPORTED`
+(0x18) are real, different error codes in CTAP 2.1/2.2 —
+`CTAP2_ERR_FP_DATABASE_FULL` and `CTAP2_ERR_LARGE_BLOB_STORAGE_FULL`
+respectively. Emitting the old names put a byte on the wire that a
+2.1-aware platform would read as a completely different failure than the
+one this authenticator meant. The other four
+(`CTAP2_ERR_CBOR_PARSING`, `CTAP2_ERR_INVALID_CBOR_TYPE`,
+`CTAP2_ERR_CREDENTIAL_NOT_VALID`, `CTAP2_ERR_NOT_BUSY`) were merely
+nonexistent — unassigned in every published table — rather than collisions,
+but still not safe to keep emitting to a conformance-testing platform.
+
+### What changed
+
+- `ctap_errors.h`: removed the six invented names (recorded in a comment so
+  they are not reintroduced), added every CTAP 2.1/2.2 code this header was
+  missing (`CTAP2_ERR_UP_REQUIRED` through `CTAP2_ERR_UNAUTHORIZED_PERMISSION`,
+  `CTAP2_ERR_PUAT_REQUIRED` as the 2.1 name for the same 0x36 value this
+  device already used as `CTAP2_ERR_PIN_REQUIRED` — kept both, since this
+  device advertises `FIDO_2_0` rather than `FIDO_2_1_PRE`), and annotated
+  every CTAP2.0-only code and every unassigned range inline against the
+  table rather than leaving them unexplained gaps.
+- `ctap_parse.c`/`ctap_parse.h`/`ctap.c`/`extensions/wallet.c`: every caller
+  updated to the real names (`CTAP2_ERR_CBOR_UNEXPECTED_TYPE`,
+  `CTAP2_ERR_INVALID_CBOR`, `CTAP2_ERR_LIMIT_EXCEEDED`,
+  `CTAP2_ERR_INVALID_CREDENTIAL`).
+
+### A real bug found while auditing `parse_credential_descriptor`
+
+Reading every call site to retarget the renamed constants surfaced an actual
+memory-safety issue in the `PUB_KEY_CRED_CUSTOM` fallback (the
+`getAssertionState.customCredId` path `ENABLE_U2F_EXTENSIONS` gates):
+TinyCBOR's short-buffer contract reads the opposite way round from the
+obvious assumption — `cbor_value_copy_byte_string()` copies *nothing* when
+the destination is too small, yet still writes the full wire length into
+`buflen` and reports `CborErrorOutOfMemory`. The old code took that
+`buflen` and stored it as `customCredIdSize` uncapped, then
+`ctap_add_credential_descriptor()`/`ctap_end_get_assertion()` (`ctap.c`)
+pair that size with `&cred->credential.id` — a `sizeof(CredentialId)`
+buffer, not the 256-byte one `customCredId` actually is. A peer-controlled
+over-length credential id in an allowList entry could make this
+authenticator sign over an out-of-bounds read and echo the overrun back in
+the assertion's credential id. Now clamped at the point the length is
+produced, not where it's consumed.
+
+While there: `PUB_KEY_CRED_CUSTOM`'s one caller in
+`ctap_authenticate_credential()` (`ctap.c`) accepts a credential type with
+no MAC and no rpId binding — the gate is `is_extension_request()`'s static
+4-byte tag — but every other `PUB_KEY_CRED_CUSTOM` site in this file is
+already behind `ENABLE_U2F_EXTENSIONS`; this one wasn't, despite having no
+legitimate caller without the extension that consumes it. Gated to match.
+Also zero-initialized `parse_credential_descriptor`'s local `type[12]`
+buffer: the same short-write TinyCBOR contract left it unwritten on the
+same path, and while nothing currently reads it when `cred->type` stays
+`PUB_KEY_CRED_UNKNOWN`, reading an indeterminate stack buffer under
+peer-controlled conditions is undefined behavior regardless of whether
+today's call graph happens to discard the result.
+
+### Verification
+
+`tests/host` (pytest, `pip install -r tests/requirements-host.txt`) passes
+185 of the suite's non-PIV cases unchanged after this change, including
+every CBOR/CTAP2 parsing and framing test — the renamed constants are
+internal values, not wire-format changes, so no test assertion needed to
+change. `tests/host/test_piv_apdu.py` and three cases in
+`test_ccid_proto.py` fail/crash on a clean checkout of `main` with *none*
+of this pass's changes applied (confirmed via `git stash`) — pre-existing,
+unrelated to anything `core/fido2/` owns, and not touched here. Flagged
+separately rather than folded into this pass.
