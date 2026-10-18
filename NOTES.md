@@ -2063,3 +2063,193 @@ across two physical units (no second unit was available, same caveat the
 BLE identity entry above already recorded for the USB-serial-over-BLE
 characteristic); and the open manufacturing/fulfillment question above
 about how an owner is meant to learn their own unit's factory-default key.
+
+## 2026-10-18 — PIV factory reset (RESET APPLICATION)
+
+### What was missing
+
+`ctctl piv reset` printed "✓ PIV application reset to factory defaults
+(Default PIN: 123456, PUK: 12345678)" but only ever called `select_piv()` —
+a plain ISO 7816 SELECT. SELECT's firmware handler calls `piv_reset()`,
+which clears session state (`_pin_verified`, `_mgmt_authenticated`,
+chained-response state) and nothing else: it does not delete stored
+certificates, does not reset the PIN hash, does not reset the PUK hash,
+and does not reset the management key. The CLI was reporting a factory
+reset that never happened on the device — found and deliberately left
+unfixed by the previous pass ("PIV PUK and management key support" above)
+because there was no `RESET APPLICATION` APDU in the firmware at all yet
+to send instead.
+
+### What changed, by piece
+
+- **`PIV_INS_RESET_APPLICATION`, vendor INS `0xFB`** (`piv.h`): grouped
+  with the existing `0xFA`/`0xFF` vendor instructions and their shared
+  comment — YubiKey's own byte for a full PIV factory reset, reused for
+  the same reason `SET PIN RETRIES`/`SET MANAGEMENT KEY` reused `0xFA`/
+  `0xFF`: this device speaks the one vendor dialect PIV tooling already
+  understands instead of inventing a second one no client has ever seen.
+  ISO case 1 shape — P1 = P2 = `0x00`, no data field, no response data.
+
+- **The gate** (`reset_application()`, `piv.c`): refuses unless *both*
+  the PIN and PUK retry counters are already at zero
+  (`PIV_SW_SECURITY_NOT_SATISFIED` otherwise). SP 800-73 does not define
+  this operation at all, so there is no spec text to defer to — this is
+  the real-world convention every PIV implementation that offers a full
+  reset (YubiKey very much included) actually enforces, and the reasoning
+  is straightforward: an unauthenticated party who merely holds the
+  device must not be able to wipe it and install their own keys and
+  certificates, and "both secrets are already unusable" is the one
+  precondition checkable without knowing either of them. See "A judgement
+  call flagged, not decided silently" below — this is the one piece of
+  this pass that is a convention, not a specification, and is called out
+  there for exactly that reason.
+
+- **What a reset actually does**, composed from existing, narrower HAL
+  hooks rather than one new coarse "wipe everything" hook:
+  - `delete_object` over every object tag this device's own tooling can
+    ever write: the four certificate slots plus the two identity objects
+    `PUT DATA` is allowed to override (CCC, CHUID). Nothing wider is
+    reachable — there is no sanctioned way for any tool this device ships
+    to write an object under any other tag (`piv_cli.rs`'s own module doc
+    comment: arbitrary object import/export is explicitly out of scope).
+  - `key_generate` over every one of the four key slots. Keys are
+    derived, not stored, so "the old key is gone" can only mean "the
+    derivation input changed" — exactly what `key_generate` already does
+    for one slot at a time when `GENERATE ASYMMETRIC KEY PAIR` is called;
+    reset just calls it for all four instead of waiting for a client to
+    ask slot by slot. This also has a pleasant side effect on the ESP32
+    HAL: `piv_ensure_slot_cert()`'s self-signed certificates for 9A/9D are
+    regenerated lazily at next boot against whichever file is missing,
+    and `delete_object` just removed those exact files — so the very next
+    boot produces fresh self-signed certs that already match the new
+    derived keys, with no special-casing needed in the reset path itself
+    for that interaction.
+  - `set_pin_puk_retries(PIV_PIN_MAX_RETRIES, PIV_PUK_MAX_RETRIES)` — the
+    exact same HAL hook `SET PIN RETRIES` already calls, here with the
+    compile-time ceilings instead of an operator-chosen one. Its own doc
+    comment already documents that it resets the PIN and PUK to their SP
+    800-73 defaults and both counters to the ceiling in the same call —
+    precisely "PIN, PUK, and both retry ceilings back to factory", for
+    free, by reusing it rather than duplicating its logic.
+  - **`mgmt_key_reset_to_default`, the one genuinely new HAL hook**
+    (appended at the very end of `piv_hal_t`, not inserted next to
+    `mgmt_key_set`/`mgmt_key_is_default` where it would read more
+    naturally — see the "A real, pre-existing bug" entry above about
+    this exact struct being mirrored positionally by a ctypes layer that
+    has already drifted out of sync once; appending means a mirror that
+    has not yet picked up this field is merely missing one hook, not
+    reading every hook after it from the wrong slot). Mints a fresh,
+    genuinely random 24-byte key via the same `esp_fill_random()`
+    construction `ensure_mgmt_key()`'s first-ever mint already uses, and
+    marks `mgmt_key_is_default` true again. Deliberately *not* implemented
+    as a call to `mgmt_key_set` with freshly-generated bytes:
+    `mgmt_key_set` is reachable from the APDU layer specifically because
+    an authenticated caller may install any key of their choosing, and
+    folding the two together would risk this hook one day being able to
+    install a caller-influenced value too. It has exactly one job and no
+    input. There is no existing hook this behaviour could be gotten from
+    for free the way the PIN/PUK/ceiling reset was — a key an owner has
+    rotated away from the factory default must not survive a reset by
+    merely being re-labelled "default" without actually changing its
+    bytes, which is why this could not simply call `mgmt_key_is_default`'s
+    setter half.
+  - Every step runs even if an earlier one fails, and any failure is
+    reported only after all of them have been attempted, not on the first
+    one — an operation this irreversible should maximise what it actually
+    cleans up rather than stopping partway and leaving the rest exactly as
+    attractive a target as before. This is no less atomic than
+    `set_pin_puk_retries`' own multi-write sequence already is on the
+    ESP32 HAL (it writes `pinmax`/`pukmax`, then the PIN hash, then the
+    PUK hash, then both counters, with no rollback if a middle write
+    fails) — a longer version of an atomicity gap this applet's admin
+    commands already accept, not a new one this pass introduced.
+  - `piv_reset()` runs on success, same as SELECT already does: a freshly
+    reset device has nothing left to have verified or authenticated.
+
+- **Daemon side** (`cryptick-token-daemon`, done alongside this): see
+  that repo's own `NOTES.md` entry of the same name for
+  `piv::commands::reset_application()` and the `ctctl piv reset` rewrite
+  that actually sends it instead of a bare SELECT.
+
+### A judgement call flagged, not decided silently: the "both blocked" gate
+
+This pass made the PIN-and-PUK-both-blocked gate the default, matching the
+task's own instruction to do so while flagging it for sign-off the same
+way the management-key default-key policy was flagged in the prior pass.
+Spelling out the actual trade-off:
+
+**Why this is the right default.** It is the convention every real-world
+PIV implementation offering a full reset already uses, it requires no new
+UX this device does not already have (`ctctl piv access change-pin`/
+`change-puk` already let an operator spend PIN/PUK attempts on purpose),
+and the alternative — a reset reachable without exhausting both secrets —
+would mean *physical possession alone* is enough to factory-reset and
+re-provision someone else's device, which is a strictly worse security
+property than "physical possession plus knowing both secrets are already
+unusable."
+
+**What it costs.** An operator who still remembers their PIN or PUK and
+simply wants to start over (not someone who has locked themselves out)
+cannot reset directly — they would have to deliberately exhaust both
+counters first (6 wrong PIN/PUK attempts combined at the default ceiling
+of 3 each), which is a worse day-to-day experience than a reset reachable
+on demand would be.
+
+**What was not built as an alternative.** A "soft reset" that wipes
+certificates and resets secrets to defaults *without* requiring both to be
+blocked first — gated on, say, a verified PIN plus an authenticated
+management key instead — was considered and not built. It would read as a
+different, less destructive operation (closer to what `SET PIN RETRIES`
+already does) than what `RESET APPLICATION` is named for and what the
+task asked for, and bundling a second, differently-gated reset path into
+this pass would have been scope growth nobody asked for, not an
+engineering judgement call this pass was positioned to make alone.
+
+**This is the one decision in this pass worth a human sign-off rather than
+treating as settled by this write-up** — unlike the mechanism itself
+(the APDU shape, the HAL composition, the atomicity posture), which are
+engineering choices with no real alternative reading once a PIV-reset
+feature was in scope at all, the *gate's* strictness trades a concrete
+amount of operator convenience for a concrete amount of physical-
+possession security, and which side of that trade this product wants is a
+product decision, not a bug this pass could get wrong by picking it the
+other way.
+
+### Tests
+
+**Verified against the real applet C, not by inspection:**
+`tests/host/test_piv_apdu.py`'s new "RESET APPLICATION" section (11 new
+cases): the P1/P2 and empty-body checks run independent of retry state; the
+gate rejects PIN-blocked-only and PUK-blocked-only, and accepts
+both-blocked; a successful reset restores the PIN, the PUK, both retry
+counters, and — the case that would have silently passed with a lazier
+implementation — restores the retry *ceiling* to the compile-time default
+even after `SET PIN RETRIES` had raised it, not merely to whatever ceiling
+happened to be configured; every stored data object (both certificate
+slots, CHUID, and CCC) is actually gone afterward, confirmed both via the
+objects dict and via `delete_object`'s own call log; every one of the four
+slots' key-generation counter is rolled; the management key becomes a new
+random value — not the same bytes re-labelled, confirmed by checking the
+pre-reset key no longer authenticates — and `mgmt_key_is_default` reports
+true again; session state (`_mgmt_authenticated`) does not survive the
+reset; and the whole instruction answers `PIV_SW_INS_UNSUPPORTED` on a HAL
+build that does not implement the one new hook. `tests/host` is 351/351
+(340 pre-existing + 11 new); `test_piv_apdu.py` alone is 149/149.
+
+**Not build-verified this round, same caveat as the prior PUK/management-
+key pass:** PlatformIO is not installed in this sandbox, so
+`piv_hal_esp32.cpp`'s `piv_mgmt_key_reset_to_default()` has not been
+compiled against the real ESP32 Arduino/NVS headers — checked by careful
+reading against this same file's existing `nvs_set_blob`/`nvs_set_i32`
+usage in `ensure_mgmt_key()` and `piv_mgmt_key_set()` for API-shape
+consistency, not by a real build.
+
+**Needs a flashed unit to confirm:** that a reset performed while the PIN
+and PUK are genuinely blocked on real hardware (not the Python mock's
+`_rget()`/`_puk_rget()` stand-ins) actually clears NVS the way
+`nvs_erase_all`-adjacent reasoning predicts, and that the lazily-
+regenerated self-signed certificates for slots 9A/9D on the next boot
+after a reset actually match the newly-rolled derived keys end to end —
+both follow from reading `piv_hal_esp32.cpp`'s existing, already-tested
+primitives rather than from a new code path unique to this pass, but
+neither has been exercised on a real device.

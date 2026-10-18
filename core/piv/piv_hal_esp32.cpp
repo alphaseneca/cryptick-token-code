@@ -704,6 +704,38 @@ int piv_random_bytes(uint8_t *out, size_t len)
 }
 
 /**
+ * RESET APPLICATION's management-key half (see piv.h's doc comment on
+ * mgmt_key_reset_to_default for why this is its own hook rather than a
+ * call into mgmt_key_set): mint a fresh random default, unconditionally
+ * replacing whatever key — default or owner-rotated — was stored before.
+ *
+ * Deliberately not a call to ensure_mgmt_key(): that function mints only
+ * when no key is stored yet, and a factory reset must mint a new one even
+ * when a key, possibly owner-chosen, already exists.
+ */
+int piv_mgmt_key_reset_to_default(void)
+{
+    uint8_t key[PIV_MGMT_KEY_LEN];
+    esp_fill_random(key, sizeof(key));
+
+    nvs_handle_t h;
+    if (nvs_open(kNvsNamespace, NVS_READWRITE, &h) != ESP_OK) {
+        memset(key, 0, sizeof(key));
+        return 0;
+    }
+    esp_err_t err = nvs_set_blob(h, "mgmtkey", key, sizeof(key));
+    if (err == ESP_OK)
+        err = nvs_set_i32(h, "mgmtdefault", 1);
+    nvs_commit(h);
+    nvs_close(h);
+    memset(key, 0, sizeof(key));
+    if (err == ESP_OK)
+        CLOG_W("PIV", "factory reset: management key replaced with a fresh "
+                      "random default");
+    return err == ESP_OK ? 1 : 0;
+}
+
+/**
  * Presence for a private-key operation.
  *
  * Slot 9A (PIV Authentication) is verified by the PIV PIN per NIST SP 800-73.
@@ -746,6 +778,7 @@ const piv_hal_t kPivHal = {
     piv_mgmt_key_set,
     piv_mgmt_key_is_default,
     piv_random_bytes,
+    piv_mgmt_key_reset_to_default,
 };
 
 static const uint8_t kDefaultCert9A[436] = {
