@@ -14,6 +14,7 @@ as much weight as the happy path.
 from __future__ import annotations
 
 import ctypes
+import os
 import re
 from pathlib import Path
 
@@ -38,10 +39,16 @@ SW_WRONG_P1P2 = 0x6A86
 SW_INS_UNSUPPORTED = 0x6D00
 SW_CLA_UNSUPPORTED = 0x6E00
 
+
+def PIV_SW_VERIFY_FAILED(retries: int) -> int:
+    """Mirrors the C macro of the same name in piv.h."""
+    return 0x63C0 | (retries & 0x0F)
+
 SLOT_9A, SLOT_9C, SLOT_9D, SLOT_9E = 0x9A, 0x9C, 0x9D, 0x9E
 OBJ_CERT_9A = 0x5FC105
 
 CORRECT_PIN = b"123456"
+DEFAULT_PUK = b"12345678"  # SP 800-73-5 Part 1 §2.4.3's default PUK.
 
 # --- HAL callback types ---------------------------------------------------
 
@@ -52,6 +59,7 @@ GET_OBJ = ctypes.CFUNCTYPE(
 SET_OBJ = ctypes.CFUNCTYPE(
     ctypes.c_int, ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t
 )
+DELETE_OBJ = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_uint32)
 SIGN = ctypes.CFUNCTYPE(
     ctypes.c_int, ctypes.c_uint8, ctypes.POINTER(ctypes.c_uint8),
     ctypes.POINTER(ctypes.c_uint8), ctypes.POINTER(ctypes.c_size_t),
@@ -68,11 +76,25 @@ RETRIES_GET = ctypes.CFUNCTYPE(ctypes.c_int)
 RETRIES_SET = ctypes.CFUNCTYPE(None, ctypes.c_int)
 PRESENCE = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_uint8)
 
+# --- PUK, configurable retry ceilings, and the management key -------------
+# Same shapes as their PIN equivalents above; see piv_hal_t in piv.h.
+PUK_CHECK = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t)
+PUK_SET = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t)
+RETRY_MAX_GET = ctypes.CFUNCTYPE(ctypes.c_int)
+SET_RETRIES = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int, ctypes.c_int)
+MGMT_CRYPT = ctypes.CFUNCTYPE(
+    ctypes.c_int, ctypes.POINTER(ctypes.c_uint8), ctypes.POINTER(ctypes.c_uint8)
+)
+MGMT_SET = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t)
+MGMT_IS_DEFAULT = ctypes.CFUNCTYPE(ctypes.c_int)
+RANDOM_BYTES = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t)
+
 
 class PivHal(ctypes.Structure):
     _fields_ = [
         ("get_object", GET_OBJ),
         ("set_object", SET_OBJ),
+        ("delete_object", DELETE_OBJ),
         ("sign_p256", SIGN),
         ("ecdh_p256", ECDH),
         ("pin_check", PIN_CHECK),
@@ -83,6 +105,17 @@ class PivHal(ctypes.Structure):
         ("pin_retries_get", RETRIES_GET),
         ("pin_retries_set", RETRIES_SET),
         ("user_presence", PRESENCE),
+        ("puk_check", PUK_CHECK),
+        ("puk_set", PUK_SET),
+        ("puk_retries_get", RETRIES_GET),
+        ("puk_retries_set", RETRIES_SET),
+        ("pin_retry_max_get", RETRY_MAX_GET),
+        ("puk_retry_max_get", RETRY_MAX_GET),
+        ("set_pin_puk_retries", SET_RETRIES),
+        ("mgmt_key_crypt_block", MGMT_CRYPT),
+        ("mgmt_key_set", MGMT_SET),
+        ("mgmt_key_is_default", MGMT_IS_DEFAULT),
+        ("random_bytes", RANDOM_BYTES),
     ]
 
 
@@ -100,6 +133,25 @@ class Card:
         self.sign_calls: list[tuple[int, bytes]] = []
         self.presence_calls: list[int] = []
         self._bufs: dict[int, ctypes.Array] = {}
+        self.deleted: list[int] = []
+
+        # PUK: same shape and SP 800-73 default as the PIN above.
+        self.puk = DEFAULT_PUK
+        self.puk_retries = 3
+        # Configurable ceilings SET PIN RETRIES reconfigures; start at the
+        # compile-time default both constants in piv.h fall back to.
+        self.pin_max = 3
+        self.puk_max = 3
+        # A fake, deterministic, *reversible* stand-in for AES-192-ECB: XOR
+        # each byte of a 16-byte block with the matching byte of a 24-byte
+        # key, wrapped to 16. Real AES is verified by code review and on
+        # hardware, same split this file already uses for sign_p256/ecdh_p256
+        # above — what this harness can usefully pin down is the *protocol*
+        # (witness/challenge/response, session gating, replay rejection),
+        # not NIST FIPS-197 itself.
+        self.mgmt_key = bytes((i * 7 + 3) & 0xFF for i in range(24))
+        self.mgmt_key_is_default = True
+        self.random_calls = 0
 
         def _get(tag, out_pp, out_len):
             blob = self.objects.get(int(tag))
@@ -130,6 +182,11 @@ class Card:
         def _ecdh(slot, peer_pub, shared32):
             for i in range(32):
                 shared32[i] = (slot ^ 0x42 ^ i) & 0xFF
+            return 1
+
+        def _delete(tag):
+            self.deleted.append(int(tag))
+            self.objects.pop(int(tag), None)
             return 1
 
         def _pin(p, n):
@@ -168,14 +225,85 @@ class Card:
             self.presence_calls.append(int(slot))
             return 1 if self.presence_ok else 0
 
+        def _puk_check(p, n):
+            return 1 if bytes(p[:n]) == self.puk else 0
+
+        def _puk_set(p, n):
+            self.puk = bytes(p[:n])
+            return 1
+
+        def _puk_rget():
+            return self.puk_retries
+
+        def _puk_rset(n):
+            self.puk_retries = int(n)
+
+        def _pin_max():
+            return self.pin_max
+
+        def _puk_max():
+            return self.puk_max
+
+        def _set_retries(pin_max, puk_max):
+            # Mirrors piv_hal_t's set_pin_puk_retries doc comment: the
+            # ceiling and the stored secret share one rewrite, so this
+            # resets both secrets to their SP 800-73 defaults too.
+            self.pin_max = int(pin_max)
+            self.puk_max = int(puk_max)
+            self.pin = CORRECT_PIN
+            self.puk = DEFAULT_PUK
+            self.retries = self.pin_max
+            self.puk_retries = self.puk_max
+            return 1
+
+        def _mgmt_crypt(in16, out16):
+            block = bytes(in16[:16])
+            enc = self.mgmt_crypt(block)
+            for i, b in enumerate(enc):
+                out16[i] = b
+            return 1
+
+        def _mgmt_set(key, n):
+            self.mgmt_key = bytes(key[:n])
+            self.mgmt_key_is_default = False
+            return 1
+
+        def _mgmt_is_default():
+            return 1 if self.mgmt_key_is_default else 0
+
+        def _random(out, n):
+            self.random_calls += 1
+            # Deterministic, not cryptographic — this harness tests protocol
+            # shape, not entropy quality (real randomness is ESP32 hardware
+            # TRNG territory, out of this host build's reach).
+            data = os.urandom(int(n))
+            for i, b in enumerate(data):
+                out[i] = b
+            return 1
+
         self._cbs = [
-            GET_OBJ(_get), SET_OBJ(_set), SIGN(_sign), ECDH(_ecdh), PIN_CHECK(_pin),
-            PIN_SET(_pin_set), PUBKEY(_pubkey), GUID(_guid), KEYGEN(_keygen),
-            RETRIES_GET(_rget), RETRIES_SET(_rset),
+            GET_OBJ(_get), SET_OBJ(_set), DELETE_OBJ(_delete), SIGN(_sign),
+            ECDH(_ecdh), PIN_CHECK(_pin), PIN_SET(_pin_set), PUBKEY(_pubkey),
+            GUID(_guid), KEYGEN(_keygen), RETRIES_GET(_rget), RETRIES_SET(_rset),
             PRESENCE(_presence) if with_presence_hook else ctypes.cast(None, PRESENCE),
+            PUK_CHECK(_puk_check), PUK_SET(_puk_set),
+            RETRIES_GET(_puk_rget), RETRIES_SET(_puk_rset),
+            RETRY_MAX_GET(_pin_max), RETRY_MAX_GET(_puk_max),
+            SET_RETRIES(_set_retries), MGMT_CRYPT(_mgmt_crypt),
+            MGMT_SET(_mgmt_set), MGMT_IS_DEFAULT(_mgmt_is_default),
+            RANDOM_BYTES(_random),
         ]
         self.hal = PivHal(*self._cbs)
         lib.piv_init(ctypes.byref(self.hal))
+
+    def mgmt_crypt(self, block: bytes, key: bytes | None = None) -> bytes:
+        """What a *host* holding `key` (defaulting to this card's real key,
+        i.e. a legitimate holder) would compute for the same fake cipher
+        `_mgmt_crypt` above implements card-side. Tests pass a wrong `key`
+        to simulate a caller that does not actually hold the management
+        key."""
+        key = self.mgmt_key if key is None else key
+        return bytes(b ^ key[i % len(key)] for i, b in enumerate(block))
 
     def apdu(self, cmd: bytes, out_max: int = 300) -> tuple[int, bytes]:
         buf = (ctypes.c_uint8 * out_max)()
@@ -218,6 +346,79 @@ class Card:
         tl = bytes([(tag >> 16) & 0xFF, (tag >> 8) & 0xFF, tag & 0xFF])
         body = bytes([0x5C, len(tl)]) + tl
         return self.transceive(bytes([0x00, 0xCB, 0x3F, 0xFF, len(body)]) + body)
+
+    def change_puk(self, old: bytes, new: bytes) -> int:
+        blocks = old.ljust(8, b"\xff") + new.ljust(8, b"\xff")
+        return self.apdu(bytes([0x00, 0x24, 0x00, 0x81, 0x10]) + blocks)[0]
+
+    def reset_retry(self, puk: bytes, new_pin: bytes) -> int:
+        """RESET RETRY COUNTER: unblock the PIN with the PUK."""
+        body = puk.ljust(8, b"\xff") + new_pin.ljust(8, b"\xff")
+        return self.apdu(bytes([0x00, 0x2C, 0x00, 0x80, len(body)]) + body)[0]
+
+    def set_pin_retries(self, pin_max: int, puk_max: int) -> int:
+        return self.apdu(bytes([0x00, 0xFA, pin_max, puk_max]))[0]
+
+    def set_management_key(self, key: bytes, alg: int = 0x0A) -> int:
+        body = bytes([alg, len(key)]) + key
+        return self.apdu(bytes([0x00, 0xFF, 0xFF, 0xFF, len(body)]) + body)[0]
+
+    def mgmt_request_witness(self) -> tuple[int, bytes]:
+        """First half of GENERAL AUTHENTICATE's mutual exchange: ask the
+        card for its (encrypted) witness. Returns (sw, encrypted_witness)."""
+        body = bytes([0x7C, 0x02, 0x80, 0x00])
+        sw, resp = self.transceive(bytes([0x00, 0x87, 0x0A, 0x9B, len(body)]) + body)
+        if sw != SW_OK:
+            return sw, b""
+        elements = parse_dynamic_auth(resp)
+        return sw, elements.get(0x80, b"")
+
+    def mgmt_respond(self, witness_plain: bytes, challenge: bytes) -> tuple[int, bytes]:
+        """Second half: return the decrypted witness plus a fresh challenge
+        of our own. Returns (sw, encrypted_response_to_our_challenge)."""
+        inner = bytes([0x80, len(witness_plain)]) + witness_plain
+        inner += bytes([0x81, len(challenge)]) + challenge
+        body = bytes([0x7C, len(inner)]) + inner
+        sw, resp = self.transceive(bytes([0x00, 0x87, 0x0A, 0x9B, len(body)]) + body)
+        if sw != SW_OK:
+            return sw, b""
+        elements = parse_dynamic_auth(resp)
+        return sw, elements.get(0x82, b"")
+
+    def authenticate_management_key(self, key: bytes | None = None) -> int:
+        """Drives the full mutual-authenticate exchange as a legitimate
+        host holding `key` (defaulting to this card's real key) would."""
+        sw, enc_witness = self.mgmt_request_witness()
+        if sw != SW_OK:
+            return sw
+        witness_plain = self.mgmt_crypt(enc_witness, key)
+        challenge = bytes(range(16))
+        sw, enc_response = self.mgmt_respond(witness_plain, challenge)
+        if sw != SW_OK:
+            return sw
+        # A real host would now also verify the card's response decrypts
+        # back to `challenge` — i.e. mutual, not just one-directional —
+        # which is exactly what test_mutual_auth_is_actually_mutual below
+        # checks explicitly rather than folding it silently in here.
+        return sw
+
+
+def parse_dynamic_auth(resp: bytes) -> dict[int, bytes]:
+    """Reads a 7C-wrapped dynamic authentication template's immediate
+    children into {tag: value}. Minimal on purpose — this file's own BER-TLV
+    parsing, not a general one, so a shape this applet never emits is a
+    bug worth seeing fail rather than a case worth silently handling."""
+    assert resp and resp[0] == 0x7C, f"expected a 7C template, got {resp[:1].hex()}"
+    length = resp[1]
+    body = resp[2 : 2 + length]
+    out: dict[int, bytes] = {}
+    i = 0
+    while i + 1 < len(body):
+        tag = body[i]
+        l = body[i + 1]
+        out[tag] = body[i + 2 : i + 2 + l]
+        i += 2 + l
+    return out
 
 
 @pytest.fixture(scope="module")
@@ -562,7 +763,10 @@ def test_lc_longer_than_body(card):
 
 
 def test_unknown_instruction(card):
-    assert card.apdu(bytes([0x00, 0xFF, 0x00, 0x00]))[0] == SW_INS_UNSUPPORTED
+    """0xFF is deliberately not used here any more — it is SET MANAGEMENT
+    KEY now (see test_set_management_key_* below); 0xEE stays genuinely
+    unassigned by both SP 800-73 and this applet's vendor extensions."""
+    assert card.apdu(bytes([0x00, 0xEE, 0x00, 0x00]))[0] == SW_INS_UNSUPPORTED
 
 
 @pytest.mark.parametrize("cla", [0x80, 0xFF, 0x0C, 0x01])
@@ -658,10 +862,269 @@ def test_change_pin_rejects_a_short_body(card):
     assert card.apdu(bytes([0x00, 0x24, 0x00, 0x80, 0x08]) + b"1" * 8)[0] == SW_WRONG_LENGTH
 
 
-@pytest.mark.parametrize("p1,p2", [(0x01, 0x80), (0x00, 0x81), (0x00, 0x00)])
+@pytest.mark.parametrize("p1,p2", [(0x01, 0x80), (0x00, 0x00), (0x00, 0x9B)])
 def test_change_pin_rejects_other_references(card, p1, p2):
+    """P2 0x81 (the PUK) is deliberately not one of these cases any more —
+    CHANGE REFERENCE DATA legitimately supports it now; see
+    test_change_puk_* below for its own behaviour."""
     body = b"1" * 16
     assert card.apdu(bytes([0x00, 0x24, p1, p2, 0x10]) + body)[0] == SW_WRONG_P1P2
+
+
+# --- CHANGE REFERENCE DATA (PUK) and RESET RETRY COUNTER ------------------
+#
+# Mirrors the CHANGE REFERENCE DATA (PIN) tests above almost exactly: same
+# instruction, same 16-byte old-block/new-block shape, same retry mechanics —
+# SP 800-73 Part 2 §3.2.2 defines one CHANGE REFERENCE DATA command for both
+# secrets, distinguished only by P2. The PUK's own retry counter is entirely
+# separate from the PIN's, which RESET RETRY COUNTER's own tests exist to
+# pin down (literally: changing one must never touch the other's count).
+
+
+def test_verify_reports_puk_retries_without_spending_one(card):
+    """SP 800-73 has no 'verify the PUK' operation — this is query-only, the
+    same empty-body convention VERIFY already uses for the PIN."""
+    assert card.apdu(bytes([0x00, 0x20, 0x00, 0x81]))[0] == PIV_SW_VERIFY_FAILED(3)
+    assert card.puk_retries == 3, "a query must never spend a retry"
+
+
+def test_verify_rejects_a_non_empty_body_for_the_puk(card):
+    assert card.apdu(bytes([0x00, 0x20, 0x00, 0x81, 0x08]) + b"1" * 8)[0] == SW_WRONG_P1P2
+
+
+def test_puk_can_be_changed(card):
+    assert card.change_puk(DEFAULT_PUK, b"87654321") == SW_OK
+    assert card.puk == b"87654321"
+
+
+def test_wrong_current_puk_spends_a_retry_not_the_pins(card):
+    assert card.change_puk(b"00000000", b"87654321") == PIV_SW_VERIFY_FAILED(2)
+    assert card.puk_retries == 2
+    assert card.retries == 3, "a wrong PUK must never spend a PIN retry"
+
+
+def test_puk_blocks_at_zero_retries(card):
+    for _ in range(3):
+        card.change_puk(b"00000000", b"87654321")
+    assert card.puk_retries == 0
+    assert card.change_puk(b"00000000", b"87654321") == SW_BLOCKED
+    assert card.change_puk(DEFAULT_PUK, b"87654321") == SW_BLOCKED, \
+        "a blocked PUK must stay blocked even against its own correct value"
+
+
+def test_successful_puk_change_restores_the_retry_counter(card):
+    card.change_puk(b"00000000", b"ignored1")  # spend one retry
+    assert card.puk_retries == 2
+    assert card.change_puk(DEFAULT_PUK, b"87654321") == SW_OK
+    assert card.puk_retries == 3
+
+
+def test_reset_retry_unblocks_a_blocked_pin(card):
+    for _ in range(3):
+        card.verify(b"000000")
+    assert card.retries == 0
+    assert card.verify(CORRECT_PIN) == SW_BLOCKED, "sanity: really blocked"
+
+    assert card.reset_retry(DEFAULT_PUK, b"999999") == SW_OK
+    assert card.pin == b"999999"
+    assert card.retries == 3
+    assert card.verify(b"999999") == SW_OK
+
+
+def test_reset_retry_does_not_verify_the_new_pin(card):
+    """SP 800-73: RESET RETRY COUNTER clears the block, it is not a VERIFY.
+    A caller that wants the session authenticated still has to present the
+    new PIN afterward."""
+    card.reset_retry(DEFAULT_PUK, b"999999")
+    assert not card.lib.piv_pin_is_verified()
+
+
+def test_reset_retry_rejects_a_wrong_puk_and_spends_its_retry(card):
+    assert card.reset_retry(b"00000000", b"999999") == PIV_SW_VERIFY_FAILED(2)
+    assert card.puk_retries == 2
+    assert card.pin == CORRECT_PIN, "the PIN must be untouched by a failed attempt"
+
+
+def test_reset_retry_blocks_at_zero_puk_retries(card):
+    for _ in range(3):
+        card.reset_retry(b"00000000", b"999999")
+    assert card.reset_retry(DEFAULT_PUK, b"999999") == SW_BLOCKED
+
+
+@pytest.mark.parametrize("p1,p2", [(0x01, 0x80), (0x00, 0x81), (0x00, 0x9B)])
+def test_reset_retry_rejects_other_references(card, p1, p2):
+    """SP 800-73 defines RESET RETRY COUNTER only for the PIN (P2 0x80) —
+    there is no standard operation to reset the PUK's own counter with a
+    third secret, so every other P2 is refused the same as a wrong P1."""
+    body = b"1" * 16
+    assert card.apdu(bytes([0x00, 0x2C, p1, p2, 0x10]) + body)[0] == SW_WRONG_P1P2
+
+
+def test_reset_retry_rejects_a_short_body(card):
+    assert card.apdu(bytes([0x00, 0x2C, 0x00, 0x80, 0x08]) + b"1" * 8)[0] == SW_WRONG_LENGTH
+
+
+# --- Management key: GENERAL AUTHENTICATE mutual exchange -----------------
+#
+# SP 800-73 Part 2 §3.2.4 Table 7. `Card.mgmt_crypt()` plays the legitimate
+# host's side (it knows the same key the fake HAL's `_mgmt_crypt` closure
+# uses); passing a wrong key there is this harness's way of simulating a
+# caller that does not actually hold the management key.
+
+
+def test_mgmt_key_authenticates_with_the_right_key(card):
+    assert card.authenticate_management_key() == SW_OK
+
+
+def test_mgmt_key_rejects_the_wrong_key(card):
+    wrong = bytes((b + 1) & 0xFF for b in card.mgmt_key)
+    sw, enc_witness = card.mgmt_request_witness()
+    assert sw == SW_OK
+    # Decrypted with the *wrong* key — not what the card actually encrypted
+    # its witness with, so the applet must reject it.
+    bad_witness = card.mgmt_crypt(enc_witness, wrong)
+    sw, _ = card.mgmt_respond(bad_witness, bytes(range(16)))
+    assert sw == SW_SECURITY
+
+
+def test_mutual_auth_is_actually_mutual(card):
+    """Not just "the host proved it holds the key" — the card's own
+    response must decrypt back to the exact challenge the host sent, or
+    the host has no way to tell this card from an impostor that merely
+    forwarded the witness somewhere else."""
+    sw, enc_witness = card.mgmt_request_witness()
+    assert sw == SW_OK
+    witness_plain = card.mgmt_crypt(enc_witness)
+    challenge = bytes(range(16))
+    sw, enc_response = card.mgmt_respond(witness_plain, challenge)
+    assert sw == SW_OK
+    assert card.mgmt_crypt(enc_response) == challenge
+
+
+def test_mgmt_witness_is_single_use(card):
+    """A witness is good for exactly one follow-up request. Replaying an
+    old (already-consumed) witness against a *new* request must fail, not
+    silently re-validate against stale state."""
+    sw, enc_witness_1 = card.mgmt_request_witness()
+    assert sw == SW_OK
+    witness_1_plain = card.mgmt_crypt(enc_witness_1)
+    # Spend it once, successfully.
+    assert card.mgmt_respond(witness_1_plain, bytes(range(16)))[0] == SW_OK
+
+    # A second, fresh witness request — the old plaintext must no longer
+    # be the one this applet is holding.
+    sw, enc_witness_2 = card.mgmt_request_witness()
+    assert sw == SW_OK
+    assert enc_witness_2 != enc_witness_1, "two witnesses must differ (random)"
+    sw, _ = card.mgmt_respond(witness_1_plain, bytes(range(16)))
+    assert sw == SW_SECURITY, "a stale witness must not authenticate a new exchange"
+
+
+def test_mgmt_auth_does_not_survive_a_reset(card):
+    assert card.authenticate_management_key() == SW_OK
+    card.select()  # re-select resets the session, same as SELECT already does for the PIN
+    assert card.set_management_key(card.mgmt_key) == SW_SECURITY, \
+        "an admin op must require authenticating again after a session reset"
+
+
+def test_general_authenticate_mgmt_rejects_other_algorithms(card):
+    # 0x11 is this device's ECDSA P-256 identifier, not a valid management
+    # key algorithm — reusing it here must not be mistaken for a signing
+    # request against key reference 0x9B.
+    body = bytes([0x7C, 0x02, 0x80, 0x00])
+    assert card.apdu(bytes([0x00, 0x87, 0x11, 0x9B, len(body)]) + body)[0] == SW_WRONG_P1P2
+
+
+def test_general_authenticate_mgmt_rejects_malformed_templates(card):
+    # Neither a witness tag nor a challenge tag present.
+    body = bytes([0x7C, 0x02, 0x83, 0x00])
+    assert card.apdu(bytes([0x00, 0x87, 0x0A, 0x9B, len(body)]) + body)[0] == SW_WRONG_DATA
+
+
+# --- SET MANAGEMENT KEY ----------------------------------------------------
+
+
+def test_set_management_key_requires_prior_authentication(card):
+    new_key = bytes(range(24))
+    assert card.set_management_key(new_key) == SW_SECURITY
+    assert card.mgmt_key_is_default
+
+
+def test_set_management_key_changes_the_key(card):
+    new_key = bytes(range(24))
+    assert card.authenticate_management_key() == SW_OK
+    assert card.set_management_key(new_key) == SW_OK
+    assert card.mgmt_key == new_key
+    assert not card.mgmt_key_is_default
+
+    # The *old* key no longer authenticates...
+    card.select()
+    assert card.authenticate_management_key(key=bytes((i * 7 + 3) & 0xFF for i in range(24))) == SW_SECURITY
+    # ...but the new one does.
+    assert card.authenticate_management_key(key=new_key) == SW_OK
+
+
+def test_set_management_key_requires_fresh_authentication_each_time(card):
+    """Changing the key invalidates *this* session's authentication too —
+    a second SET MANAGEMENT KEY right after the first must not ride the
+    same handshake."""
+    new_key = bytes(range(24))
+    assert card.authenticate_management_key() == SW_OK
+    assert card.set_management_key(new_key) == SW_OK
+    assert card.set_management_key(bytes(range(24, 48))) == SW_SECURITY
+
+
+@pytest.mark.parametrize("p1,p2", [(0x00, 0xFF), (0xFF, 0x00), (0x00, 0x00)])
+def test_set_management_key_rejects_wrong_p1p2(card, p1, p2):
+    card.authenticate_management_key()
+    body = bytes([0x0A, 24]) + bytes(range(24))
+    assert card.apdu(bytes([0x00, 0xFF, p1, p2, len(body)]) + body)[0] == SW_WRONG_P1P2
+
+
+def test_set_management_key_rejects_wrong_algorithm_or_length(card):
+    card.authenticate_management_key()
+    # Right length, wrong algorithm id.
+    body = bytes([0x03, 24]) + bytes(range(24))
+    assert card.apdu(bytes([0x00, 0xFF, 0xFF, 0xFF, len(body)]) + body)[0] == SW_WRONG_DATA
+    # Right algorithm, wrong length (16 bytes — an AES-128 length, which
+    # this applet does not support).
+    card.authenticate_management_key()
+    body = bytes([0x0A, 16]) + bytes(range(16))
+    assert card.apdu(bytes([0x00, 0xFF, 0xFF, 0xFF, len(body)]) + body)[0] == SW_WRONG_DATA
+
+
+# --- SET PIN RETRIES --------------------------------------------------------
+
+
+def test_set_pin_retries_requires_pin_and_mgmt_auth(card):
+    assert card.set_pin_retries(5, 5) == SW_SECURITY
+    card.verify()
+    assert card.set_pin_retries(5, 5) == SW_SECURITY, "mgmt auth alone is not enough"
+
+
+def test_set_pin_retries_resets_both_secrets_and_ceilings(card):
+    card.verify()
+    assert card.authenticate_management_key() == SW_OK
+    assert card.set_pin_retries(5, 7) == SW_OK
+
+    assert card.pin_max == 5
+    assert card.puk_max == 7
+    assert card.pin == CORRECT_PIN
+    assert card.puk == DEFAULT_PUK
+    assert card.retries == 5
+    assert card.puk_retries == 7
+    # Successful verification now restores to the *new* ceiling, not the
+    # compile-time default of 3.
+    card.verify(b"000000")
+    assert card.verify() == SW_OK
+    assert card.retries == 5
+
+
+@pytest.mark.parametrize("pin_max,puk_max", [(0, 3), (3, 0), (16, 3), (3, 16)])
+def test_set_pin_retries_rejects_ceilings_outside_one_to_fifteen(card, pin_max, puk_max):
+    card.verify()
+    card.authenticate_management_key()
+    assert card.set_pin_retries(pin_max, puk_max) == SW_WRONG_P1P2
 
 
 # --- GENERATE ASYMMETRIC KEY PAIR -----------------------------------------

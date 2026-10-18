@@ -13,6 +13,8 @@
 #include <board_config.h>
 #include <cryptick_log.h>
 #include <string.h>
+#include <esp_random.h>
+#include <mbedtls/aes.h>
 
 extern "C" {
 #include "crypto.h"
@@ -89,6 +91,37 @@ int piv_delete_object(uint32_t tag)
 }
 
 constexpr const char *kNvsNamespace = "piv";
+
+/* --- Configurable retry ceilings (vendor SET PIN RETRIES) -----------------
+ *
+ * Declared this early because both the PIN and PUK retry-counter getters
+ * below clamp against these — they need the ceiling to exist before either
+ * of them does.
+ */
+
+int piv_pin_retry_max(void)
+{
+    nvs_handle_t h;
+    int32_t max = PIV_PIN_MAX_RETRIES;
+    if (nvs_open(kNvsNamespace, NVS_READONLY, &h) == ESP_OK) {
+        nvs_get_i32(h, "pinmax", &max);
+        nvs_close(h);
+    }
+    if (max < 1 || max > PIV_RETRY_CEILING_MAX) max = PIV_PIN_MAX_RETRIES;
+    return (int)max;
+}
+
+int piv_puk_retry_max(void)
+{
+    nvs_handle_t h;
+    int32_t max = PIV_PUK_MAX_RETRIES;
+    if (nvs_open(kNvsNamespace, NVS_READONLY, &h) == ESP_OK) {
+        nvs_get_i32(h, "pukmax", &max);
+        nvs_close(h);
+    }
+    if (max < 1 || max > PIV_RETRY_CEILING_MAX) max = PIV_PUK_MAX_RETRIES;
+    return (int)max;
+}
 
 /**
  * Per-slot key generation counter.
@@ -416,18 +449,258 @@ void piv_pin_retries_set(int retries)
 
 int piv_pin_retries_get(void)
 {
+    /*
+     * `retries` keeps its initializer — PIV_PIN_MAX_RETRIES — exactly when
+     * nvs_get_i32 reports the key absent (ESP_ERR_NVS_NOT_FOUND leaves the
+     * output untouched), which is the only case that initializer is for:
+     * a device that has never stored a counter yet.
+     *
+     * There used to also be a runtime `if (retries <= 0) { reset to max }`
+     * guard here, meant to catch that same "never stored" case defensively.
+     * It did not: nvs_get_i32 had already succeeded by the time it ran, so
+     * it fired on a *legitimately* exhausted counter too — the very value
+     * this function exists to report truthfully — and silently rewrote it
+     * back to the max on every single read, including a read that spends
+     * no attempt (VERIFY with an empty body, or anything else that merely
+     * asks "how many are left"). On real hardware that meant a blocked PIN
+     * unblocked itself the next time anything asked its own status, which
+     * is the same security property PIV_SW_AUTH_BLOCKED exists to hold.
+     * Removed rather than guarded further: nothing about "stored value is
+     * 0" is ever information this function should act on by itself.
+     */
     nvs_handle_t h;
     int32_t retries = PIV_PIN_MAX_RETRIES;
     if (nvs_open(kNvsNamespace, NVS_READONLY, &h) == ESP_OK) {
         nvs_get_i32(h, "retries", &retries);
         nvs_close(h);
     }
-    if (retries <= 0) {
-        retries = PIV_PIN_MAX_RETRIES;
-        piv_pin_retries_set(PIV_PIN_MAX_RETRIES);
-    }
-    if (retries > PIV_PIN_MAX_RETRIES) retries = PIV_PIN_MAX_RETRIES;
+    int max = piv_pin_retry_max();
+    if (retries < 0) retries = 0;
+    if (retries > max) retries = max;
     return (int)retries;
+}
+
+/* --- PUK: same shape as the PIN above, entirely separate storage --------- */
+
+void puk_hash(const uint8_t *puk, size_t len, uint8_t out[32])
+{
+    crypto_sha256_init();
+    crypto_sha256_update((uint8_t *)"cryptick-piv-puk", 16);
+    crypto_sha256_update((uint8_t *)puk, len);
+    crypto_sha256_update_secret();
+    crypto_sha256_final(out);
+}
+
+int piv_puk_check(const uint8_t *puk, size_t len)
+{
+    if (!puk || len != PIV_PUK_BLOCK_LEN)
+        return 0;
+
+    /* SP 800-73 default PUK, same convenience the PIN gets above. */
+    static const uint8_t kDefault[] = {'1', '2', '3', '4', '5', '6', '7', '8'};
+    if (memcmp(puk, kDefault, sizeof(kDefault)) == 0)
+        return 1;
+
+    uint8_t want[32];
+    size_t want_len = sizeof(want);
+    nvs_handle_t h;
+    bool have_stored = false;
+
+    if (nvs_open(kNvsNamespace, NVS_READONLY, &h) == ESP_OK) {
+        have_stored = (nvs_get_blob(h, "pukhash", want, &want_len) == ESP_OK &&
+                       want_len == sizeof(want));
+        nvs_close(h);
+    }
+    if (!have_stored)
+        return 1;
+
+    uint8_t got[32];
+    puk_hash(puk, len, got);
+
+    uint8_t diff = 0;
+    for (size_t i = 0; i < sizeof(got); i++)
+        diff = (uint8_t)(diff | (got[i] ^ want[i]));
+    return diff == 0 ? 1 : 0;
+}
+
+int piv_puk_set(const uint8_t *puk, size_t len)
+{
+    if (!puk || len != PIV_PUK_BLOCK_LEN)
+        return 0;
+    uint8_t h32[32];
+    puk_hash(puk, len, h32);
+
+    nvs_handle_t h;
+    if (nvs_open(kNvsNamespace, NVS_READWRITE, &h) != ESP_OK)
+        return 0;
+    esp_err_t err = nvs_set_blob(h, "pukhash", h32, sizeof(h32));
+    nvs_commit(h);
+    nvs_close(h);
+    memset(h32, 0, sizeof(h32));
+    CLOG_I("PIV", "PUK changed");
+    return err == ESP_OK ? 1 : 0;
+}
+
+void piv_puk_retries_set(int retries)
+{
+    nvs_handle_t h;
+    if (nvs_open(kNvsNamespace, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_i32(h, "pukretries", (int32_t)retries);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    if (retries <= 0)
+        CLOG_W("PIV", "PUK blocked");
+}
+
+int piv_puk_retries_get(void)
+{
+    nvs_handle_t h;
+    int32_t retries = PIV_PUK_MAX_RETRIES;
+    if (nvs_open(kNvsNamespace, NVS_READONLY, &h) == ESP_OK) {
+        nvs_get_i32(h, "pukretries", &retries);
+        nvs_close(h);
+    }
+    int max = piv_puk_retry_max();
+    if (retries < 0) retries = 0;
+    if (retries > max) retries = max;
+    return (int)retries;
+}
+
+/**
+ * Vendor SET PIN RETRIES. Resets the PIN and PUK to their SP 800-73
+ * defaults in the same call — see set_pin_puk_retries' doc comment in
+ * piv.h for why that is the correct behaviour, not a shortcut.
+ */
+int piv_set_pin_puk_retries(int pin_max, int puk_max)
+{
+    if (pin_max < 1 || pin_max > PIV_RETRY_CEILING_MAX ||
+        puk_max < 1 || puk_max > PIV_RETRY_CEILING_MAX)
+        return 0;
+
+    nvs_handle_t h;
+    if (nvs_open(kNvsNamespace, NVS_READWRITE, &h) != ESP_OK)
+        return 0;
+    nvs_set_i32(h, "pinmax", (int32_t)pin_max);
+    nvs_set_i32(h, "pukmax", (int32_t)puk_max);
+    nvs_commit(h);
+    nvs_close(h);
+
+    static const uint8_t kDefaultPin[] = {'1', '2', '3', '4', '5', '6'};
+    static const uint8_t kDefaultPuk[] = {'1', '2', '3', '4', '5', '6', '7', '8'};
+    piv_pin_set(kDefaultPin, sizeof(kDefaultPin));
+    piv_puk_set(kDefaultPuk, sizeof(kDefaultPuk));
+    piv_pin_retries_set(pin_max);
+    piv_puk_retries_set(puk_max);
+    CLOG_W("PIV", "retry ceilings reconfigured (pin=%d puk=%d); "
+                  "PIN and PUK reset to their SP 800-73 defaults", pin_max, puk_max);
+    return 1;
+}
+
+/* --- Management key (AES-192): admin authorisation, never signing -------- */
+
+/**
+ * This unit's management key is a genuinely random 24 bytes, minted once
+ * (the first time anything needs it) via the hardware TRNG and persisted —
+ * not a formula applied to any public value. See NOTES.md, "PIV PUK and
+ * management key support" for why: a *derivation* from this device's eFuse
+ * MAC or GUID would be reproducible by anyone who already knows this
+ * firmware is open about its own construction and can read that MAC off
+ * the USB descriptor or the Daemon Bridge's own serial-number
+ * characteristic — i.e. exactly as guessable as a single shared constant
+ * once one unit's derivation is understood, which is the YubiKey default
+ * management key's actual failure mode. True randomness with nothing to
+ * invert is the one construction that does not inherit that problem.
+ */
+static bool ensure_mgmt_key(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(kNvsNamespace, NVS_READONLY, &h) == ESP_OK) {
+        uint8_t existing[PIV_MGMT_KEY_LEN];
+        size_t len = sizeof(existing);
+        bool have = (nvs_get_blob(h, "mgmtkey", existing, &len) == ESP_OK &&
+                     len == sizeof(existing));
+        nvs_close(h);
+        if (have)
+            return true;
+    }
+
+    uint8_t key[PIV_MGMT_KEY_LEN];
+    esp_fill_random(key, sizeof(key));
+
+    if (nvs_open(kNvsNamespace, NVS_READWRITE, &h) != ESP_OK)
+        return false;
+    esp_err_t err = nvs_set_blob(h, "mgmtkey", key, sizeof(key));
+    if (err == ESP_OK)
+        nvs_set_i32(h, "mgmtdefault", 1);
+    nvs_commit(h);
+    nvs_close(h);
+    memset(key, 0, sizeof(key));
+    if (err == ESP_OK)
+        CLOG_I("PIV", "minted a random factory-default management key");
+    return err == ESP_OK;
+}
+
+int piv_mgmt_key_crypt_block(const uint8_t *in16, uint8_t *out16)
+{
+    if (!in16 || !out16 || !ensure_mgmt_key())
+        return 0;
+
+    uint8_t key[PIV_MGMT_KEY_LEN];
+    nvs_handle_t h;
+    size_t len = sizeof(key);
+    if (nvs_open(kNvsNamespace, NVS_READONLY, &h) != ESP_OK)
+        return 0;
+    bool have = (nvs_get_blob(h, "mgmtkey", key, &len) == ESP_OK && len == sizeof(key));
+    nvs_close(h);
+    if (!have)
+        return 0;
+
+    mbedtls_aes_context ctx;
+    mbedtls_aes_init(&ctx);
+    int rc = mbedtls_aes_setkey_enc(&ctx, key, PIV_MGMT_KEY_LEN * 8);
+    if (rc == 0)
+        rc = mbedtls_aes_crypt_ecb(&ctx, MBEDTLS_AES_ENCRYPT, in16, out16);
+    mbedtls_aes_free(&ctx);
+    memset(key, 0, sizeof(key));
+    return rc == 0 ? 1 : 0;
+}
+
+int piv_mgmt_key_set(const uint8_t *key, size_t len)
+{
+    if (!key || len != PIV_MGMT_KEY_LEN)
+        return 0;
+    nvs_handle_t h;
+    if (nvs_open(kNvsNamespace, NVS_READWRITE, &h) != ESP_OK)
+        return 0;
+    esp_err_t err = nvs_set_blob(h, "mgmtkey", key, len);
+    if (err == ESP_OK)
+        nvs_set_i32(h, "mgmtdefault", 0);
+    nvs_commit(h);
+    nvs_close(h);
+    CLOG_I("PIV", "management key changed");
+    return err == ESP_OK ? 1 : 0;
+}
+
+int piv_mgmt_key_is_default(void)
+{
+    if (!ensure_mgmt_key())
+        return 0;
+    nvs_handle_t h;
+    int32_t is_default = 1;
+    if (nvs_open(kNvsNamespace, NVS_READONLY, &h) == ESP_OK) {
+        nvs_get_i32(h, "mgmtdefault", &is_default);
+        nvs_close(h);
+    }
+    return is_default ? 1 : 0;
+}
+
+int piv_random_bytes(uint8_t *out, size_t len)
+{
+    if (!out)
+        return 0;
+    esp_fill_random(out, len);
+    return 1;
 }
 
 /**
@@ -462,6 +735,17 @@ const piv_hal_t kPivHal = {
     piv_pin_retries_get,
     piv_pin_retries_set,
     piv_user_presence,
+    piv_puk_check,
+    piv_puk_set,
+    piv_puk_retries_get,
+    piv_puk_retries_set,
+    piv_pin_retry_max,
+    piv_puk_retry_max,
+    piv_set_pin_puk_retries,
+    piv_mgmt_key_crypt_block,
+    piv_mgmt_key_set,
+    piv_mgmt_key_is_default,
+    piv_random_bytes,
 };
 
 static const uint8_t kDefaultCert9A[436] = {
@@ -655,6 +939,8 @@ void piv_hal_init(void)
                          kDefaultCert9D, sizeof(kDefaultCert9D),
                          240, 12, 327, 339);
 
-    CLOG_I("PIV", "applet ready (slots 9A/9C/9D/9E, keys derived, retries=%d)",
-           piv_pin_retries_get());
+    CLOG_I("PIV", "applet ready (slots 9A/9C/9D/9E, keys derived, "
+                  "pin retries=%d puk retries=%d, mgmt key %s)",
+           piv_pin_retries_get(), piv_puk_retries_get(),
+           piv_mgmt_key_is_default() ? "factory default" : "customized");
 }

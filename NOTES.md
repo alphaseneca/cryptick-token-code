@@ -1801,3 +1801,265 @@ power delta on top of that; neither has been done. See
 same pass (bounded jittered reconnect backoff in
 `crates/transport-ble/src/backoff.rs`) and the fuller writeup — this entry
 intentionally doesn't repeat it.
+
+---
+
+## 2026-10-18 — PIV PUK and management key support
+
+### What was missing
+
+`ctctl piv` had no `access change-puk/set-retries/unblock-pin/change-
+management-key`, and the reason traced to the applet, not the CLI:
+`change_reference()` hard-rejected any key reference but the PIN's
+(`if (p1 != 0x00 || p2 != 0x80) return PIV_SW_WRONG_P1P2;`), there was no
+PUK storage or retry counter anywhere, and nothing implemented a
+management key or `GENERAL AUTHENTICATE` against key reference `9B`. This
+is the gap `crates/piv/src/commands.rs`'s own doc comment in the daemon
+repo already named explicitly.
+
+### What changed, by piece
+
+- **PUK** (`piv.h`/`piv.c`/`piv_hal_esp32.cpp`): storage, retry counter,
+  and hashing mirror the PIN's existing shape exactly — `puk_check`/
+  `puk_set`/`puk_retries_get`/`puk_retries_set` HAL hooks, a `pukhash`
+  NVS blob salted the same way `pinhash` is
+  (`crypto_sha256_update_secret()`), a separate `pukretries` counter. SP
+  800-73's default PUK (`12345678`) is accepted the same convenience way
+  `123456`/`000000` already are for the PIN.
+  - `CHANGE REFERENCE DATA` (existing INS `0x24`) now accepts P2
+    `PIV_KEY_REF_PUK` (`0x81`) as well as the PIN's `0x80` — same 16-byte
+    old-block/new-block shape, same retry mechanics, entirely separate
+    counter.
+  - `RESET RETRY COUNTER`, INS `0x2C` (SP 800-73 Part 2 §3.2.3) is new:
+    PUK + new PIN in, unblocks the PIN and installs it. Does **not**
+    verify the new PIN — SP 800-73 defines this as clearing the block,
+    not as a VERIFY, so a caller that wants the session authenticated
+    still has to VERIFY afterward. Matches every other PIV implementation
+    of this instruction, not a shortcut.
+  - `VERIFY` (existing INS `0x20`) now also answers an empty-body query
+    for P2 `0x81`, reporting PUK retries the same `63Cx` way it already
+    does for the PIN — SP 800-73 has no "verify the PUK" operation
+    (the PUK only ever authenticates as half of the two instructions
+    above), so a non-empty body for P2 `0x81` is refused rather than given
+    a second way to spend a PUK retry.
+
+- **Configurable retry ceilings** (vendor `SET PIN RETRIES`, INS `0xFA`,
+  P1/P2 = new PIN/PUK ceiling, no data — the same wire shape YubiKey's own
+  PIV implementation uses, reused deliberately rather than inventing a
+  second vendor dialect no PIV tooling has seen): `pin_retry_max_get`/
+  `puk_retry_max_get` HAL hooks back the ceiling `verify()`/
+  `change_reference()`/`reset_retry_counter()` now restore to on success,
+  instead of the old hardcoded `PIV_PIN_MAX_RETRIES` constant everywhere.
+  `set_pin_puk_retries()` resets the PIN and PUK to their SP 800-73
+  defaults in the same call — not a shortcut; every real implementation of
+  this vendor command does this because the ceiling and the stored secret
+  share one rewrite, and `ctctl`'s own CLI warns about it the same way
+  `piv reset` already warns before a destructive operation. Ceilings are
+  capped at 15 (`PIV_RETRY_CEILING_MAX`), not YubiKey's 255: the `63Cx`
+  status word this applet already uses to report "x attempts remain" has
+  only a 4-bit field for x, so a ceiling above 15 would make that same
+  status word ambiguous for the exact count it exists to report. Narrower
+  than YubiKey on purpose rather than inheriting an ambiguity nothing else
+  in this applet has.
+
+- **Management key** (AES-192, key reference `9B`): new
+  `mgmt_key_crypt_block`/`mgmt_key_set`/`mgmt_key_is_default`/
+  `random_bytes` HAL hooks; `GENERAL AUTHENTICATE` (existing INS `0x87`)
+  gains a second path (`general_authenticate_mgmt()`) alongside the
+  existing P-256 signing one, for the SP 800-73-5 Part 2 §3.2.4 Table 7
+  mutual-authenticate exchange:
+  1. Host sends an empty witness request (`7C 02 80 00`). The applet
+     generates a random 16-byte witness, encrypts it with the management
+     key, holds the plaintext as session state (`_mgmt_witness`,
+     single-use — see below), and returns the ciphertext.
+  2. Host decrypts the witness with its own copy of the key and sends it
+     back in plaintext alongside a challenge of its own
+     (`7C 24 80 10 <W> 81 10 <C>`). The applet compares the returned
+     plaintext against what it holds (constant-time, same reasoning as
+     the PIN compare below it) — a match proves the *host* holds the key.
+     It then encrypts the host's challenge and returns that, proving the
+     *card* holds the key too: mutual, not one-directional.
+  - `_mgmt_authenticated`, a per-session flag with the same lifetime as
+    `_pin_verified` (cleared by `piv_reset()`, i.e. on SELECT or a card
+    reset), gates the two new administrative instructions below. The
+    witness itself is single-use: `_mgmt_witness_pending` is cleared the
+    moment it is compared, successfully or not, so a captured witness
+    cannot be replayed against a later, unrelated exchange.
+  - No retry counter on the management key: SP 800-73 defines none for it
+    (unlike the PIN and PUK), and neither does YubiKey's own
+    implementation. Followed the spec here rather than inventing a
+    blocking mechanism nothing asked for.
+  - `SET MANAGEMENT KEY` (vendor, INS `0xFF`, P1=P2=`0xFF` — same
+    real-world convention as `SET PIN RETRIES`): data is
+    `<alg=0x0A> <len=24> <key bytes>`, no TLV wrapper (one algorithm, so
+    nothing for a template to disambiguate). Gated on
+    `_mgmt_authenticated`; clears it on success, since the session
+    authenticated against a key that is, as of this call, no longer the
+    one installed.
+  - **GENERATE ASYMMETRIC KEY PAIR and PUT DATA are deliberately
+    untouched.** `generate_keypair()`'s own existing comment already
+    documents that gate as PIN + presence rather than the management key
+    "as a deliberate substitution, not an oversight" — re-gating either
+    operation behind the new management key was not part of what this
+    pass was asked to add, and would have been a scope-expanding,
+    potentially breaking change to an already-working, already-tested
+    flow for no requested benefit.
+
+### The management-key default: a real decision, not a default I made silently
+
+Real PIV cards — YubiKey very much included — ship a single, published,
+identical-on-every-unit default management key
+(`010203040506070801020304050607080102030405060708` is YubiKey's actual
+one). That is a well-known, real-world footgun: any deployment that never
+rotates it is one public constant away from full admin access, and because
+it is the *same* constant on every unit ever made, one leak (or one widely
+circulated blog post) compromises every unit whose owner hasn't rotated —
+not just one.
+
+This device's default is instead **a genuinely random 24 bytes, minted
+once per physical unit** the first time anything needs it (`piv_hal_esp32.cpp`'s
+`ensure_mgmt_key()`, via `esp_fill_random()` — the same hardware TRNG the
+witness itself uses) and persisted in NVS alongside everything else this
+applet stores. `mgmt_key_is_default` lets a caller (or future CLI UX) tell
+whether a unit's key has ever been rotated away from that random default.
+
+Why not *derive* it from something already unique per unit — the eFuse
+MAC this device already uses for its USB serial and, as of the BLE device
+identity entry above, its Daemon Bridge serial-number characteristic too?
+Because that MAC is **public**: readable over USB with no authentication,
+and over BLE with nothing stronger than a bond. A derivation from it would
+only be as secret as the formula producing it — and this firmware's source
+is read, not guessed, by anyone auditing it (including this very file). A
+derived default would therefore degrade to *exactly* YubiKey's failure
+mode the moment the derivation is understood once: computable by anyone
+who can read a unit's public serial and has read this applet's source,
+which makes it no better than a single shared constant in practice. True
+randomness with nothing to invert is the one construction that does not
+inherit that problem — there is no formula to leak, because there isn't
+one.
+
+**The real, open trade-off this creates, flagged rather than decided
+silently:** a random default that nothing derives means there is currently
+no sanctioned way for a legitimate owner to *learn* their own unit's
+factory default management key short of already having changed it (at
+which point it is their own chosen value, not the question). Real products
+solve this by printing a unique default on something physical (a sticker,
+an insert card) at manufacturing time, or by a one-time "show me the
+current key, but only while it's still the factory default" command over
+a channel that implies physical possession (this device's existing CDC
+debug console, which already has exactly this shape for the `SERIAL`
+command, would be the natural place). **Neither exists yet** — this pass
+built the mechanism (storage, the APDU, the retry-free authentication, a
+swappable default) but deliberately did not invent a manufacturing/
+fulfillment process or a new CDC command on its own, since that is a
+product decision, not an engineering one, and bundling it into this pass
+would have meant guessing at a process nobody has described. Until
+something like that exists, the practical path for an owner today is:
+plug in over USB, read the factory-default key during initial setup
+through whatever "I'm setting this device up for the first time" flow
+`ctctl` grows, and rotate away from it immediately via
+`piv access change-management-key` — the same thing security guidance for
+a YubiKey's own well-known default already recommends, just with a unit-
+unique starting point instead of a universal one.
+
+### A real, pre-existing bug found and fixed while building this: the host
+### PIV test harness was corrupting memory on every run
+
+`tests/host/test_piv_apdu.py`'s `PivHal` ctypes structure had fallen out of
+sync with `piv_hal_t` in `piv.h`: `delete_object` was added to the real
+struct by an earlier pass (`feat(piv): delete a data object on a
+zero-length PUT DATA`) but never added to this file's ctypes mirror. Every
+field from `sign_p256` onward was therefore at the wrong byte offset
+relative to what the compiled `piv.c` actually read — the firmware was
+calling through function pointers read from the wrong slots (effectively,
+each HAL hook from that point on fired whatever closure Python had put
+*one field over* from where it belonged), and `user_presence`, the last
+field, was read one `uint64_t` past the end of the smaller Python-sized
+allocation entirely.
+
+**This was not a latent, unexercised bug — it was live on every run of
+this file.** It explains three things found during this same pass, not
+three separate coincidences:
+
+- `tests/host/test_piv_apdu.py` segfaulted partway through
+  (`test_card_authentication_slot_signs_without_a_pin`, the first case to
+  reach `general_authenticate()`'s `_hal->user_presence(slot)` check) —
+  reading past the end of the allocated struct.
+- A cluster of tests *before* that crash point failed outright
+  (`test_select_clears_pin_verification`, `test_correct_pin_verifies`, and
+  several more) — reading through a shifted, wrong function pointer for
+  `pin_check`/`pin_set`/etc.
+- Three `tests/host/test_ccid_proto.py` tests failed too
+  (`test_power_off_clears_pin_verification`,
+  `test_power_on_also_resets_the_applet`,
+  `test_select_verify_sign_over_ccid`) — same root cause, reached through
+  CCID's own PIV wrapper rather than this file directly; heap corruption
+  from one compiled extension does not respect source-file boundaries
+  within one Python process.
+
+All confirmed pre-existing and unrelated to this pass's own changes by
+reverting to a clean `main` via `git stash` and reproducing the identical
+crash and failures with *none* of this pass's code applied. Fixed by
+adding `delete_object` to the ctypes struct at its correct (third) field
+position — the one-line cause of a problem that looked, before this, like
+three unrelated ones. `tests/host` was 306/306 once fixed (182 non-PIV +
+124 PIV, matching the figure an earlier pass's own notes record as the
+expected healthy baseline) before this pass added anything of its own;
+this pass's 34 new PUK/management-key/retry-query tests bring
+`test_piv_apdu.py` to 138 passing (104 pre-existing + 34 new) and the full
+`tests/host` suite to 340.
+A struct layout mismatch like this has no compiler to catch it — ctypes
+trusts the Python side completely — so there is no guard against this
+exact class of bug recurring the next time a HAL hook is added to one side
+and not the other; flagging that gap rather than closing it, since closing
+it would mean generating the ctypes struct from `piv.h` itself, a bigger
+change than this pass's actual scope.
+
+### Daemon-side follow-up (separate repo, done alongside this)
+
+`crates/piv/src/commands.rs` gained `change_puk`/`reset_pin`/
+`verify_puk_retries`/`set_pin_retries`/`set_management_key`/
+`mgmt_request_witness`/`mgmt_respond` builders and a `ManagementKey`
+AES-192 type (the host's independent implementation of the same cipher
+this applet's `mgmt_key_crypt_block` runs — the two sides never exchange
+the key itself, only prove to each other they each hold a copy).
+`crates/token-manager/src/cli/piv_cli.rs` wires all four into
+`ctctl piv access change-puk/set-retries/unblock-pin/change-management-key`,
+replacing `change-puk`'s old canned "✓ PUK modification requested" message
+(which never sent anything to the device — the exact bug class an earlier
+pass fixed in `piv certificates delete`) with a real implementation. See
+that repo's own NOTES.md for the full detail.
+
+### What's verified vs. what needs real hardware
+
+**Verified against the real applet C, not by inspection:** `tests/host`
+(`pytest tests/host`, `pip install -r tests/requirements-host.txt`) —
+306 pre-existing cases unchanged, 34 new ones covering: PUK change and its
+own independent retry counter, PIN unblock via PUK (including that it does
+*not* auto-verify), every wrong-reference/wrong-length/wrong-P1P2 rejection
+the new instructions add, the full mutual-authenticate exchange
+(right key, wrong key, actual mutual-ness — the card's response decrypts
+back to the exact challenge sent, not just "some success status" —
+single-use witness/replay rejection, session-scoped authentication that
+does not survive a reset), management-key rotation (old key stops
+working, new key starts, re-authentication required per change), and
+retry-ceiling reconfiguration (both secrets reset to defaults, the new
+ceiling actually takes effect on the next successful verify, out-of-range
+ceilings refused).
+
+**Not build-verified this round, same as the BLE power-tier entry above:**
+PlatformIO is not installed in this sandbox, so `piv_hal_esp32.cpp`'s
+actual compile against the ESP32 Arduino/mbedtls headers (`esp_fill_random`,
+`mbedtls_aes_setkey_enc`/`mbedtls_aes_crypt_ecb`) has not been confirmed —
+checked by careful reading against this project's existing mbedtls AES
+usage (`core/crypto_esp32.cpp`, `core/secret_crypto.cpp`) for API-shape
+consistency, not by a real build.
+
+**Needs a flashed unit to confirm:** that AES-192 interop actually holds
+between firmware and daemon (both sides were written and tested
+independently against the same spec table, never against each other);
+that the random factory-default management key is genuinely distinct
+across two physical units (no second unit was available, same caveat the
+BLE identity entry above already recorded for the USB-serial-over-BLE
+characteristic); and the open manufacturing/fulfillment question above
+about how an owner is meant to learn their own unit's factory-default key.

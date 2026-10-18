@@ -12,6 +12,25 @@ static const piv_hal_t *_hal;
 static int _pin_verified;
 
 /*
+ * Management-key authentication, same per-session lifetime as _pin_verified.
+ * Set only once GENERAL AUTHENTICATE's mutual exchange (below) has verified
+ * this caller holds the key, not merely that it started the exchange.
+ */
+static int _mgmt_authenticated;
+
+/*
+ * The one piece of state GENERAL AUTHENTICATE's mutual exchange carries
+ * between its two APDUs: the plaintext witness this applet generated and
+ * handed back encrypted in the first response, held so the second request
+ * has something to compare the caller's returned plaintext against.
+ * `_mgmt_witness_pending` is false whenever there is nothing to compare —
+ * including after a successful or failed comparison, so a witness is good
+ * for exactly one follow-up request and cannot be replayed.
+ */
+static uint8_t _mgmt_witness[PIV_MGMT_BLOCK_LEN];
+static int     _mgmt_witness_pending;
+
+/*
  * Pending response for GET RESPONSE chaining.
  *
  * A PIV certificate is comfortably larger than the 256 bytes a short APDU can
@@ -207,6 +226,120 @@ static int parse_object_tag(const uint8_t *data, size_t len, uint32_t *tag)
 /* --- GENERAL AUTHENTICATE ------------------------------------------------- */
 
 /**
+ * GENERAL AUTHENTICATE against the management key (P2 PIV_KEY_REF_MGMT),
+ * SP 800-73-4 Part 2 §3.2.4 Table 7's mutual-authentication exchange for a
+ * symmetric algorithm. Two round trips — the standard shape every PIV admin
+ * tool (ykman included) already speaks for a card management key:
+ *
+ *   1. Host sends an empty witness request: 7C 02 80 00.
+ *      Card answers with its witness, encrypted: 7C 12 80 10 <E(W)>.
+ *   2. Host decrypts W with its own copy of the key and sends it back
+ *      alongside a fresh challenge of its own: 7C 24 80 10 <W> 81 10 <C>.
+ *      If the returned W matches what this applet encrypted, the host has
+ *      proven it holds the key. Card answers with C encrypted:
+ *      7C 12 82 10 <E(C)>. The host decrypts that and checks it against the
+ *      C it sent — if it matches, the card has proven it holds the key too,
+ *      completing authentication in both directions rather than just one.
+ *
+ * No retry counter: SP 800-73 defines none for the management key, unlike
+ * the PIN and PUK, and ykman/YubiKey do not add one either — see NOTES.md
+ * for why this applet follows the spec here rather than inventing one.
+ */
+static int general_authenticate_mgmt(uint8_t alg, const uint8_t *data, size_t len,
+                                     size_t le, uint8_t *out, size_t out_max)
+{
+    if (alg != PIV_MGMT_ALG_AES192)
+        return put_sw(out, out_max, PIV_SW_WRONG_P1P2);
+    if (!_hal || !_hal->mgmt_key_crypt_block)
+        return put_sw(out, out_max, PIV_SW_INS_UNSUPPORTED);
+
+    if (len < 2 || data[0] != 0x7C)
+        return put_sw(out, out_max, PIV_SW_WRONG_DATA);
+    size_t off = 1, tmpl_len = 0;
+    if (!tlv_get_len(data, len, &off, &tmpl_len) || off + tmpl_len > len)
+        return put_sw(out, out_max, PIV_SW_WRONG_DATA);
+
+    size_t end = off + tmpl_len;
+    const uint8_t *witness = NULL, *challenge = NULL;
+    size_t witness_len = 0, challenge_len = 0;
+
+    while (off + 1 < end) {
+        uint8_t t = data[off++];
+        size_t l;
+        if (!tlv_get_len(data, end, &off, &l) || off + l > end)
+            return put_sw(out, out_max, PIV_SW_WRONG_DATA);
+        if (t == PIV_TAG_WITNESS) {
+            witness = data + off;
+            witness_len = l;
+        } else if (t == PIV_TAG_CHALLENGE) {
+            challenge = data + off;
+            challenge_len = l;
+        }
+        off += l;
+    }
+
+    /* Form 1: an empty witness tag asks this applet to start the exchange. */
+    if (witness && witness_len == 0 && !challenge) {
+        if (!_hal->random_bytes)
+            return put_sw(out, out_max, PIV_SW_INS_UNSUPPORTED);
+        if (!_hal->random_bytes(_mgmt_witness, sizeof(_mgmt_witness)))
+            return put_sw(out, out_max, PIV_SW_WRONG_DATA);
+        _mgmt_witness_pending = 1;
+
+        uint8_t enc[PIV_MGMT_BLOCK_LEN];
+        if (!_hal->mgmt_key_crypt_block(_mgmt_witness, enc))
+            return put_sw(out, out_max, PIV_SW_WRONG_DATA);
+
+        size_t n = 0;
+        _scratch[n++] = 0x7C;
+        _scratch[n++] = 2 + PIV_MGMT_BLOCK_LEN;
+        _scratch[n++] = PIV_TAG_WITNESS;
+        _scratch[n++] = PIV_MGMT_BLOCK_LEN;
+        memcpy(_scratch + n, enc, PIV_MGMT_BLOCK_LEN);
+        n += PIV_MGMT_BLOCK_LEN;
+        return respond(_scratch, n, le, out, out_max);
+    }
+
+    /* Form 2: the decrypted witness, proving the host holds the key, plus
+     * the host's own challenge for this applet to answer in kind. */
+    if (witness && challenge) {
+        if (!_mgmt_witness_pending || witness_len != sizeof(_mgmt_witness)) {
+            _mgmt_witness_pending = 0;
+            return put_sw(out, out_max, PIV_SW_SECURITY_NOT_SATISFIED);
+        }
+
+        /* Constant-time compare — same reasoning as the PIN check below. */
+        uint8_t diff = 0;
+        for (size_t i = 0; i < sizeof(_mgmt_witness); i++)
+            diff = (uint8_t)(diff | (witness[i] ^ _mgmt_witness[i]));
+        _mgmt_witness_pending = 0;
+        memset(_mgmt_witness, 0, sizeof(_mgmt_witness));
+        if (diff != 0)
+            return put_sw(out, out_max, PIV_SW_SECURITY_NOT_SATISFIED);
+
+        if (challenge_len != PIV_MGMT_BLOCK_LEN)
+            return put_sw(out, out_max, PIV_SW_WRONG_DATA);
+
+        uint8_t enc[PIV_MGMT_BLOCK_LEN];
+        if (!_hal->mgmt_key_crypt_block(challenge, enc))
+            return put_sw(out, out_max, PIV_SW_WRONG_DATA);
+
+        _mgmt_authenticated = 1;
+
+        size_t n = 0;
+        _scratch[n++] = 0x7C;
+        _scratch[n++] = 2 + PIV_MGMT_BLOCK_LEN;
+        _scratch[n++] = PIV_TAG_RESPONSE;
+        _scratch[n++] = PIV_MGMT_BLOCK_LEN;
+        memcpy(_scratch + n, enc, PIV_MGMT_BLOCK_LEN);
+        n += PIV_MGMT_BLOCK_LEN;
+        return respond(_scratch, n, le, out, out_max);
+    }
+
+    return put_sw(out, out_max, PIV_SW_WRONG_DATA);
+}
+
+/**
  * The dynamic authentication template (0x7C) carries a challenge in 0x81; the
  * response goes back in 0x82. For ECDSA the "challenge" is already the hash to
  * sign, so the applet never hashes anything itself.
@@ -218,6 +351,9 @@ static int general_authenticate(uint8_t alg, uint8_t slot,
     size_t off = 0, tmpl_len = 0;
     const uint8_t *challenge = NULL;
     size_t challenge_len = 0;
+
+    if (slot == PIV_KEY_REF_MGMT)
+        return general_authenticate_mgmt(alg, data, len, le, out, out_max);
 
     /* P-256 only: the device has one curve and advertises nothing else. */
     if (alg != 0x11)
@@ -578,10 +714,51 @@ static size_t pin_block_len(const uint8_t *block, size_t lc)
     return (n >= PIV_PIN_MIN_LEN && n <= PIV_PIN_MAX_LEN) ? n : 0;
 }
 
+/** This applet's configured PIN retry ceiling — SET PIN RETRIES' value if
+ *  the HAL supports it, else the compile-time default. */
+static int pin_retry_max(void)
+{
+    if (_hal->pin_retry_max_get)
+        return _hal->pin_retry_max_get();
+    return PIV_PIN_MAX_RETRIES;
+}
+
+/** Same for the PUK. */
+static int puk_retry_max(void)
+{
+    if (_hal->puk_retry_max_get)
+        return _hal->puk_retry_max_get();
+    return PIV_PUK_MAX_RETRIES;
+}
+
+/**
+ * VERIFY's empty-body "how many tries remain" query (see the PIN's own copy
+ * of this below), extended to the PUK. SP 800-73 has no concept of
+ * "verifying" a PUK on its own — it only ever authenticates as half of
+ * CHANGE REFERENCE DATA or RESET RETRY COUNTER — so this is deliberately
+ * query-only: a non-empty body is refused rather than given a second way to
+ * spend a PUK retry outside those two instructions.
+ */
+static int verify_puk_retries(uint8_t p1, size_t lc, uint8_t *out, size_t out_max)
+{
+    if (p1 != 0x00 || lc != 0)
+        return put_sw(out, out_max, PIV_SW_WRONG_P1P2);
+    if (!_hal || !_hal->puk_retries_get)
+        return put_sw(out, out_max, PIV_SW_INS_UNSUPPORTED);
+
+    int retries = _hal->puk_retries_get();
+    if (retries <= 0)
+        return put_sw(out, out_max, PIV_SW_AUTH_BLOCKED);
+    return put_sw(out, out_max, PIV_SW_VERIFY_FAILED(retries));
+}
+
 static int verify(uint8_t p1, uint8_t p2, const uint8_t *data, size_t lc,
                   uint8_t *out, size_t out_max)
 {
-    /* 0x80 is the application PIN; 0x00/0x81 (global, PUK) are not supported. */
+    if (p2 == PIV_KEY_REF_PUK)
+        return verify_puk_retries(p1, lc, out, out_max);
+
+    /* 0x80 is the application PIN; 0x00 (global) is not supported. */
     if (p2 != 0x80)
         return put_sw(out, out_max, PIV_SW_WRONG_P1P2);
 
@@ -625,7 +802,7 @@ static int verify(uint8_t p1, uint8_t p2, const uint8_t *data, size_t lc,
     if (_hal->pin_check(data, pin_len)) {
         _pin_verified = 1;
         if (_hal->pin_retries_set)
-            _hal->pin_retries_set(PIV_PIN_MAX_RETRIES);
+            _hal->pin_retries_set(pin_retry_max());
         return put_sw(out, out_max, PIV_SW_OK);
     }
 
@@ -646,18 +823,54 @@ static int verify(uint8_t p1, uint8_t p2, const uint8_t *data, size_t lc,
 /* --- CHANGE REFERENCE DATA ------------------------------------------------ */
 
 /**
- * Change the application PIN.
+ * Change the application PIN (P2 PIV_KEY_REF_PIN) or the PUK (P2
+ * PIV_KEY_REF_PUK) — the one CHANGE REFERENCE DATA instruction SP 800-73
+ * defines for both secrets, distinguished only by which key reference P2
+ * names (Part 2 §3.2.2).
  *
- * Without this the device ships on the SP 800-73 default and there is no way
- * off it, which makes the PIN decorative. The old PIN is presented alongside
- * the new one, so a wrong attempt spends a retry exactly like VERIFY.
+ * Without this the device ships on the SP 800-73 defaults and there is no
+ * way off them, which makes both secrets decorative. The old value is
+ * presented alongside the new one, so a wrong attempt spends a retry exactly
+ * like VERIFY — on whichever secret P2 named, never the other one.
  */
 static int change_reference(uint8_t p1, uint8_t p2,
                             const uint8_t *data, size_t lc,
                             uint8_t *out, size_t out_max)
 {
-    if (p1 != 0x00 || p2 != 0x80)
+    if (p1 != 0x00)
         return put_sw(out, out_max, PIV_SW_WRONG_P1P2);
+
+    if (p2 == PIV_KEY_REF_PUK) {
+        if (!_hal || !_hal->puk_check || !_hal->puk_set || !_hal->puk_retries_get)
+            return put_sw(out, out_max, PIV_SW_INS_UNSUPPORTED);
+
+        int retries = _hal->puk_retries_get();
+        if (retries <= 0)
+            return put_sw(out, out_max, PIV_SW_AUTH_BLOCKED);
+
+        if (!data || lc != 2 * PIV_PUK_BLOCK_LEN)
+            return put_sw(out, out_max, PIV_SW_WRONG_LENGTH);
+
+        if (!_hal->puk_check(data, PIV_PUK_BLOCK_LEN)) {
+            retries--;
+            if (_hal->puk_retries_set)
+                _hal->puk_retries_set(retries);
+            if (retries <= 0)
+                return put_sw(out, out_max, PIV_SW_AUTH_BLOCKED);
+            return put_sw(out, out_max, PIV_SW_VERIFY_FAILED(retries));
+        }
+
+        if (!_hal->puk_set(data + PIV_PUK_BLOCK_LEN, PIV_PUK_BLOCK_LEN))
+            return put_sw(out, out_max, PIV_SW_WRONG_DATA);
+
+        if (_hal->puk_retries_set)
+            _hal->puk_retries_set(puk_retry_max());
+        return put_sw(out, out_max, PIV_SW_OK);
+    }
+
+    if (p2 != PIV_KEY_REF_PIN)
+        return put_sw(out, out_max, PIV_SW_WRONG_P1P2);
+
     if (!_hal || !_hal->pin_check || !_hal->pin_set || !_hal->pin_retries_get)
         return put_sw(out, out_max, PIV_SW_INS_UNSUPPORTED);
 
@@ -694,7 +907,128 @@ static int change_reference(uint8_t p1, uint8_t p2,
 
     _pin_verified = 1;
     if (_hal->pin_retries_set)
-        _hal->pin_retries_set(PIV_PIN_MAX_RETRIES);
+        _hal->pin_retries_set(pin_retry_max());
+    return put_sw(out, out_max, PIV_SW_OK);
+}
+
+/**
+ * RESET RETRY COUNTER (INS 0x2C): unblock the PIN with the PUK, SP 800-73
+ * Part 2 §3.2.3. The one key reference the standard defines for this is
+ * PIV_KEY_REF_PIN — resetting the PIN is the whole point of having a PUK;
+ * there is no standard operation for resetting the PUK's own counter with
+ * some third secret, so any other P2 is refused.
+ *
+ * A correct PUK restores *both* counters to their ceiling (the PUK's own,
+ * same as a successful CHANGE REFERENCE DATA would, and the PIN's, which is
+ * this instruction's actual job) and installs the new PIN — but does
+ * *not* verify it. SP 800-73 defines RESET RETRY COUNTER as clearing the
+ * block, not as a VERIFY; a caller who wants the session authenticated
+ * still has to present the new PIN afterward, same as every real PIV
+ * implementation.
+ */
+static int reset_retry_counter(uint8_t p1, uint8_t p2,
+                               const uint8_t *data, size_t lc,
+                               uint8_t *out, size_t out_max)
+{
+    if (p1 != 0x00 || p2 != PIV_KEY_REF_PIN)
+        return put_sw(out, out_max, PIV_SW_WRONG_P1P2);
+    if (!_hal || !_hal->puk_check || !_hal->puk_retries_get ||
+        !_hal->pin_set || !_hal->pin_retries_get)
+        return put_sw(out, out_max, PIV_SW_INS_UNSUPPORTED);
+
+    int puk_retries = _hal->puk_retries_get();
+    if (puk_retries <= 0)
+        return put_sw(out, out_max, PIV_SW_AUTH_BLOCKED);
+
+    /* PUK block ‖ new PIN block, 8 bytes each. */
+    if (!data || lc != PIV_PUK_BLOCK_LEN + PIV_PIN_BLOCK_LEN)
+        return put_sw(out, out_max, PIV_SW_WRONG_LENGTH);
+
+    size_t new_pin_len = pin_block_len(data + PIV_PUK_BLOCK_LEN, PIV_PIN_BLOCK_LEN);
+    if (new_pin_len == 0)
+        return put_sw(out, out_max, PIV_SW_WRONG_DATA);
+
+    if (!_hal->puk_check(data, PIV_PUK_BLOCK_LEN)) {
+        puk_retries--;
+        if (_hal->puk_retries_set)
+            _hal->puk_retries_set(puk_retries);
+        if (puk_retries <= 0)
+            return put_sw(out, out_max, PIV_SW_AUTH_BLOCKED);
+        return put_sw(out, out_max, PIV_SW_VERIFY_FAILED(puk_retries));
+    }
+
+    if (!_hal->pin_set(data + PIV_PUK_BLOCK_LEN, new_pin_len))
+        return put_sw(out, out_max, PIV_SW_WRONG_DATA);
+
+    _pin_verified = 0; /* unblocking is not verifying */
+    if (_hal->pin_retries_set)
+        _hal->pin_retries_set(pin_retry_max());
+    if (_hal->puk_retries_set)
+        _hal->puk_retries_set(puk_retry_max());
+    return put_sw(out, out_max, PIV_SW_OK);
+}
+
+/**
+ * SET PIN RETRIES (vendor, INS 0xFA): reconfigure both retry ceilings.
+ * P1 is the new PIN ceiling, P2 the new PUK ceiling, no data field — the
+ * same wire shape YubiKey's PIV implementation uses for this command.
+ *
+ * Gated on *both* a verified PIN and an authenticated management key: it
+ * rewrites the PIN and PUK (see set_pin_puk_retries' own doc comment in
+ * piv.h for why that is not a shortcut), so either secret's owner alone
+ * authorising it would let either one override the other's.
+ */
+static int set_pin_retries(uint8_t p1, uint8_t p2,
+                           size_t lc, uint8_t *out, size_t out_max)
+{
+    if (lc != 0)
+        return put_sw(out, out_max, PIV_SW_WRONG_LENGTH);
+    if (!_hal || !_hal->set_pin_puk_retries)
+        return put_sw(out, out_max, PIV_SW_INS_UNSUPPORTED);
+    if (!_pin_verified || !_mgmt_authenticated)
+        return put_sw(out, out_max, PIV_SW_SECURITY_NOT_SATISFIED);
+    if (p1 < 1 || p1 > PIV_RETRY_CEILING_MAX || p2 < 1 || p2 > PIV_RETRY_CEILING_MAX)
+        return put_sw(out, out_max, PIV_SW_WRONG_P1P2);
+
+    if (!_hal->set_pin_puk_retries((int)p1, (int)p2))
+        return put_sw(out, out_max, PIV_SW_WRONG_DATA);
+
+    /* The PIN this session had verified no longer exists — it was just
+     * reset to the SP 800-73 default along with the ceiling. */
+    _pin_verified = 0;
+    return put_sw(out, out_max, PIV_SW_OK);
+}
+
+/**
+ * SET MANAGEMENT KEY (vendor, INS 0xFF, P1=P2=0xFF per the same real-world
+ * convention SET PIN RETRIES follows): data is `<alg> <len> <key bytes>`,
+ * no TLV wrapper — this device defines only one algorithm, so there is
+ * nothing a template would disambiguate.
+ *
+ * Gated on an authenticated management key, same as every real PIV card's
+ * key-rotation command: whoever holds the current key may install the next
+ * one. Clears _mgmt_authenticated on success — the session authenticated
+ * against a key that, as of this call, is no longer the one installed, so
+ * any further admin operation must authenticate again against the new one.
+ */
+static int set_management_key(uint8_t p1, uint8_t p2,
+                               const uint8_t *data, size_t lc,
+                               uint8_t *out, size_t out_max)
+{
+    if (p1 != 0xFF || p2 != 0xFF)
+        return put_sw(out, out_max, PIV_SW_WRONG_P1P2);
+    if (!_hal || !_hal->mgmt_key_set)
+        return put_sw(out, out_max, PIV_SW_INS_UNSUPPORTED);
+    if (!_mgmt_authenticated)
+        return put_sw(out, out_max, PIV_SW_SECURITY_NOT_SATISFIED);
+    if (!data || lc != 2 + PIV_MGMT_KEY_LEN || data[0] != PIV_MGMT_ALG_AES192 ||
+        data[1] != PIV_MGMT_KEY_LEN)
+        return put_sw(out, out_max, PIV_SW_WRONG_DATA);
+
+    if (!_hal->mgmt_key_set(data + 2, PIV_MGMT_KEY_LEN))
+        return put_sw(out, out_max, PIV_SW_WRONG_DATA);
+
+    _mgmt_authenticated = 0;
     return put_sw(out, out_max, PIV_SW_OK);
 }
 
@@ -716,6 +1050,9 @@ static void chain_clear(void)
 void piv_reset(void)
 {
     _pin_verified = 0;
+    _mgmt_authenticated = 0;
+    _mgmt_witness_pending = 0;
+    memset(_mgmt_witness, 0, sizeof(_mgmt_witness));
     pending_clear();
     chain_clear();
 }
@@ -961,6 +1298,9 @@ int piv_handle_apdu(const uint8_t *cmd, size_t cmd_len, uint8_t *out, size_t out
     case PIV_INS_CHANGE_REFERENCE:
         return change_reference(p1, p2, data, lc, out, out_max);
 
+    case PIV_INS_RESET_RETRY:
+        return reset_retry_counter(p1, p2, data, lc, out, out_max);
+
     case PIV_INS_GENERATE_KEYPAIR:
         return generate_keypair(p1, p2, data, lc, le, out, out_max);
 
@@ -968,6 +1308,12 @@ int piv_handle_apdu(const uint8_t *cmd, size_t cmd_len, uint8_t *out, size_t out
         if (!data)
             return put_sw(out, out_max, PIV_SW_WRONG_DATA);
         return general_authenticate(p1, p2, data, lc, le, out, out_max);
+
+    case PIV_INS_SET_PIN_RETRIES:
+        return set_pin_retries(p1, p2, lc, out, out_max);
+
+    case PIV_INS_SET_MGMT_KEY:
+        return set_management_key(p1, p2, data, lc, out, out_max);
 
     default:
         return put_sw(out, out_max, PIV_SW_INS_UNSUPPORTED);
