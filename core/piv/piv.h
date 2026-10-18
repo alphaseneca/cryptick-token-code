@@ -44,18 +44,21 @@ extern "C" {
 #define PIV_INS_GET_DATA             0xCB
 #define PIV_INS_PUT_DATA             0xDB
 /*
- * SET PIN RETRIES and SET MANAGEMENT KEY are not in NIST SP 800-73 — the
- * standard defines the *reference data* (PIN, PUK, management key) and how
- * to authenticate with it, but not an administrative command to reconfigure
- * retry ceilings or rekey the management key itself. INS 0xFA/0xFF are the
- * de facto real-world convention (YubiKey's own PIV implementation, which
- * every PC/SC middleware and `ykman` already knows how to send); reusing
- * them costs nothing here since neither collides with a byte SP 800-73
- * assigns, and it means this device speaks the one vendor dialect PIV
- * tooling already understands instead of inventing a second one no client
- * has ever seen. See NOTES.md, "PIV PUK and management key support".
+ * SET PIN RETRIES, RESET APPLICATION, and SET MANAGEMENT KEY are not in
+ * NIST SP 800-73 — the standard defines the *reference data* (PIN, PUK,
+ * management key) and how to authenticate with it, but not an
+ * administrative command to reconfigure retry ceilings, wipe the
+ * application back to its factory state, or rekey the management key
+ * itself. INS 0xFA/0xFB/0xFF are the de facto real-world convention
+ * (YubiKey's own PIV implementation, which every PC/SC middleware and
+ * `ykman` already knows how to send); reusing them costs nothing here
+ * since none collides with a byte SP 800-73 assigns, and it means this
+ * device speaks the one vendor dialect PIV tooling already understands
+ * instead of inventing a second one no client has ever seen. See
+ * NOTES.md, "PIV PUK and management key support" and "PIV factory reset".
  */
 #define PIV_INS_SET_PIN_RETRIES      0xFA
+#define PIV_INS_RESET_APPLICATION    0xFB
 #define PIV_INS_SET_MGMT_KEY         0xFF
 
 /* --- Key slots (SP 800-73-4 part 1, table 3) ----------------------------- */
@@ -323,6 +326,39 @@ typedef struct {
      * seeded.
      */
     int (*random_bytes)(uint8_t *out, size_t len);
+
+    /*
+     * Appended here rather than next to mgmt_key_set/mgmt_key_is_default
+     * above, where it would read more naturally: this struct is mirrored
+     * positionally by piv_hal_esp32.cpp's initializer list and by
+     * tests/host/test_piv_apdu.py's ctypes PivHal — see NOTES.md, "A real,
+     * pre-existing bug found and fixed while building this" under "PIV
+     * PUK and management key support", where one earlier field insertion
+     * fell out of sync between the C struct and the Python mirror and
+     * silently shifted every field after it to the wrong function
+     * pointer. Appending at the end instead of inserting means a mirror
+     * that has not yet been updated is merely missing this one field, not
+     * reading every other hook through the wrong slot.
+     */
+
+    /**
+     * RESET APPLICATION's management-key half: erase whatever key (default
+     * or owner-rotated) was stored, so the applet falls back to the
+     * published SP 800-73-5 default again — the same thing `set_pin_puk_
+     * retries` already does for the PIN and PUK on a reset, applied to the
+     * one secret that has no existing hook for "go back to default".
+     *
+     * Deliberately not expressed as a call to `mgmt_key_set` with the
+     * well-known default's bytes: `mgmt_key_set` is reachable from the APDU
+     * layer precisely because an authenticated caller is allowed to install
+     * any key of their choosing, and keeping this hook to "erase" rather
+     * than "install this specific value" means it has exactly one job and
+     * no input, with nothing for a caller to influence.
+     *
+     * Returns 1 on success. May be NULL, in which case RESET APPLICATION
+     * answers PIV_SW_INS_UNSUPPORTED.
+     */
+    int (*mgmt_key_reset_to_default)(void);
 } piv_hal_t;
 
 /** Install the platform hooks and reset applet state. */

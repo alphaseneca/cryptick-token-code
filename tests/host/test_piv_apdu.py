@@ -46,6 +46,9 @@ def PIV_SW_VERIFY_FAILED(retries: int) -> int:
 
 SLOT_9A, SLOT_9C, SLOT_9D, SLOT_9E = 0x9A, 0x9C, 0x9D, 0x9E
 OBJ_CERT_9A = 0x5FC105
+OBJ_CERT_9C = 0x5FC10A
+OBJ_CERT_9D = 0x5FC10B
+OBJ_CERT_9E = 0x5FC101
 
 CORRECT_PIN = b"123456"
 DEFAULT_PUK = b"12345678"  # SP 800-73-5 Part 1 §2.4.3's default PUK.
@@ -89,6 +92,14 @@ MGMT_SET = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.POINTER(ctypes.c_uint8), ctypes
 MGMT_IS_DEFAULT = ctypes.CFUNCTYPE(ctypes.c_int)
 RANDOM_BYTES = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t)
 
+# --- RESET APPLICATION's one new hook --------------------------------------
+# Appended after random_bytes, not inserted beside mgmt_key_set/
+# mgmt_key_is_default where it would read more naturally — see piv.h's own
+# comment on this field for why: an insertion anywhere but the end risks the
+# exact ctypes/struct drift "PIV PUK and management key support" (NOTES.md)
+# already found and fixed once in this same file.
+MGMT_RESET_DEFAULT = ctypes.CFUNCTYPE(ctypes.c_int)
+
 
 class PivHal(ctypes.Structure):
     _fields_ = [
@@ -116,13 +127,15 @@ class PivHal(ctypes.Structure):
         ("mgmt_key_set", MGMT_SET),
         ("mgmt_key_is_default", MGMT_IS_DEFAULT),
         ("random_bytes", RANDOM_BYTES),
+        ("mgmt_key_reset_to_default", MGMT_RESET_DEFAULT),
     ]
 
 
 class Card:
     """The applet plus a scriptable platform underneath it."""
 
-    def __init__(self, lib, *, presence=True, with_presence_hook=True):
+    def __init__(self, lib, *, presence=True, with_presence_hook=True,
+                 with_mgmt_reset_hook=True):
         self.lib = lib
         self.objects: dict[int, bytes] = {}
         self.retries = 3
@@ -152,6 +165,7 @@ class Card:
         self.mgmt_key = bytes((i * 7 + 3) & 0xFF for i in range(24))
         self.mgmt_key_is_default = True
         self.random_calls = 0
+        self.mgmt_key_reset_calls = 0
 
         def _get(tag, out_pp, out_len):
             blob = self.objects.get(int(tag))
@@ -281,6 +295,17 @@ class Card:
                 out[i] = b
             return 1
 
+        def _mgmt_reset_default():
+            self.mgmt_key_reset_calls += 1
+            # A fresh value here, not the firmware's actual published
+            # default (piv_hal_esp32.cpp's kDefaultMgmtKey) — this fake
+            # only needs to prove the *hook* fired and the card's believed
+            # key actually changed, not reproduce the real HAL's specific
+            # default-key policy, which this file has no stake in.
+            self.mgmt_key = os.urandom(24)
+            self.mgmt_key_is_default = True
+            return 1
+
         self._cbs = [
             GET_OBJ(_get), SET_OBJ(_set), DELETE_OBJ(_delete), SIGN(_sign),
             ECDH(_ecdh), PIN_CHECK(_pin), PIN_SET(_pin_set), PUBKEY(_pubkey),
@@ -292,6 +317,8 @@ class Card:
             SET_RETRIES(_set_retries), MGMT_CRYPT(_mgmt_crypt),
             MGMT_SET(_mgmt_set), MGMT_IS_DEFAULT(_mgmt_is_default),
             RANDOM_BYTES(_random),
+            MGMT_RESET_DEFAULT(_mgmt_reset_default) if with_mgmt_reset_hook
+            else ctypes.cast(None, MGMT_RESET_DEFAULT),
         ]
         self.hal = PivHal(*self._cbs)
         lib.piv_init(ctypes.byref(self.hal))
@@ -362,6 +389,12 @@ class Card:
     def set_management_key(self, key: bytes, alg: int = 0x0A) -> int:
         body = bytes([alg, len(key)]) + key
         return self.apdu(bytes([0x00, 0xFF, 0xFF, 0xFF, len(body)]) + body)[0]
+
+    def reset_application(self) -> int:
+        """RESET APPLICATION (vendor, INS 0xFB): factory-reset the whole
+        applet. Only succeeds once both the PIN and PUK are already
+        blocked — see test_piv_apdu.py's own RESET APPLICATION section."""
+        return self.apdu(bytes([0x00, 0xFB, 0x00, 0x00]))[0]
 
     def mgmt_request_witness(self) -> tuple[int, bytes]:
         """First half of GENERAL AUTHENTICATE's mutual exchange: ask the
@@ -1378,3 +1411,174 @@ def test_any_other_command_mid_chain_is_refused_then_recovers(card):
     # The abandoned block is gone rather than waiting to be completed.
     assert card.apdu(bytes([0x00, 0xDB, 0x3F, 0xFF, 0x01]) + b"C")[0] == SW_SECURITY
     assert card.objects == {}
+
+
+# --- RESET APPLICATION ------------------------------------------------------
+#
+# Vendor INS 0xFB: a full factory reset, gated on a verified PIN this session
+# and nothing else. SP 800-73 defines neither the instruction nor the gate;
+# VERIFY-then-reset is the same bar GENERATE ASYMMETRIC KEY PAIR already
+# accepts for an operation that likewise destroys certificates already
+# issued. Physical possession alone is never enough — a thief who does not
+# know the PIN cannot wipe the device and install their own keys just by
+# holding it.
+#
+# Earlier drafts of this instruction (see NOTES.md, "PIV factory reset" and
+# the two entries after it) also accepted a PIN-free lockout-recovery path —
+# both the PIN and PUK retry counters already at zero — so an owner who had
+# lost both secrets was not permanently locked out. That path was removed at
+# the device owner's explicit direction: reaching "both blocked" needs no
+# knowledge of either secret, only physical possession and a few deliberate
+# wrong guesses, which made the lockout-recovery path reachable by anyone
+# holding the device, not just its legitimate owner. The accepted cost,
+# flagged there and pinned down by tests here: forgetting the PIN *and* the
+# PUK now has no way back into this device at all.
+
+
+def _block_pin(card: Card) -> None:
+    for _ in range(card.pin_max):
+        card.verify(b"000000")
+    assert card.retries == 0, "sanity: PIN really is blocked"
+
+
+def _block_puk(card: Card) -> None:
+    for _ in range(card.puk_max):
+        card.change_puk(b"00000000", b"11111111")
+    assert card.puk_retries == 0, "sanity: PUK really is blocked"
+
+
+def test_reset_application_rejects_other_p1p2_regardless_of_pin_state(card):
+    """The P1/P2 check must not depend on whether a reset would otherwise be
+    allowed — a card with a freshly-verified PIN still rejects a malformed
+    request rather than reporting the (also true) success path."""
+    card.verify()
+    assert card.apdu(bytes([0x00, 0xFB, 0x01, 0x00]))[0] == SW_WRONG_P1P2
+    assert card.apdu(bytes([0x00, 0xFB, 0x00, 0x01]))[0] == SW_WRONG_P1P2
+
+
+def test_reset_application_rejects_a_data_field(card):
+    """ISO case 1: no data field. SP 800-73 gives this instruction no syntax
+    of its own to be lenient about."""
+    assert card.apdu(bytes([0x00, 0xFB, 0x00, 0x00, 0x01, 0xAA]))[0] == SW_WRONG_LENGTH
+
+
+def test_reset_application_rejects_an_unverified_pin(card):
+    """A fresh card: the PIN has not been verified this session. Physical
+    possession alone must never be enough."""
+    assert card.reset_application() == SW_SECURITY
+
+
+def test_reset_application_has_no_lockout_recovery_path(card):
+    """The behaviour change this test exists to pin down: exhausting both
+    retry counters — reachable by anyone holding the device, with no
+    knowledge of either secret — must not open a PIN-free way to reset.
+    There is deliberately no recovery once both are gone."""
+    _block_pin(card)
+    _block_puk(card)
+    assert card.retries == 0
+    assert card.puk_retries == 0
+    assert card.reset_application() == SW_SECURITY
+
+
+def test_reset_application_succeeds_with_a_verified_pin(card):
+    """The only path: VERIFY with the correct PIN, then reset — regardless
+    of the PUK's own state, which this instruction never looks at."""
+    assert card.verify() == SW_OK
+    assert card.puk_retries == 3  # never touched by the gate
+    assert card.reset_application() == SW_OK
+
+
+def test_reset_application_needs_current_verification_not_history(card):
+    """A PIN verified earlier and then un-verified by a later wrong attempt
+    must not leave a stale "was verified at some point" credential behind —
+    the same session-scoped lifetime _pin_verified already has everywhere
+    else (SELECT, a wrong PIN, etc.)."""
+    assert card.verify() == SW_OK
+    assert card.verify(b"999999") == PIV_SW_VERIFY_FAILED(2)  # clears it again
+    assert card.reset_application() == SW_SECURITY
+
+
+def test_reset_application_restores_compile_time_ceilings_not_a_custom_one(card):
+    """A ceiling raised by SET PIN RETRIES must not survive a factory reset —
+    "factory" means the compile-time default (3), not whatever an operator
+    last configured."""
+    card.verify()
+    assert card.authenticate_management_key() == SW_OK
+    assert card.set_pin_retries(5, 7) == SW_OK
+    assert card.pin_max == 5
+    assert card.puk_max == 7
+
+    assert card.verify() == SW_OK  # SET PIN RETRIES reset the PIN and cleared verification
+    assert card.reset_application() == SW_OK
+    assert card.pin_max == 3
+    assert card.puk_max == 3
+    assert card.retries == 3
+    assert card.puk_retries == 3
+
+
+def test_reset_application_wipes_every_stored_object(card):
+    card.verify()
+    for tag in (OBJ_CERT_9A, OBJ_CERT_9C, OBJ_CERT_9D, OBJ_CERT_9E, OBJ_CHUID, OBJ_CCC):
+        body = bytes([0x5C, 0x03, (tag >> 16) & 0xFF, (tag >> 8) & 0xFF, tag & 0xFF,
+                      0x53, 0x02, 0xAA, 0xBB])
+        assert card.apdu(bytes([0x00, 0xDB, 0x3F, 0xFF, len(body)]) + body)[0] == SW_OK
+    assert len(card.objects) == 6
+
+    assert card.reset_application() == SW_OK
+
+    assert card.objects == {}
+    for tag in (OBJ_CERT_9A, OBJ_CERT_9C, OBJ_CERT_9D, OBJ_CERT_9E, OBJ_CHUID, OBJ_CCC):
+        assert tag in card.deleted
+
+
+def test_reset_application_rolls_every_slot_key(card):
+    before = {slot: card.generation.get(slot, 0)
+              for slot in (SLOT_9A, SLOT_9C, SLOT_9D, SLOT_9E)}
+
+    card.verify()
+    assert card.reset_application() == SW_OK
+
+    for slot in (SLOT_9A, SLOT_9C, SLOT_9D, SLOT_9E):
+        assert card.generation.get(slot, 0) == before[slot] + 1, hex(slot)
+
+
+def test_reset_application_replaces_the_management_key_with_a_new_random_default(card):
+    old_key = bytes(range(24))
+    assert card.authenticate_management_key() == SW_OK
+    assert card.set_management_key(old_key) == SW_OK
+    assert not card.mgmt_key_is_default
+
+    assert card.verify() == SW_OK
+    assert card.reset_application() == SW_OK
+
+    assert card.mgmt_key_is_default
+    assert card.mgmt_key != old_key
+    assert card.mgmt_key_reset_calls == 1
+    # The old, owner-rotated key must no longer authenticate — a factory
+    # reset that merely re-labelled it "default" without changing its bytes
+    # would leave it fully operative, which is not a reset at all.
+    card.select()
+    assert card.authenticate_management_key(key=old_key) == SW_SECURITY
+
+
+def test_reset_application_clears_session_state(card):
+    """_mgmt_authenticated (and _pin_verified) must not survive a reset any
+    more than they survive piv_reset() for any other reason — an admin
+    command right after must re-authenticate against whatever key the reset
+    just installed, not ride the pre-reset session."""
+    assert card.authenticate_management_key() == SW_OK
+    assert card.verify() == SW_OK
+    assert card.reset_application() == SW_OK
+
+    assert not card.lib.piv_pin_is_verified()
+    assert card.set_management_key(bytes(range(24))) == SW_SECURITY
+
+
+def test_reset_application_unsupported_without_the_hook(lib):
+    """The HAL-support check must fire before the PIN gate is even
+    consulted — a build missing the one new hook answers INS_UNSUPPORTED
+    regardless of PIN state, verified or not."""
+    card = Card(lib, with_mgmt_reset_hook=False)
+    assert card.reset_application() == SW_INS_UNSUPPORTED
+    card.verify()
+    assert card.reset_application() == SW_INS_UNSUPPORTED

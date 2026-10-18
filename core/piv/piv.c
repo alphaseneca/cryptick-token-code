@@ -1032,6 +1032,127 @@ static int set_management_key(uint8_t p1, uint8_t p2,
     return put_sw(out, out_max, PIV_SW_OK);
 }
 
+/* --- RESET APPLICATION (vendor, factory reset) ---------------------------- */
+
+/**
+ * Every PIV data object tag this device's own tooling can ever write: the
+ * four certificate slots (SP 800-73-4 part 1, table 3) plus the two
+ * identity objects PUT DATA is allowed to override (build_chuid/build_ccc's
+ * own comment: "the stored object wins whenever it exists"). RESET
+ * APPLICATION deletes exactly these — the same object space GET DATA/
+ * PUT DATA already reach through parse_object_tag, not a storage-layer wipe
+ * one level below the object abstraction this applet already has. Nothing
+ * wider is reachable: there is no sanctioned way for any tool this device
+ * ships to write an object under any other tag (piv_cli.rs's own module doc
+ * comment: arbitrary object import/export is explicitly out of scope).
+ */
+static const uint32_t kResetObjectTags[] = {
+    PIV_OBJ_CCC, PIV_OBJ_CHUID,
+    PIV_OBJ_CERT_9A, PIV_OBJ_CERT_9C, PIV_OBJ_CERT_9D, PIV_OBJ_CERT_9E,
+};
+
+/** Every slot whose derived key must stop matching any certificate issued
+ *  before this reset — the same four slots generate_keypair() and
+ *  general_authenticate() already recognise. */
+static const uint8_t kResetSlots[] = {
+    PIV_SLOT_AUTHENTICATION, PIV_SLOT_SIGNATURE,
+    PIV_SLOT_KEY_MANAGEMENT, PIV_SLOT_CARD_AUTH,
+};
+
+/**
+ * RESET APPLICATION (vendor, INS 0xFB — the same byte YubiKey's own PIV
+ * implementation uses for a full factory reset; see piv.h's comment on
+ * PIV_INS_SET_PIN_RETRIES/PIV_INS_SET_MGMT_KEY for why this applet reuses
+ * the vendor dialect PIV tooling already knows rather than inventing a
+ * second one).
+ *
+ * No data field, no response data (ISO case 1) — P1 and P2 must both be
+ * 0x00.
+ *
+ * Gated on a verified PIN (_pin_verified) and nothing else: VERIFY, then
+ * this instruction. The same bar GENERATE ASYMMETRIC KEY PAIR already
+ * accepts for an operation that likewise destroys the usability of
+ * certificates already issued, so a full reset asking for no more than
+ * that is consistent rather than a new rule invented just for this
+ * instruction. Physical possession alone is never enough on its own — a
+ * thief who does not know the PIN cannot wipe the device and install
+ * their own keys and certificates just by holding it.
+ *
+ * Deliberately has no lockout-recovery path. An earlier draft of this
+ * instruction also accepted "both the PIN and PUK retry counters already
+ * at zero" as a second, PIN-free way in, so an owner who had also lost
+ * the PUK was not permanently locked out of their own device — see
+ * NOTES.md, "PIV factory reset" and the later entry recording why that
+ * second path was removed instead. The accepted cost: an owner who
+ * forgets the PIN *and* the PUK has no way back into this device at
+ * all, by design, not by oversight — any lockout-recovery path is also a
+ * path that requires proving nothing more than exhausting both retry
+ * counters on purpose, which needs no knowledge of either secret, only
+ * physical possession and a few wrong guesses.
+ *
+ * Deliberately composed from existing, narrower HAL hooks rather than one
+ * new coarse "wipe everything" hook: delete_object for every object tag
+ * above, key_generate for every slot above (keys are derived, not stored,
+ * so rolling the generation counter is what "the old key is gone" means
+ * on this device — see key_generate's own doc comment), set_pin_puk_retries
+ * to put the PIN, the PUK, and both retry ceilings back to their SP 800-73/
+ * compile-time defaults in one call (exactly what SET PIN RETRIES already
+ * does, called here with the compile-time ceilings instead of an
+ * operator-chosen one), and the one genuinely new hook,
+ * mgmt_key_reset_to_default, for the one piece nothing existing already
+ * does: erasing whatever management key was installed so the applet falls
+ * back to the published SP 800-73-5 default again, the same "back to the
+ * documented starting point" meaning a reset already has for the PIN and
+ * PUK above.
+ *
+ * Every step runs even if an earlier one fails, and any failure is
+ * reported only after all of them have been attempted — a reset that is
+ * already irreversible should maximise what it actually cleans up rather
+ * than stopping partway and leaving the rest exactly as attractive a
+ * target as before. This is no less atomic than SET PIN RETRIES' own
+ * multi-write sequence already is on the ESP32 HAL; a reset is not
+ * introducing a new atomicity gap, only a longer version of one this
+ * applet's admin commands already accept.
+ */
+static int reset_application(uint8_t p1, uint8_t p2, size_t lc,
+                             uint8_t *out, size_t out_max)
+{
+    if (p1 != 0x00 || p2 != 0x00)
+        return put_sw(out, out_max, PIV_SW_WRONG_P1P2);
+    if (lc != 0)
+        return put_sw(out, out_max, PIV_SW_WRONG_LENGTH);
+    if (!_hal || !_hal->delete_object || !_hal->key_generate ||
+        !_hal->set_pin_puk_retries || !_hal->mgmt_key_reset_to_default)
+        return put_sw(out, out_max, PIV_SW_INS_UNSUPPORTED);
+
+    if (!_pin_verified)
+        return put_sw(out, out_max, PIV_SW_SECURITY_NOT_SATISFIED);
+
+    int ok = 1;
+
+    for (size_t i = 0; i < sizeof(kResetObjectTags) / sizeof(kResetObjectTags[0]); i++)
+        if (!_hal->delete_object(kResetObjectTags[i]))
+            ok = 0;
+
+    for (size_t i = 0; i < sizeof(kResetSlots) / sizeof(kResetSlots[0]); i++)
+        if (!_hal->key_generate(kResetSlots[i]))
+            ok = 0;
+
+    if (!_hal->set_pin_puk_retries(PIV_PIN_MAX_RETRIES, PIV_PUK_MAX_RETRIES))
+        ok = 0;
+
+    if (!_hal->mgmt_key_reset_to_default())
+        ok = 0;
+
+    if (!ok)
+        return put_sw(out, out_max, PIV_SW_WRONG_DATA);
+
+    /* A freshly-reset device has nothing left to have verified or
+     * authenticated, and nothing pending to chain or respond to. */
+    piv_reset();
+    return put_sw(out, out_max, PIV_SW_OK);
+}
+
 /* --- Entry point ---------------------------------------------------------- */
 
 void piv_init(const piv_hal_t *hal)
@@ -1311,6 +1432,9 @@ int piv_handle_apdu(const uint8_t *cmd, size_t cmd_len, uint8_t *out, size_t out
 
     case PIV_INS_SET_PIN_RETRIES:
         return set_pin_retries(p1, p2, lc, out, out_max);
+
+    case PIV_INS_RESET_APPLICATION:
+        return reset_application(p1, p2, lc, out, out_max);
 
     case PIV_INS_SET_MGMT_KEY:
         return set_management_key(p1, p2, data, lc, out, out_max);

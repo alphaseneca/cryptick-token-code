@@ -682,6 +682,38 @@ int piv_random_bytes(uint8_t *out, size_t len)
 }
 
 /**
+ * RESET APPLICATION's management-key half (see piv.h's doc comment on
+ * mgmt_key_reset_to_default for why this is its own hook rather than a
+ * call into mgmt_key_set): erase whatever key — default or
+ * owner-rotated — was stored, the same way a factory reset puts the PIN
+ * and PUK back to their SP 800-73 defaults rather than assigning them a
+ * new, never-before-seen value.
+ *
+ * Under this applet's published-default policy (see kDefaultMgmtKey's doc
+ * comment above), "reset to default" means exactly that: nothing stored,
+ * so piv_mgmt_key_crypt_block/piv_mgmt_key_is_default fall back to
+ * kDefaultMgmtKey again, the same published constant every unshipped unit
+ * starts with. nvs_erase_key reporting the key already absent is not a
+ * failure — there is nothing to erase precisely when a reset's own job is
+ * already done.
+ */
+int piv_mgmt_key_reset_to_default(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(kNvsNamespace, NVS_READWRITE, &h) != ESP_OK)
+        return 0;
+    esp_err_t err = nvs_erase_key(h, "mgmtkey");
+    if (err == ESP_ERR_NVS_NOT_FOUND)
+        err = ESP_OK;
+    nvs_commit(h);
+    nvs_close(h);
+    if (err == ESP_OK)
+        CLOG_W("PIV", "factory reset: management key restored to the "
+                      "published default");
+    return err == ESP_OK ? 1 : 0;
+}
+
+/**
  * Presence for a private-key operation.
  *
  * Slot 9A (PIV Authentication) is verified by the PIV PIN per NIST SP 800-73.
@@ -724,6 +756,7 @@ const piv_hal_t kPivHal = {
     piv_mgmt_key_set,
     piv_mgmt_key_is_default,
     piv_random_bytes,
+    piv_mgmt_key_reset_to_default,
 };
 
 static const uint8_t kDefaultCert9A[436] = {
