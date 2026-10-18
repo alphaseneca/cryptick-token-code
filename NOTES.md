@@ -2319,3 +2319,69 @@ in the same pass — see `cryptick-token-daemon`'s own NOTES.md entry of
 this same name for the CLI-side design (it now sends `VERIFY` itself when
 neither counter already reads zero, so a wrong PIN gets a specific
 "N attempts remaining" message instead of the bare device status word).
+
+## 2026-10-19 — RESET APPLICATION's lockout-recovery path, removed per explicit product direction
+
+The prior entry relaxed the gate from "lockout only" to "a verified PIN,
+*or* lockout" and treated that as settled. Walking through the lockout
+path's own mechanics with the device's owner surfaced something the
+prior two entries did not say out loud clearly enough: reaching "both the
+PIN and PUK retry counters at zero" needs no knowledge of either secret —
+anyone holding the device can get there in six deliberate wrong guesses
+(three against VERIFY, three against CHANGE REFERENCE DATA's PUK path),
+no better informed than a total stranger. The lockout-recovery path was
+therefore not actually a *recovery* path restricted to a device's real
+owner; it was a second, PIN-free way to reach the same reset *anyone*
+holding the device could reach, just with six extra APDUs first. The
+owner's direction, once that was named plainly: remove it. This device is
+for personal macOS login; the cost of occasionally being unable to recover
+from forgetting both secrets is one they'd rather carry than keep a
+reset path that physical possession alone eventually opens regardless of
+who's holding the device.
+
+### What changed
+
+`reset_application()` is gated on a verified PIN (`_pin_verified`) and
+*only* that. The "both retry counters at zero" branch, and the
+`pin_retries_get`/`puk_retries_get` HAL hooks' use inside this function
+specifically (both hooks still exist and are used everywhere else — PIN/
+PUK VERIFY, CHANGE REFERENCE DATA, RESET RETRY COUNTER — this is only
+about what `reset_application()` itself consults), were removed entirely.
+
+### What this actually costs, stated plainly rather than left implicit
+
+An owner who forgets the PIN *and* the PUK now has no way back into this
+device. Before this entry, lockout gave them one; after it, it doesn't.
+This is the direct, accepted trade for closing the gap above — there was
+no version of a recovery path considered that keeps "recoverable from a
+double-forgotten-secret" without also keeping "reachable by six wrong
+guesses from anyone, owner or not." The two are the same mechanism.
+
+### Why this isn't a login-security regression on its own
+
+Removing the fallback does not weaken anything this applet protects day
+to day: an attacker who has never known the PIN could never sign as the
+device's owner, with or without a reset at all, and a reset — whichever
+gate reaches it — replaces the keys those certificates were issued
+against, so it was never a way to silently inherit an already-trusted
+identity either. What this entry closes is narrower and specific: a
+PIN-free way to *wipe and reprovision* a device that is not yours,
+reachable without any knowledge at all. That is the property a lockout-
+only gate looked like it was protecting and, on inspection, was not.
+
+### Tests
+
+`tests/host/test_piv_apdu.py`'s "RESET APPLICATION" section was rewritten
+rather than merely added to: the three cases that existed purely to
+exercise the now-removed lockout branch (`succeeds_once_both_are_blocked`
+and its two "blocked-one-but-not-the-other-and-unverified" companions)
+are gone, replaced by one case that pins down the new behaviour directly
+— `test_reset_application_has_no_lockout_recovery_path`, which blocks
+both counters exactly as before and now asserts the opposite outcome,
+`SECURITY_STATUS_NOT_SATISFIED`. Every other case that used to reach the
+gate via blocking (object wipe, key rolling, management-key replacement,
+session-state clearing) now reaches it via a verified PIN instead, since
+that is the only path left — their actual assertions about what a
+successful reset does were not touched. Net count: 12 cases in this
+section (down from 15), `test_piv_apdu.py` at 150/150, `tests/host` at
+352/352 (355 before this entry, minus the net 3 removed).

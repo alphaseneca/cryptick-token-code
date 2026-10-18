@@ -1069,29 +1069,26 @@ static const uint8_t kResetSlots[] = {
  * No data field, no response data (ISO case 1) — P1 and P2 must both be
  * 0x00.
  *
- * Gated on either of two preconditions:
+ * Gated on a verified PIN (_pin_verified) and nothing else: VERIFY, then
+ * this instruction. The same bar GENERATE ASYMMETRIC KEY PAIR already
+ * accepts for an operation that likewise destroys the usability of
+ * certificates already issued, so a full reset asking for no more than
+ * that is consistent rather than a new rule invented just for this
+ * instruction. Physical possession alone is never enough on its own — a
+ * thief who does not know the PIN cannot wipe the device and install
+ * their own keys and certificates just by holding it.
  *
- *   1. A verified PIN (_pin_verified) — the common case. An owner who
- *      still knows their PIN can reset directly: VERIFY, then this
- *      instruction, no need to deliberately exhaust anything first. This
- *      is the same bar GENERATE ASYMMETRIC KEY PAIR already accepts for
- *      an operation that likewise destroys the usability of certificates
- *      already issued, so a full reset asking for no more than that is
- *      consistent rather than a new, stricter rule invented just for this
- *      instruction.
- *   2. Both the PIN and PUK retry counters already at zero — the
- *      lockout-recovery case: an owner who has also lost the PIN (not
- *      just forgotten it with the PUK still available — CHANGE REFERENCE
- *      DATA / RESET RETRY COUNTER already recover that case) can still
- *      get the device back to a known state instead of discarding it.
- *
- * Either path requires proving something the device itself checks —
- * physical possession alone is never enough on its own, so a thief who
- * does not know the PIN cannot wipe the device and install their own
- * keys and certificates just by holding it. Revised from an earlier,
- * stricter draft of this instruction that accepted only path 2: see
- * NOTES.md, "PIV factory reset", for why that draft gated on lockout
- * alone, and the later entry recording why it was relaxed to add path 1.
+ * Deliberately has no lockout-recovery path. An earlier draft of this
+ * instruction also accepted "both the PIN and PUK retry counters already
+ * at zero" as a second, PIN-free way in, so an owner who had also lost
+ * the PUK was not permanently locked out of their own device — see
+ * NOTES.md, "PIV factory reset" and the later entry recording why that
+ * second path was removed instead. The accepted cost: an owner who
+ * forgets the PIN *and* the PUK has no way back into this device at
+ * all, by design, not by oversight — any lockout-recovery path is also a
+ * path that requires proving nothing more than exhausting both retry
+ * counters on purpose, which needs no knowledge of either secret, only
+ * physical possession and a few wrong guesses.
  *
  * Deliberately composed from existing, narrower HAL hooks rather than one
  * new coarse "wipe everything" hook: delete_object for every object tag
@@ -1122,13 +1119,11 @@ static int reset_application(uint8_t p1, uint8_t p2, size_t lc,
         return put_sw(out, out_max, PIV_SW_WRONG_P1P2);
     if (lc != 0)
         return put_sw(out, out_max, PIV_SW_WRONG_LENGTH);
-    if (!_hal || !_hal->pin_retries_get || !_hal->puk_retries_get ||
-        !_hal->delete_object || !_hal->key_generate ||
+    if (!_hal || !_hal->delete_object || !_hal->key_generate ||
         !_hal->set_pin_puk_retries || !_hal->mgmt_key_reset_to_default)
         return put_sw(out, out_max, PIV_SW_INS_UNSUPPORTED);
 
-    int both_blocked = _hal->pin_retries_get() <= 0 && _hal->puk_retries_get() <= 0;
-    if (!_pin_verified && !both_blocked)
+    if (!_pin_verified)
         return put_sw(out, out_max, PIV_SW_SECURITY_NOT_SATISFIED);
 
     int ok = 1;
