@@ -23,7 +23,6 @@ R558-S sensor is the user-verification/presence gate shared by all of them.
 | [docs/SECURITY_ROADMAP.md](docs/SECURITY_ROADMAP.md) | Secret-at-rest design and what is *not* hardened yet |
 | [docs/ATTESTATION.md](docs/ATTESTATION.md) | Batch attestation key, AAGUID, cert generation |
 | [docs/WEBAUTHN_L3.md](docs/WEBAUTHN_L3.md) | Browser WebAuthn checklist |
-| [core/FEATURES_TODO.md](core/FEATURES_TODO.md) | Feature checklist: done, not done, and what needs hardware/a host |
 | [test/README.md](test/README.md) | Test layers L0–L3 and how to run them |
 | [docs/datasheets/](docs/datasheets/) | Fingerprint module manuals, PCB schematic |
 

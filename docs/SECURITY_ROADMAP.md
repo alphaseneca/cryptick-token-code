@@ -44,8 +44,7 @@ mode, but it means users must keep their own backup of enrolment secrets.
 
 ## Still open before a full product security claim
 
-- eFuse-backed wrap key + ESP32 flash encryption (the gap described above) —
-  implementation plan: [SECURE_BOOT_FLASH_ENCRYPTION.md](SECURE_BOOT_FLASH_ENCRYPTION.md)
+- eFuse-backed wrap key + ESP32 flash encryption (the gap described above)
 - FIDO MDS / public attestation root (a batch self-signed cert already ships — [ATTESTATION.md](ATTESTATION.md))
 - PIN / resident-key UX polish
 - Full WebAuthn browser OS UI acceptance
