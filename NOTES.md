@@ -2390,3 +2390,75 @@ that is the only path left — their actual assertions about what a
 successful reset does were not touched. Net count: 12 cases in this
 section (down from 15), `test_piv_apdu.py` at 150/150, `tests/host` at
 352/352 (355 before this entry, minus the net 3 removed).
+
+## OATH management's fingerprint gate could be kept open indefinitely with no further touch
+
+Reported from real use: deleting a TOTP account through the extension
+"felt too easy" for something that's supposed to need a fingerprint.
+Traced to a real bug, confirmed on the physical unit (3 fingerprint
+templates enrolled, confirmed via the device's own Settings → "Clear FP
+(3)" line), not a code-review guess.
+
+### The bug
+`oath_ensure_uv()` (`src/host/oath_ops.cpp`) gates `PUT`/`DELETE`/
+`PUT_OTPAUTH`/`CALCULATE` behind a touch unless an "authenticated
+session" is already open (`auth_system_is_authenticated()`), in which
+case it reuses that session and — every time — calls
+`auth_system_record_activity()` to push the session's 60s inactivity
+clock (`INACTIVITY_TIMEOUT_SEC`) back out. That's reasonable UX on its
+own (a grace period after a real touch, same idea as any biometric
+unlock). The bug is that nothing was actually *expiring* it:
+`auth_system_tick()` — the only function that checks the inactivity
+clock and clears the session — was called from `nav_system_tick()`
+(`src/systems/nav_system.cpp`) only while the OLED happened to be
+showing the TOTP, Settings, or FP-clear screen. The overwhelmingly
+common case — the device idle on its normal clock face, which is where
+it sits between uses — never called it at all. Net effect: one real
+touch opened a session that would stay open *forever* through
+host-driven use alone, since every PUT/DELETE/CALCULATE call both
+reused it and re-armed a timeout that was never being checked.
+
+### Fix
+Moved `auth_system_tick(nowMs)` out of the three-screen conditional in
+`nav_system_tick()` so it runs on every tick regardless of what's on
+screen. It's a no-op when nothing is authenticated
+(`auth_system.cpp`'s own `if (!_authenticated) return`), so this costs
+nothing in the common case. Kept the UI-navigation side effect (kick
+the screen back to the clock face if the TOTP screen's session just
+died) scoped to `UI_TOTP` only, since that part genuinely is
+UI-specific.
+
+### Verification, against the real device, not a mock
+Flashed to the physical unit and driven directly through
+`cryptick-webauthn-host`'s real native-messaging protocol (the same
+wire format `cryptick-token-extension`'s `background.js` sends), bypassing
+nothing. Three results, in order:
+
+1. **Before the fix, repeatedly**: `totp_delete` succeeded in as little
+   as 0.11s–3.4s with no touch at all, confirming the session genuinely
+   never expired.
+2. **One confound caught and corrected mid-investigation**: a "fresh
+   boot, 0.37s instant success" result briefly looked like zero
+   fingerprint templates were enrolled (the *other* branch of
+   `oath_ensure_uv`'s bootstrap check: `!fp_system_ready() ||
+   fp_system_template_count() == 0`), until the Settings-menu count
+   (3) ruled that out — the actual explanation was the fingerprint
+   sensor's own UART handshake (`fp_system_init()`) failing on that one
+   boot. A power cycle fixed it (confirmed by a subsequent call taking
+   17s — a real touch-wait, not bootstrap, since the bootstrap branch
+   cannot take 17s, it returns immediately). Flagged here as a loose
+   end: this looked like one flaky boot, not a reproducible failure,
+   but it was never deliberately reproduced to rule out a timing issue
+   in sensor bring-up — worth watching for if it recurs.
+3. **After the fix, with a genuinely idle device (75s, zero calls) and
+   a confirmed real no-touch attempt**: `totp_delete` took 25.15s and
+   came back `"daemon refused request: Timeout"` — the session had
+   actually expired, a fresh touch was actually required, and the
+   device correctly failed closed when none came. The account was
+   confirmed still present afterward (the failed delete did not
+   partially apply).
+
+Three throwaway test accounts (`ClaudeCITest:probe`, `:coldprobe`,
+`:postfix1`) were added and mostly cleaned up during this; whatever's
+left is exactly that — test junk, safe to delete from the Authenticator
+tab.

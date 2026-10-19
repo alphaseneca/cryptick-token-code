@@ -1188,12 +1188,24 @@ void nav_system_tick(unsigned long nowMs)
         publish_ui();
     }
 
-    if (_state == UI_TOTP || _state == UI_SETTINGS ||
-        _state == UI_FP_CLEAR_CONFIRM) {
-        auth_system_tick(nowMs);
-        if (!auth_system_is_authenticated() && _state == UI_TOTP && fp_system_ready()) {
-            set_state(UI_CLOCK);
-        }
+    /*
+     * Unconditional: this is the only call site for auth_system_tick, and the
+     * session it expires gates every OATH HID/BLE PUT/DELETE/CALCULATE
+     * (oath_ensure_uv's "UV satisfied (auth session)" branch), not just the
+     * on-device TOTP/Settings UI. Scoping the tick itself to those three
+     * screens meant the 60s inactivity window never actually expired while
+     * the OLED sat on the idle clock face -- the overwhelming common case --
+     * so one real touch left OATH management permanently unlocked for as
+     * long as host-driven requests kept arriving (oath_ensure_uv's
+     * already-authenticated branch itself calls auth_system_record_activity,
+     * so each use re-armed a timeout that was never being checked). The
+     * function is a no-op when nothing is authenticated (auth_system.cpp's
+     * own early `if (!_authenticated) return`), so ticking it here every
+     * time costs nothing in the common case.
+     */
+    auth_system_tick(nowMs);
+    if (_state == UI_TOTP && !auth_system_is_authenticated() && fp_system_ready()) {
+        set_state(UI_CLOCK);
     }
 
     /*
